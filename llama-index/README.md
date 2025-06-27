@@ -1,6 +1,6 @@
 # LlamaIndex Graph Store Integration: AgensGraph
 
-This plugin provides support for AgensGraphStore integration in [llamaindex](https://www.llamaindex.ai/), for persisting graphs directly in [AgensGraph](https://github.com/bitnine-oss/agensgraph). Additionally, we support the PropertyGraphIndex, which allows you to store and query property graphs in AgensGraph.
+This plugin provides support for AgensGraphStore integration in [llamaindex](https://www.llamaindex.ai/), for persisting graphs directly in [AgensGraph](https://github.com/skaiworldwide-oss/agensgraph). Additionally, we support the PropertyGraphIndex, which allows you to store and query property graphs in AgensGraph.
 
 See the associated guides below:
 
@@ -21,7 +21,7 @@ poetry build
 ## Usage
 
 ```
-pip install llama-index llama_index_graph_stores_agensgraph-0.1.0-py3-none-any.whl
+pip install llama-index llama_index_graph_stores_agensgraph
 ```
 
 ### AgensGraphStore

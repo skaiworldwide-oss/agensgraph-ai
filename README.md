@@ -17,6 +17,9 @@ This repository is designed to help developers:
 
 Everything is open-source and modular — feel free to use, fork, or contribute.
 
+# 📄 License
+This repository is licensed under the [Apache License 2.0](./python/LICENSE).
+
 # 📬 Contact
 For questions, feature requests, or collaboration:
 * Open an [Issue](https://github.com/skaiworldwide-oss/agensgraph-ai/issues) or Pull Request

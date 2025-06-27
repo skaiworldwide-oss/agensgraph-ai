@@ -22,13 +22,15 @@ ignore_missing_imports = true
 python_version = "3.8"
 
 [tool.poetry]
-authors = ["Your Name <you@example.com>"]
+authors = ["Muhammad Taha Naveed <skaisw@skaiworldwide.com>"]
 description = "llama-index graph stores agensgraph integration"
 exclude = ["**/BUILD"]
-license = "MIT"
 name = "llama-index-graph-stores-agensgraph"
 readme = "README.md"
 version = "0.1.0"
+homepage = "https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/llama-index"
+repository = "https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/llama-index"
+keywords = ["llama-index", "agensgraph", "graph store", "integration"]
 
 [tool.poetry.dependencies]
 python = ">=3.9,<4.0"

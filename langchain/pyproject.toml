@@ -6,10 +6,10 @@ requires = ["poetry-core"]
 name = "langchain-graph-store-agensgraph"
 version = "0.1.0"
 description = "AgensGraph integration for LangChain graph stores"
-authors = ["Your Name <you@example.com>"]
+authors = ["Muhammad Taha Naveed <skaisw@skaiworldwide.com>"]
 readme = "README.md"
-homepage = "https://github.com/bitnine-oss/langchain-agensgraph"
-repository = "https://github.com/bitnine-oss/langchain-agensgraph"
+homepage = "https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/langchain"
+repository = "https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/langchain"
 keywords = ["langchain", "agensgraph", "graph store", "integration"]
 
 [tool.poetry.dependencies]

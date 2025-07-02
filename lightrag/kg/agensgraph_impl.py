@@ -113,9 +113,11 @@ class AgensgraphStorage(BaseGraphStorage):
         async with self._get_pool_connection() as conn:
             async with conn.cursor() as curs:
                 try:
-                    await curs.execute(f"CREATE GRAPH {self.graph_name}")
+                    await curs.execute(f"CREATE GRAPH IF NOT EXISTS {self.graph_name}")
                     await curs.execute(f'SET graph_path = {self.graph_name}')
-                    await curs.execute(f'CREATE VLABEL base')
+                    await curs.execute(f'CREATE VLABEL IF NOT EXISTS base')
+                    await curs.execute(f'CREATE ELABEL IF NOT EXISTS "DIRECTED"')
+                    await curs.execute(f'CREATE PROPERTY INDEX IF NOT EXISTS base_entity_idx ON base (entity_id)')
                     await conn.commit()
                 except (
                     psycopg.errors.InvalidSchemaName,
@@ -160,7 +162,7 @@ class AgensgraphStorage(BaseGraphStorage):
             Exception: If there is an error executing the query
         """
         query = f"""
-                MATCH (n:base {{entity_id: '{node_id}'}})
+                MATCH (n:base {{entity_id: '{self.escape_str(node_id)}'}})
                 RETURN true AS node_exists LIMIT 1
                 """
         single_result = (await self._query(query))[0]
@@ -188,7 +190,7 @@ class AgensgraphStorage(BaseGraphStorage):
             Exception: If there is an error executing the query
         """
         query = f"""
-                MATCH (a:base {{entity_id: '{source_node_id}'}})-[r]-(b:base {{entity_id: '{target_node_id}'}})
+                MATCH (a:base {{entity_id: '{self.escape_str(source_node_id)}'}})-[r]-(b:base {{entity_id: '{self.escape_str(target_node_id)}'}})
                 RETURN true AS edgeExists LIMIT 1
                 """
         single_result = (await self._query(query))[0]
@@ -214,7 +216,7 @@ class AgensgraphStorage(BaseGraphStorage):
             Exception: If there is an error executing the query
         """
         query = f"""
-                MATCH (n:base {{entity_id: '{node_id}'}})
+                MATCH (n:base {{entity_id: '{self.escape_str(node_id)}'}})
                 RETURN n
                 """
         records = await self._query(query)
@@ -284,7 +286,7 @@ class AgensgraphStorage(BaseGraphStorage):
             Exception: If there is an error executing the query
         """
         query = f"""
-                MATCH (n:base {{entity_id: '{node_id}'}})
+                MATCH (n:base {{entity_id: '{self.escape_str(node_id)}'}})
                 OPTIONAL MATCH (n)-[r]-()
                 RETURN COUNT(r) AS degree
                 """
@@ -299,7 +301,7 @@ class AgensgraphStorage(BaseGraphStorage):
             )
             return edge_count
         else:
-            logger.warning(f"No node found with label '{node_id}'")
+            logger.warning(f"No node found with label '{self.escape_str(node_id)}'")
             return 0
 
     async def node_degrees_batch(self, node_ids: list[str]) -> dict[str, int]:
@@ -416,21 +418,17 @@ class AgensgraphStorage(BaseGraphStorage):
             Exception: If there is an error executing the query
         """
         query = f"""
-                MATCH (start:base {{entity_id: '{source_node_id}'}})-[r]-(end:base {{entity_id: '{target_node_id}'}})
+                MATCH (start:base {{entity_id: '{self.escape_str(source_node_id)}'}})-[r]-("end":base {{entity_id: '{self.escape_str(target_node_id)}'}})
                 RETURN properties(r) as edge_properties
                 """
-        params = {
-            "source_entity_id": source_node_id,
-            "target_entity_id": target_node_id,
-        }
         records = await self._query(query)
 
         if records:
             if len(records) > 1:
                 logger.warning(
                     "Multiple edges found between '%s' and '%s'. Returning first result.",
-                    source_node_id,
-                    target_node_id,
+                    self.escape_str(source_node_id),
+                    self.escape_str(target_node_id),
                 )
             edge_result = records[0]["edge_properties"]
 
@@ -444,7 +442,7 @@ class AgensgraphStorage(BaseGraphStorage):
                 if key not in edge_result:
                     edge_result[key] = default_value
                     logger.warning(
-                        f"Edge between {source_node_id} and {target_node_id} "
+                        f"Edge between {self.escape_str(source_node_id)} and {self.escape_str(target_node_id)} "
                         f"missing {key}, using default: {default_value}"
                     )
             logger.debug(
@@ -457,16 +455,11 @@ class AgensgraphStorage(BaseGraphStorage):
         else:
             logger.warning(
                 "No edge found between '%s' and '%s'. Returning default properties.",
-                source_node_id,
-                target_node_id,
+                self.escape_str(source_node_id),
+                self.escape_str(target_node_id),
             )
-            # Return default properties if no edge found
-            return {
-                "weight": 0.0,
-                "source_id": None,
-                "description": None,
-                "keywords": None,
-            }
+            # Return None when no edge found
+            return None
 
     async def get_edges_batch(
         self, pairs: list[dict[str, str]]
@@ -482,7 +475,7 @@ class AgensgraphStorage(BaseGraphStorage):
         """
         query = f"""
                 UNWIND {pairs} AS pair
-                MATCH (start:base {{entity_id: pair.src}})-[r:"DIRECTED"]-(end:base {{entity_id: pair.tgt}})
+                MATCH (start:base {{entity_id: pair.src}})-[r:"DIRECTED"]-("end":base {{entity_id: pair.tgt}})
                 RETURN pair.src AS src_id, pair.tgt AS tgt_id, collect(properties(r)) AS edges
                 """
         records = await self._query(query)
@@ -503,14 +496,8 @@ class AgensgraphStorage(BaseGraphStorage):
                     }.items():
                         if key not in edge_props:
                             edge_props[key] = default
-                            logger.warning(
-                                f"Edge between {src} and {tgt} missing {key}, using default: {default}"
-                            )
                     edges_dict[(src, tgt)] = edge_props
                 else:
-                    logger.warning(
-                        f"No edge properties found for pair ({src}, {tgt}). Using default properties."
-                    )
                     edges_dict[(src, tgt)] = {
                         "weight": 0.0,
                         "source_id": None,
@@ -526,15 +513,7 @@ class AgensgraphStorage(BaseGraphStorage):
             return edges_dict
         else:
             logger.warning("No edges found for the provided pairs.")
-            return {
-                (pair["src"], pair["tgt"]): {
-                    "weight": 0.0,
-                    "source_id": None,
-                    "description": None,
-                    "keywords": None,
-                }
-                for pair in pairs
-            }
+            return edges_dict
     
     async def get_node_edges(self, source_node_id: str) -> list[tuple[str, str]] | None:
         """Retrieves all edges (relationships) for a particular node identified by its label.
@@ -550,7 +529,7 @@ class AgensgraphStorage(BaseGraphStorage):
             Exception: If there is an error executing the query
         """
         query = f"""
-                MATCH (n:base {{entity_id: '{source_node_id}'}})
+                MATCH (n:base {{entity_id: '{self.escape_str(source_node_id)}'}})
                 OPTIONAL MATCH (n)-[r]-(connected:base)
                 WHERE connected.entity_id IS NOT NULL
                 RETURN n, r, connected
@@ -658,7 +637,7 @@ class AgensgraphStorage(BaseGraphStorage):
         query = f"""
                 UNWIND {chunk_ids} AS chunk_id
                 MATCH (n:base)
-                WHERE n.source_id IS NOT NULL AND chunk_id IN split(n.source_id, {GRAPH_FIELD_SEP})
+                WHERE n.source_id IS NOT NULL AND chunk_id <@ split(n.source_id, '{GRAPH_FIELD_SEP}')::jsonb
                 RETURN DISTINCT n
                 """
 
@@ -675,7 +654,7 @@ class AgensgraphStorage(BaseGraphStorage):
         query = f"""
                 UNWIND {chunk_ids} AS chunk_id
                 MATCH (a:base)-[r]-(b:base)
-                WHERE r.source_id IS NOT NULL AND chunk_id IN split(r.source_id, {GRAPH_FIELD_SEP})
+                WHERE r.source_id IS NOT NULL AND chunk_id <@ split(r.source_id, '{GRAPH_FIELD_SEP}')::jsonb
                 RETURN DISTINCT a.entity_id AS source, b.entity_id AS target, properties(r) AS properties
                 """
 
@@ -701,9 +680,9 @@ class AgensgraphStorage(BaseGraphStorage):
             node_id: The unique identifier for the node (used as label)
             node_data: Dictionary of node properties
         """
-        properties = node_data
+        properties = self._format_properties(node_data)
         query = f"""
-                MERGE (n:base {{entity_id: '{node_id}'}})
+                MERGE (n:base {{entity_id: '{self.escape_str(node_id)}'}})
                 SET n += {properties}
                 """
         try:
@@ -735,13 +714,13 @@ class AgensgraphStorage(BaseGraphStorage):
             target_node_id (str): Label of the target node (used as identifier)
             edge_data (dict): Dictionary of properties to set on the edge
         """
-        edge_properties = edge_data
+        edge_properties = self._format_properties(edge_data)
 
         query = f"""
-                MATCH (source:base {{entity_id: '{source_node_id}'}})
+                MATCH (source:base {{entity_id: '{self.escape_str(source_node_id)}'}})
                 WITH source
-                MATCH (target:base {{entity_id: '{target_node_id}'}})
-                MERGE (source)-[r:DIRECTED]-(target)
+                MATCH (target:base {{entity_id: '{self.escape_str(target_node_id)}'}})
+                MERGE (source)-[r:"DIRECTED"]-(target)
                 SET r += {edge_properties}
                 RETURN r, source, target
                 """
@@ -758,32 +737,53 @@ class AgensgraphStorage(BaseGraphStorage):
             raise
 
     async def get_knowledge_graph(
-        self, node_label: str, max_depth: int, max_nodes: int
+        self, node_label: str, max_depth: int = 3, max_nodes: int = 1000
     ) -> KnowledgeGraph:
+        """
+        Retrieve a connected subgraph of nodes where the label includes the specified `node_label`.
+
+        Args:
+            node_label: Label of the starting node, * means all nodes
+            max_depth: Maximum depth of the subgraph, Defaults to 3
+            max_nodes: Maximum nodes to return by BFS, Defaults to 1000
+
+        Returns:
+            KnowledgeGraph object containing nodes and edges, with an is_truncated flag
+            indicating whether the graph was truncated due to max_nodes limit
+        """
         from collections import deque
 
         result = KnowledgeGraph()
         visited_nodes = set()
         visited_edges = set()
         visited_edge_pairs = set()
+        queue = deque()
 
-        # Step 1: Get starting node
-        query = f"""
-                MATCH (n:base {{entity_id: '{node_label}'}})
-                RETURN id(n) AS node_id, n
-                """
-        node_result = await self._query(query)
-        if not node_result:
-            return result
+        # Step 1: Get starting nodes
+        if node_label == "*":
+            query = f"""
+                    MATCH (n:base)
+                    RETURN DISTINCT id(n) AS node_id, n
+                    LIMIT {max_nodes}
+                    """
+            node_results = await self._query(query)
+        else:
+            query = f"""
+                    MATCH (n:base {{entity_id: '{self.escape_str(node_label)}'}})
+                    RETURN id(n) AS node_id, n
+                    """
+            node_results = await self._query(query)
 
-        start_node_data = node_result[0]["n"]
-        start_node = KnowledgeGraphNode(
-            id=str(start_node_data["entity_id"]),
-            labels=[start_node_data["entity_id"]],
-            properties=start_node_data,
-        )
-
-        queue = deque([(start_node, None, 0)])
+        for record in node_results:
+            node_data = record["n"]
+            if not node_data.get("entity_id"):
+                continue
+            start_node = KnowledgeGraphNode(
+                id=str(node_data["entity_id"]),
+                labels=[node_data["entity_id"]],
+                properties=node_data,
+            )
+            queue.append((start_node, None, 0))
 
         # Step 2: BFS traversal
         while queue and len(visited_nodes) < max_nodes:
@@ -803,14 +803,15 @@ class AgensgraphStorage(BaseGraphStorage):
                 result.is_truncated = True
                 break
 
-            # Step 3: Query neighbors (AgensGraph-compatible Cypher)
+            # Step 3: Query neighbors
             query = f"""
-            MATCH (a:base {{entity_id: '{current_node.id}'}})-[r]-(b)
-            RETURN r, b, id(r) AS edge_id, id(b) AS target_id
+            MATCH (a:base {{entity_id: '{self.escape_str(current_node.id)}'}})-[r]-(b)
+            RETURN type(r) as rel_type, properties(r) as r, b, id(r) AS edge_id, id(b) AS target_id
             """
             records = await self._query(query)
 
             for record in records:
+                rel_type = record["rel_type"]
                 rel = record["r"]
                 b_node = record["b"]
                 edge_id = str(record["edge_id"])
@@ -827,7 +828,7 @@ class AgensgraphStorage(BaseGraphStorage):
 
                 target_edge = KnowledgeGraphEdge(
                     id=edge_id,
-                    type=rel["label"],
+                    type=rel_type,
                     source=current_node.id,
                     target=target_id,
                     properties=rel,
@@ -883,12 +884,12 @@ class AgensgraphStorage(BaseGraphStorage):
             node_id: The label of the node to delete
         """
         query = f"""
-                MATCH (n:base {{entity_id: '{node_id}'}})
+                MATCH (n:base {{entity_id: '{self.escape_str(node_id)}'}})
                 DETACH DELETE n
                 """
         try:
             await self._query(query)
-            logger.debug(f"Deleted node with label '{node_id}'")
+            logger.debug(f"Deleted node with label '{self.escape_str(node_id)}'")
         except Exception as e:
             logger.error(f"Error during node deletion: {str(e)}")
             raise
@@ -920,13 +921,13 @@ class AgensgraphStorage(BaseGraphStorage):
         """
         for source, target in edges:
             query = f"""
-                    MATCH (source:base {{entity_id: '{source}'}})-[r]-(target:base {{entity_id: '{target}'}})
+                    MATCH (source:base {{entity_id: '{self.escape_str(source)}'}})-[r]-(target:base {{entity_id: '{self.escape_str(target)}'}})
                     DELETE r
                     """
             try:
                 await self._query(query)
                 logger.debug(
-                    f"Deleted edge from '{source}' to '{target}'"
+                    f"Deleted edge from '{self.escape_str(source)}' to '{self.escape_str(target)}'"
                 )
             except Exception as e:
                 logger.error(f"Error during edge deletion: {str(e)}")
@@ -1006,6 +1007,10 @@ class AgensgraphStorage(BaseGraphStorage):
         return d
 
     @staticmethod
+    def escape_str(val: str) -> str:
+        return val.replace("'", "''").replace("\\", "\\\\").replace('"', '\\"')
+
+    @staticmethod
     def _format_properties(
         properties: Dict[str, Any], id: Union[str, None] = None
     ) -> str:
@@ -1021,22 +1026,28 @@ class AgensgraphStorage(BaseGraphStorage):
             str: the properties dictionary as a properly formatted string
         """
         props = []
-        # wrap property key in double quotes to escape
         for k, v in properties.items():
-            prop = f'"{k}": \'{v}\'' if isinstance(v, str) else f'"{k}": {v}'
+            if isinstance(v, str):
+                v_escaped = AgensgraphStorage.escape_str(v)
+                prop = f'"{k}": \'{v_escaped}\''
+            else:
+                prop = f'"{k}": {v}'
             props.append(prop)
+
         if id is not None and "id" not in properties:
-            props.append(
-                f"id: '{id}'" if isinstance(id, str) else f"id: {id}"
-            )
+            id_val = AgensgraphStorage.escape_str(v)(id) if isinstance(id, str) else id
+            props.append(f"id: '{id_val}'" if isinstance(id, str) else f"id: {id_val}")
+
         return "{" + ", ".join(props) + "}"
 
     async def _query(self, query: str) -> List[Dict[str, Any]]:
         """
-        Query the graph by taking a cypher query
+        Query the graph by taking a cypher query, converting it to an
+        age compatible query, executing it and converting the result
 
         Args:
             query (str): a cypher query to be executed
+            params (dict): parameters for the query
 
         Returns:
             List[Dict[str, Any]]: a list of dictionaries containing the result set

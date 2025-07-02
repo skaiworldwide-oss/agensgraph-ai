@@ -132,3 +132,4 @@ custom_kg = {
 }
 
 rag.insert_custom_kg(custom_kg)
+print("Custom knowledge graph inserted successfully.")

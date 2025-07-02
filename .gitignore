@@ -10,6 +10,7 @@ migration_scripts/
 
 # Local development
 venv/
+*/.venv/
 .venv/
 .ipynb_checkpoints
 .__pycache__
@@ -26,3 +27,29 @@ token.json
 .python-version
 .DS_Store
 /storage/
+
+# Framework-specific files
+local_neo4jWorkDir/
+neo4jWorkDir/
+
+# Data & Storage
+inputs/
+rag_storage/
+examples/input/
+examples/output/
+output*/
+custom_kg/
+
+# Miscellaneous
+.DS_Store
+TODO.md
+ignore_this.txt
+*.ignore.*
+
+# Project-specific files
+dickens*/
+book.txt
+LightRAG.pdf
+download_models_hf.py
+lightrag-dev/
+gui/

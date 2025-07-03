@@ -9,7 +9,6 @@ from typing import Any, Dict, List, NamedTuple, Optional, Union, final
 import pipmaster as pm
 from lightrag.types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
 from typing import Any, List, Dict, Optional, Tuple, NamedTuple, Pattern
-from ..constants import GRAPH_FIELD_SEP
 
 from tenacity import (
     retry,
@@ -19,8 +18,11 @@ from tenacity import (
 )
 
 from lightrag.utils import logger
-
-from ..base import BaseGraphStorage
+from lightrag.base import BaseGraphStorage
+try:
+    from lightrag.constants import GRAPH_FIELD_SEP
+except ImportError:
+    from lightrag.prompt import GRAPH_FIELD_SEP
 
 if sys.platform.startswith("win"):
     import asyncio.windows_events

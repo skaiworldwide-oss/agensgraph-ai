@@ -7,6 +7,7 @@ from lightrag.utils import EmbeddingFunc
 # import nest_asyncio
 # nest_asyncio.apply()
 #########
+import lightrag_agensgraph
 
 os.environ["AGENSGRAPH_DB"] = ""
 os.environ["AGENSGRAPH_USER"] = ""

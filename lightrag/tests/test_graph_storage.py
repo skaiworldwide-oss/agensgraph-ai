@@ -19,6 +19,7 @@ import importlib
 import numpy as np
 from dotenv import load_dotenv
 from ascii_colors import ASCIIColors
+import lightrag_agensgraph
 
 os.environ["AGENSGRAPH_DB"] = ""
 os.environ["AGENSGRAPH_USER"] = ""
@@ -38,7 +39,11 @@ from lightrag.kg import (
     verify_storage_implementation,
 )
 from lightrag.kg.shared_storage import initialize_share_data
-from lightrag.constants import GRAPH_FIELD_SEP
+
+try:
+    from lightrag.constants import GRAPH_FIELD_SEP
+except ImportError:
+    from lightrag.prompt import GRAPH_FIELD_SEP
 
 
 # 模拟的嵌入函数，返回随机向量
@@ -1191,7 +1196,7 @@ async def main():
     load_dotenv(dotenv_path=".env", override=False)
 
     # 获取图存储类型
-    graph_storage_type = os.getenv("LIGHTRAG_GRAPH_STORAGE", "NetworkXStorage")
+    graph_storage_type = os.getenv("LIGHTRAG_GRAPH_STORAGE", "AgensgraphStorage")
     ASCIIColors.magenta(f"\n当前配置的图存储类型: {graph_storage_type}")
     ASCIIColors.white(
         f"支持的图存储类型: {', '.join(STORAGE_IMPLEMENTATIONS['GRAPH_STORAGE']['implementations'])}"

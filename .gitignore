@@ -28,10 +28,6 @@ token.json
 .DS_Store
 /storage/
 
-# Framework-specific files
-local_neo4jWorkDir/
-neo4jWorkDir/
-
 # Data & Storage
 inputs/
 rag_storage/

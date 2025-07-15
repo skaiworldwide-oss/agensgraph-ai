@@ -1,0 +1,135 @@
+{
+  "dxt_version": "0.1",
+  "name": "mcp-agensgraph-cypher",
+  "display_name": "Agensgraph Cypher MCP Server",
+  "version": "0.1.0",
+  "description": "Execute read and write Cypher queries on your Agensgraph database.",
+  "long_description": "A Model Context Protocol (MCP) server that provides tools for interacting with Agensgraph database using Cypher queries. Supports both read and write operations with proper validation and error handling.",
+  "keywords": ["agensgraph", "cypher", "graph", "database", "mcp", "ai", "llm"],
+  "categories": ["database", "graph", "query"],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/mcp-agensgraph/servers/mcp-agensgraph-cypher"
+  },
+  "documentation": "https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/mcp-agensgraph/servers/mcp-agensgraph-cypher/README.md",
+  "support": "https://github.com/skaiworldwide-oss/agensgraph-ai/issues",
+  "server": {
+    "type": "python",
+    "entry_point": "src/mcp_agensgraph_cypher/__init__.py",
+    "mcp_config": {
+      "command": "uvx",
+      "args": ["mcp-agensgraph-cypher"],
+      "env": {
+        "AGENSGRAPH_DB": "${user_config.agensgraph_db}",
+        "AGENSGRAPH_USERNAME": "${user_config.agensgraph_username}",
+        "AGENSGRAPH_PASSWORD": "${user_config.agensgraph_password}",
+        "AGENSGRAPH_HOST": "${user_config.agensgraph_host}",
+        "AGENSGRAPH_PORT": "${user_config.agensgraph_port}",
+        "AGENSGRAPH_GRAPH_NAME": "${user_config.agensgraph_graph_name}",
+        "AGENSGRAPH_TRANSPORT": "${user_config.transport}",
+        "AGENSGRAPH_NAMESPACE": "${user_config.agensgraph_namespace}",
+        "AGENSGRAPH_MCP_SERVER_HOST": "${user_config.mcp_server_host}",
+        "AGENSGRAPH_MCP_SERVER_PORT": "${user_config.mcp_server_port}"
+      }
+    }
+  },
+  "tools": [
+    {
+      "name": "get_agensgraph_schema",
+      "description": "Retrieve the schema of the Agensgraph graph database, including node labels, properties, and relationships"
+    },
+    {
+      "name": "read_agensgraph_cypher",
+      "description": "Execute read-only Cypher queries (MATCH, RETURN, etc.) on the Agensgraph database"
+    },
+    {
+      "name": "write_agensgraph_cypher",
+      "description": "Execute write Cypher queries (CREATE, MERGE, SET, DELETE, etc.) on the Agensgraph database"
+    }
+  ],
+  "prompts": [],
+  "tools_generated": false,
+  "license": "MIT",
+  "user_config": {
+    "agensgraph_db": {
+      "type": "string",
+      "title": "Agensgraph Database",
+      "description": "The name of the Agensgraph database to connect to",
+      "default": "agensgraph",
+      "required": true,
+      "sensitive": false
+    },
+    "agensgraph_username": {
+      "type": "string",
+      "title": "Agensgraph Username",
+      "description": "The username for connecting to the Agensgraph database",
+      "default": "agensgraph",
+      "required": true,
+      "sensitive": true
+    },
+    "agensgraph_password": {
+      "type": "string",
+      "title": "Agensgraph Password",
+      "description": "The password for connecting to the Agensgraph database",
+      "default": "",
+      "required": true,
+      "sensitive": true
+    },
+    "agensgraph_host": {
+      "type": "string",
+      "title": "Agensgraph Host",
+      "description": "The host for the Agensgraph database, defaults to localhost",
+      "default": "localhost",
+      "required": false,
+      "sensitive": false
+    },
+    "agensgraph_port": {
+      "type": "number",
+      "title": "Agensgraph Port",
+      "description": "The port for the Agensgraph database, defaults to 5432",
+      "default": 5432,
+      "required": false,
+      "sensitive": false
+    },
+    "agensgraph_graph_name": {
+      "type": "string",
+      "title": "Agensgraph Graph Name",
+      "description": "The name of the graph in the Agensgraph database, defaults to 'graph'",
+      "default": "graph",
+      "required": false,
+      "sensitive": false
+    },
+    "agensgraph_namespace": {
+      "type": "string",
+      "title": "Namespace",
+      "description": "An optional namespace for the MCP server tools",
+      "default": "",
+      "required": false,
+      "sensitive": false
+    },
+    "transport": {
+      "type": "string",
+      "title": "Transport",
+      "description": "The MCP transport, defaults to stdio",
+      "default": "stdio",
+      "required": false,
+      "sensitive": false
+    },
+    "mcp_server_host": {
+      "type": "string",
+      "title": "MCP Server Host",
+      "description": "The host for the MCP server, if not using stdio. Defaults to 127.0.0.1",
+      "default": "127.0.0.1",
+      "required": false,
+      "sensitive": false
+    },
+    "mcp_server_port": {
+      "type": "number",
+      "title": "MCP Server Port",
+      "description": "The port for the MCP server, if not using stdio. Defaults to 8000",
+      "default": 8000,
+      "required": false,
+      "sensitive": false
+    }
+  }
+}

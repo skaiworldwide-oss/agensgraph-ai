@@ -1,0 +1,2 @@
+# test mcp-agensgraph-cypher with a local database and Inspector
+npx @modelcontextprotocol/inspector uv --directory src/mcp_agensgraph_cypher run mcp-agensgraph-cypher --db-name test --username <your-username> --password <your-password> --graph-name test

@@ -26,7 +26,7 @@ pip install langchain langchain_graph_store_agensgraph
 from langchain.graphs.agensgraph import AgensGraph
 
 conf = {
-    "database": "",
+    "dbname": "",
     "user": "",
     "password": "",
     "host": "",

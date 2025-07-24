@@ -43,7 +43,7 @@ test_data = [
 ]
 
 conf = {
-    "database": os.getenv("AGENSGRAPH_DB"),
+    "dbname": os.getenv("AGENSGRAPH_DB"),
     "user": os.getenv("AGENSGRAPH_USER"),
     "password": os.getenv("AGENSGRAPH_PASSWORD"),
     "host": os.getenv("AGENSGRAPH_HOST", "localhost"),
@@ -52,7 +52,7 @@ conf = {
 
 class TestAgensGraph(unittest.TestCase):
     def setUp(self) -> None:
-        self.assertIsNotNone(conf["database"])
+        self.assertIsNotNone(conf["dbname"])
         self.assertIsNotNone(conf["user"])
         self.assertIsNotNone(conf["password"])
 

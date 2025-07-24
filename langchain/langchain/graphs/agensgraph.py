@@ -25,8 +25,7 @@ from langchain_community.graphs.graph_document import GraphDocument
 from langchain_community.graphs.graph_store import GraphStore
 from functools import wraps
 
-import psycopg2
-import psycopg2.extras
+import psycopg
 
 typeof_function = f"""
     CREATE OR REPLACE FUNCTION typeof(element jsonb)
@@ -85,15 +84,15 @@ triple_query = """
     RETURN DISTINCT {start: start[0], type: relationship_type, end: end_label} AS output;
 """
 
-def require_psycopg2(func):
+def require_psycopg(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
         try:
-            import psycopg2
+            import psycopg
         except ImportError:
             raise ImportError(
-                "Could not import psycopg2 python package. "
-                "Please install it with `pip install psycopg2`."
+                "Could not import psycopg python package. "
+                "Please install it with `pip install psycopg`."
             )
         return func(*args, **kwargs)
     return wrapper
@@ -101,7 +100,7 @@ def require_psycopg2(func):
 def execute_query(cursor, query, error_message = "Error executing graph query"):
     try:
         cursor.execute(query)
-    except psycopg2.Error as e:
+    except psycopg.Error as e:
         raise AgensQueryException(
             {
                 "message": error_message,
@@ -134,7 +133,7 @@ class AgensGraph(GraphStore):
     Args:
         graph_name (str): the name of the graph to connect to or create
         conf (Dict[str, Any]): the pgsql connection config passed directly
-            to psycopg2.connect
+            to psycopg.connect
         create (bool): if True and graph doesn't exist, attempt to create it
 
     *Security note*: Make sure that the database connection uses credentials
@@ -155,14 +154,14 @@ class AgensGraph(GraphStore):
     vertex_regex: Pattern = re.compile(r"(\w+)\[(\d+\.\d+)\](\{.*\})")
     edge_regex: Pattern = re.compile(r"(\w+)\[(\d+\.\d+)\]\[(\d+\.\d+),\s*(\d+\.\d+)\](\{.*\})")
 
-    @require_psycopg2
+    @require_psycopg
     def __init__(
         self, graph_name: str, conf: Dict[str, Any], create: bool = False
     ) -> None:
         """Create a new Agensgraph Graph instance."""
 
         self.graph_name = graph_name
-        self.connection = psycopg2.connect(**conf)
+        self.connection = psycopg.connect(**conf)
 
         with self._get_cursor() as curs:
             # check if graph with name graph_name exists
@@ -205,12 +204,12 @@ class AgensGraph(GraphStore):
 
         self.refresh_schema()
 
-    @require_psycopg2
-    def _get_cursor(self) -> psycopg2.extras.NamedTupleCursor:
-        cursor = self.connection.cursor(cursor_factory=psycopg2.extras.NamedTupleCursor)
+    @require_psycopg
+    def _get_cursor(self) -> psycopg.Cursor:
+        cursor = self.connection.cursor(row_factory=psycopg.rows.namedtuple_row)
         return cursor
 
-    @require_psycopg2
+    @require_psycopg
     def _get_triples(self) -> List[Dict[str, str]]:
         """
         Get a set of distinct relationship types (as a list of dicts) in the graph
@@ -265,7 +264,7 @@ class AgensGraph(GraphStore):
 
         return triple_schema
 
-    @require_psycopg2
+    @require_psycopg
     def _get_node_properties(self) -> List[Dict[str, Any]]:
         """
         Fetch a list of available node properties by node label to be used
@@ -303,7 +302,7 @@ class AgensGraph(GraphStore):
 
         return node_properties
 
-    @require_psycopg2
+    @require_psycopg
     def _get_edge_properties(self) -> List[Dict[str, Any]]:
         """
         Fetch a list of available edge properties by edge label to be used
@@ -441,7 +440,7 @@ class AgensGraph(GraphStore):
 
         return d
 
-    @require_psycopg2
+    @require_psycopg
     def query(self, query: str, params: dict = {}) -> List[Dict[str, Any]]:
         """
         Query the graph by taking a cypher query, executing it and
@@ -459,7 +458,7 @@ class AgensGraph(GraphStore):
             try:
                 curs.execute(query)
                 self.connection.commit()
-            except psycopg2.Error as e:
+            except psycopg.Error as e:
                 self.connection.rollback()
                 raise AgensQueryException(
                     {
@@ -469,7 +468,7 @@ class AgensGraph(GraphStore):
                 )
             try:
                 data = curs.fetchall()
-            except psycopg2.ProgrammingError:
+            except psycopg.ProgrammingError:
                 data = []  # Handle queries that don’t return data
 
             if data is None:

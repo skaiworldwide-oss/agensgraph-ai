@@ -26,8 +26,9 @@ from langchain_community.graphs.graph_store import GraphStore
 from functools import wraps
 
 import psycopg
+from psycopg import sql
 
-typeof_function = f"""
+typeof_function = r"""
     CREATE OR REPLACE FUNCTION typeof(element jsonb)
     RETURNS text AS $$
     DECLARE
@@ -77,11 +78,11 @@ edge_properties_query = f"""
     RETURN label, COLLECT(DISTINCT {{'property': property, type: typeof(values[0])}}) as props;
 """
 
-triple_query = """
+triple_query = f"""
     MATCH (start_node)-[r]->(end_node)
     WITH labels(start_node) AS start, type(r) AS relationship_type, labels(end_node) AS endd, keys(r) AS relationship_properties
     UNWIND endd as end_label
-    RETURN DISTINCT {start: start[0], type: relationship_type, end: end_label} AS output;
+    RETURN DISTINCT {{start: start[0], type: relationship_type, end: end_label}} AS output;
 """
 
 def require_psycopg(func):
@@ -97,9 +98,9 @@ def require_psycopg(func):
         return func(*args, **kwargs)
     return wrapper
 
-def execute_query(cursor, query, error_message = "Error executing graph query"):
+def execute_query(cursor, query, params = {}, error_message = "Error executing graph query"):
     try:
-        cursor.execute(query)
+        cursor.execute(query, params)
     except psycopg.Error as e:
         raise AgensQueryException(
             {
@@ -165,22 +166,17 @@ class AgensGraph(GraphStore):
 
         with self._get_cursor() as curs:
             # check if graph with name graph_name exists
-            graph_id_query = (
-                """SELECT oid as graphid FROM ag_graph WHERE graphname = '{}';""".format(
-                    graph_name
-                )
-            )
+            graph_id_query = "SELECT oid as graphid FROM ag_graph WHERE graphname = %(graphname)s;"
+            params = {"graphname": graph_name}
 
-            execute_query(curs, graph_id_query)
+            execute_query(curs, graph_id_query, params, "Error checking for existing graph")
             data = curs.fetchone()
 
             # if graph doesn't exist and create is True, create it
             if data is None:
                 if create:
-                    create_statement = """
-                        CREATE GRAPH {};
-                    """.format(graph_name)
-                    execute_query(curs, create_statement)
+                    execute_query(curs, sql.SQL('CREATE GRAPH IF NOT EXISTS {graphname}').format(
+                        graphname=sql.Identifier(graph_name)), error_message="Error creating graph")
                     self.connection.commit()
                 else:
                     raise Exception(
@@ -190,15 +186,16 @@ class AgensGraph(GraphStore):
                         ).format(graph_name)
                     )
 
-                execute_query(curs, graph_id_query)
+                execute_query(curs, graph_id_query, params, "Error fetching graph id after creation")
                 data = curs.fetchone()
 
             # store graph id and refresh the schema
             self.graphid = data.graphid
 
+
             # set the graph path to the current graph and declare some functions
-            graph_path = """SET graph_path = '{}';""".format(self.graph_name)
-            execute_query(curs, graph_path)
+            execute_query(curs, sql.SQL('SET graph_path = {graphname}').format(
+                graphname=sql.Identifier(graph_name)), error_message="Error setting graph path")
             execute_query(curs, typeof_function)
             self.connection.commit()
 
@@ -456,7 +453,7 @@ class AgensGraph(GraphStore):
         # execute the query, rolling back on an error
         with self._get_cursor() as curs:
             try:
-                curs.execute(query)
+                curs.execute(query, params)
                 self.connection.commit()
             except psycopg.Error as e:
                 self.connection.rollback()
@@ -532,33 +529,25 @@ class AgensGraph(GraphStore):
         Returns:
             None
         """
-        # Ensure that the label used in merge exists (due to bug in agensgraph)
         # query for inserting nodes
         node_insert_query = (
             """
-            CREATE VLABEL IF NOT EXISTS "{label}";
-            MERGE (n:"{label}" {{id: '{id}'}})
-            SET n = {properties};
+            MERGE (n:{label} {{id: %(id)s}})
+            SET n = %(properties)s;
             """
             if not include_source
             else """
-            CREATE VLABEL IF NOT EXISTS "{label}";
-            CREATE VLABEL IF NOT EXISTS "Document";
-            CREATE ELABEL IF NOT EXISTS "MENTIONS";
-            MERGE (n:"{label}" {properties})
-            MERGE (d:"Document" {d_properties})
+            MERGE (n:{label} %(properties)s)
+            MERGE (d:{doc_label} %(d_properties)s)
             MERGE (d)-[:"MENTIONS"]->(n)
         """
         )
 
         # query for inserting edges
         edge_insert_query = """
-            CREATE VLABEL IF NOT EXISTS "{f_label}";
-            CREATE VLABEL IF NOT EXISTS "{t_label}";
-            CREATE ELABEL IF NOT EXISTS "{r_label}";
-            MERGE ("from":"{f_label}" {f_properties})
-            MERGE ("to":"{t_label}" {t_properties})
-            MERGE ("from")-[:"{r_label}" {r_properties}]->("to")
+            MERGE ("from":{f_label} %(f_properties)s)
+            MERGE ("to":{t_label} %(t_properties)s)
+            MERGE ("from")-[:{r_label} %(r_properties)s]->("to")
         """
         # iterate docs and insert them
         for doc in graph_documents:
@@ -571,33 +560,72 @@ class AgensGraph(GraphStore):
 
             # insert entity nodes
             for node in doc.nodes:
+                # Ensure that the label used in merge exists (due to bug in agensgraph)
+                self.query(sql.SQL('CREATE VLABEL IF NOT EXISTS {label}').format(
+                    label=sql.Identifier(AgensGraph.clean_graph_labels(node.type))
+                ))
+                if include_source:
+                    self.query(sql.SQL('CREATE VLABEL IF NOT EXISTS {label}').format(
+                        label=sql.Identifier(AgensGraph.clean_graph_labels(doc.source.type))
+                    ))
+                    self.query(sql.SQL('CREATE ELABEL IF NOT EXISTS {label}').format(
+                        label=sql.Identifier("MENTIONS")
+                    ))
+
                 node.properties["id"] = node.id
                 if include_source:
-                    query = node_insert_query.format(
-                        label=node.type,
-                        properties=self._format_properties(node.properties),
-                        d_properties=self._format_properties(doc.source.metadata),
+                    query = sql.SQL(node_insert_query).format(
+                        label=sql.Identifier(AgensGraph.clean_graph_labels(node.type)),
+                        doc_label=sql.Identifier(AgensGraph.clean_graph_labels(doc.source.type)),
                     )
+                    params = {
+                        'properties': json.dumps(node.properties),
+                        'd_properties': json.dumps(doc.source.metadata),
+                        'id': json.dumps(node.id)
+                    }
                 else:
-                    query = node_insert_query.format(
-                        label=AgensGraph.clean_graph_labels(node.type),
-                        properties=self._format_properties(node.properties),
-                        id=node.id,
+                    query = sql.SQL(node_insert_query).format(
+                        label=sql.Identifier(AgensGraph.clean_graph_labels(node.type))
                     )
-                self.query(query)
+                    params = {
+                        'properties': json.dumps(node.properties),
+                        'id': json.dumps(node.id)
+                    }
+                self.query(query, params)
 
             # insert relationships
             for edge in doc.relationships:
+
                 edge.source.properties["id"] = edge.source.id
                 edge.target.properties["id"] = edge.target.id
                 inputs = {
                     "f_label": AgensGraph.clean_graph_labels(edge.source.type),
-                    "f_properties": self._format_properties(edge.source.properties),
+                    "f_properties": json.dumps(edge.source.properties),
                     "t_label": AgensGraph.clean_graph_labels(edge.target.type),
-                    "t_properties": self._format_properties(edge.target.properties),
+                    "t_properties": json.dumps(edge.target.properties),
                     "r_label": AgensGraph.clean_graph_labels(edge.type).upper(),
-                    "r_properties": self._format_properties(edge.properties),
+                    "r_properties": json.dumps(edge.properties),
                 }
 
-                query = edge_insert_query.format(**inputs)
-                self.query(query)
+                # Ensure that the label used in merge exists (due to bug in agensgraph)
+                self.query(sql.SQL('CREATE VLABEL IF NOT EXISTS {f_label}').format(
+                    f_label=sql.Identifier(inputs["f_label"])
+                ))
+                self.query(sql.SQL('CREATE VLABEL IF NOT EXISTS {t_label}').format(
+                    t_label=sql.Identifier(inputs["t_label"])
+                ))
+                self.query(sql.SQL('CREATE ELABEL IF NOT EXISTS {r_label}').format(
+                    r_label=sql.Identifier(inputs["r_label"])
+                ))
+
+                query = sql.SQL(edge_insert_query).format(
+                    f_label=sql.Identifier(inputs["f_label"]),
+                    t_label=sql.Identifier(inputs["t_label"]),
+                    r_label=sql.Identifier(inputs["r_label"]),
+                )
+                params = {
+                    'f_properties': inputs["f_properties"],
+                    't_properties': inputs["t_properties"],
+                    'r_properties': inputs["r_properties"]
+                }
+                self.query(query, params)

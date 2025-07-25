@@ -21,7 +21,7 @@ from typing import Any, Dict
 
 from langchain_core.documents import Document
 
-from langchain.graphs.agensgraph import AgensGraph
+from langchain_agensgraph.graphs.agensgraph import AgensGraph
 from langchain_community.graphs.graph_document import GraphDocument, Node, Relationship
 
 test_data = [

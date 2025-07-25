@@ -18,7 +18,7 @@ import unittest
 from collections import namedtuple
 from typing import Any, Dict, List
 
-from langchain.graphs.agensgraph import AgensGraph
+from langchain_agensgraph.graphs.agensgraph import AgensGraph
 
 
 class TestAgensGraph(unittest.TestCase):

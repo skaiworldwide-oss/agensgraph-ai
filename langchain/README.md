@@ -23,7 +23,7 @@ pip install langchain langchain_graph_store_agensgraph
 ```
 
 ```python
-from langchain.graphs.agensgraph import AgensGraph
+from langchain_agensgraph.graphs.agensgraph import AgensGraph
 
 conf = {
     "dbname": "",

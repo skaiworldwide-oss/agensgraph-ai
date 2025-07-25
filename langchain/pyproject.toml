@@ -3,7 +3,7 @@ build-backend = "poetry.core.masonry.api"
 requires = ["poetry-core"]
 
 [tool.poetry]
-name = "langchain-graph-store-agensgraph"
+name = "langchain-agensgraph"
 version = "0.1.0"
 description = "AgensGraph integration for LangChain graph stores"
 authors = ["Muhammad Taha Naveed <skaisw@skaiworldwide.com>"]
@@ -47,4 +47,4 @@ extras = ["toml"]
 version = ">=v2.2.6"
 
 [[tool.poetry.packages]]
-include = "langchain/"
+include = "langchain_agensgraph/"

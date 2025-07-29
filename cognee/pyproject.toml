@@ -1,0 +1,21 @@
+[build-system]
+build-backend = "poetry.core.masonry.api"
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+
+[tool.poetry]
+name = "cognee-agensgraph"
+version = "0.1.0"
+description = "Cognee graph store implementation for agensgraph"
+authors = ["Muhammad Taha Naveed <skaisw@skaiworldwide.com>"]
+readme = "README.md"
+homepage = "https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/cognee"
+repository = "https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/cognee"
+keywords = ["cognee", "agensgraph", "graph store", "integration"]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<=3.13"
+psycopg = { version = ">=3.1.0", extras = ["binary", "pool"] }
+cognee = ">=0.2.1, <1.0.0"
+
+[[tool.poetry.packages]]
+include = "cognee_agensgraph"

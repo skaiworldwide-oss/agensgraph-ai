@@ -3,12 +3,13 @@ import shutil
 import cognee
 import pathlib
 from cognee.shared.logging_utils import get_logger
+from cognee.modules.data.methods import get_dataset_data
+import cognee_agensgraph
 
 logger = get_logger()
 
 
 async def main():
-    cognee.config.set_graph_database_provider("agensgraph")
     await cognee.prune.prune_data()
     await cognee.prune.prune_system(metadata=True)
 
@@ -50,7 +51,9 @@ async def main():
     Each of these companies has significantly impacted the technology landscape, driving innovation and transforming everyday life through their groundbreaking products and services.
     """
 
-    await cognee.add([text_1, text_2])
+    # Add documents and get dataset information
+    add_result = await cognee.add([text_1, text_2])
+    dataset_id = add_result.dataset_id
 
     await cognee.cognify()
 
@@ -60,7 +63,14 @@ async def main():
     nodes, edges = await graph_engine.get_graph_data()
     assert len(nodes) > 10 and len(edges) > 10, "Graph database is not loaded."
 
-    await cognee.delete([text_1, text_2], mode="hard")
+    # Get the data IDs from the dataset
+    dataset_data = await get_dataset_data(dataset_id)
+    assert len(dataset_data) > 0, "Dataset should contain data"
+
+    # Delete each document using its ID
+    for data_item in dataset_data:
+        await cognee.delete(data_item.id, dataset_id, mode="hard")
+
     nodes, edges = await graph_engine.get_graph_data()
 
     assert len(nodes) == 0 and len(edges) == 0, "Document is not deleted."

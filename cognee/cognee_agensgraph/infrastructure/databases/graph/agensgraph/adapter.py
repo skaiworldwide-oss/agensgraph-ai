@@ -1,4 +1,4 @@
-"""Agensgraph Adapter for Graph Database"""
+"""Memgraph Adapter for Graph Database"""
 
 import json, re
 from cognee.shared.logging_utils import get_logger, ERROR
@@ -14,15 +14,12 @@ from cognee.infrastructure.databases.graph.graph_db_interface import (
 )
 from cognee.modules.storage.utils import JSONEncoder
 from cognee.infrastructure.databases.exceptions.exceptions import NodesetFilterNotSupportedError
-import pipmaster as pm
 
-if not pm.is_installed("psycopg-pool"):
-    pm.install("psycopg-pool")
-    pm.install("psycopg[binary,pool]")
-
-import psycopg  # type: ignore
-from psycopg.rows import namedtuple_row  # type: ignore
-from psycopg_pool import AsyncConnectionPool, PoolTimeout  # type: ignore
+import psycopg
+from psycopg import sql
+from psycopg.types.json import Jsonb
+from psycopg.rows import namedtuple_row
+from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
 logger = get_logger("AgensgraphAdapter", level=ERROR)
 BASE_LABEL = "__Node__"
@@ -207,40 +204,54 @@ class AgensgraphAdapter(GraphDBInterface):
         self.graph_name = "cognee"
         self.graph_id = None
 
-        self.initialize(graph_database_url)
-
         return None
     
-    def initialize(self, graph_database_url):
+    async def initialize(self):
         """
         Initialize the Agensgraph storage
         """
-        connection = psycopg.connect(graph_database_url, autocommit=False)
-        
-        with connection.cursor() as curs:
-            try:
-                curs.execute(f'CREATE GRAPH IF NOT EXISTS "{self.graph_name}"')
-                curs.execute(f"SELECT oid from ag_graph WHERE graphname = '{self.graph_name}'")
-                self.graph_id = (curs.fetchone())[0]
-                curs.execute(f'SET graph_path = "{self.graph_name}"')
-                curs.execute(f'CREATE VLABEL IF NOT EXISTS base')
-                curs.execute(f'CREATE ELABEL IF NOT EXISTS "DIRECTED"')
-                curs.execute(f'CREATE PROPERTY INDEX IF NOT EXISTS base_entity_idx ON base (entity_id)')
-                curs.execute(append_label_function)
-                curs.execute(get_labels_function)
-                curs.execute(track_labels.format(self.graph_id))
-                curs.execute(label_catalog.format(self.graph_name, BASE_LABEL))
-                curs.execute(get_label_name_function)
-                connection.commit()
-            except (
-                psycopg.errors.InvalidSchemaName,
-                psycopg.errors.UniqueViolation,
-            ):
-                connection.rollback()
-                logger.warning(
-                    f"Graph {self.graph_name} already exists or could not be created."
-                )
+        if self.driver is None:
+            raise AgensgraphQueryException("Agensgraph driver is not initialized")
 
+        # create graph and set graph_path
+        async with self.driver_lock:
+            try:
+                await self.driver.open()
+            except psycopg.errors.InvalidSchemaName as e:
+                raise AgensgraphQueryException(
+                    f"Failed to open connection to Agensgraph: {str(e)}"
+                ) from e
+
+        async with self.get_pool_connection() as conn:
+            async with conn.cursor() as curs:
+                try:
+                    await curs.execute(f'CREATE GRAPH IF NOT EXISTS "{self.graph_name}"')
+                    await curs.execute(f"SELECT oid from ag_graph WHERE graphname = '{self.graph_name}'")
+                    self.graph_id = (await curs.fetchone())[0]
+                    await curs.execute(f'SET graph_path = "{self.graph_name}"')
+                    await curs.execute(f'CREATE VLABEL IF NOT EXISTS base')
+                    await curs.execute(f'CREATE ELABEL IF NOT EXISTS "DIRECTED"')
+                    await curs.execute(f'CREATE PROPERTY INDEX IF NOT EXISTS base_entity_idx ON base (entity_id)')
+                    await curs.execute(append_label_function)
+                    await curs.execute(get_labels_function)
+                    await curs.execute(track_labels.format(self.graph_id))
+                    await curs.execute(label_catalog.format(self.graph_name, BASE_LABEL))
+                    await curs.execute(get_label_name_function)
+                    await conn.commit()
+                except (
+                    psycopg.errors.InvalidSchemaName,
+                    psycopg.errors.UniqueViolation,
+                ):
+                    await conn.rollback()
+                    logger.warning(
+                        f"Graph {self.graph_name} already exists or could not be created."
+                    )
+                except psycopg.Error as e:
+                    await conn.rollback()
+                    raise AgensgraphQueryException(
+                        f"Error initializing graph {self.graph_name}: {str(e)}"
+                    ) from e
+            
         logger.info(f"Agensgraph storage initialized for graph: {self.graph_name}")
 
 
@@ -288,7 +299,7 @@ class AgensgraphAdapter(GraphDBInterface):
             async with conn.cursor(row_factory=namedtuple_row) as curs:
                 try:
                     await curs.execute(f'SET graph_path = {self.graph_name}')
-                    await curs.execute(query)
+                    await curs.execute(query, params)
                     await conn.commit()
                 except psycopg.Error as e:
                     await conn.rollback()
@@ -349,22 +360,23 @@ class AgensgraphAdapter(GraphDBInterface):
 
             The result of the query execution, typically the ID of the added node.
         """
-        serialized_properties = self.serialize_properties(node.model_dump())
-
-        query = dedent(
-            f"""MERGE (node: "{BASE_LABEL}"{{id: '{str(node.id)}'}})
-                ON CREATE SET node += {serialized_properties}, node.updated_at = now(), node.labels = append_label(node.labels, {type(node).__name__})
-                ON MATCH SET node += {serialized_properties}, node.updated_at = now(), node.labels = append_label(node.labels, {type(node).__name__})
-                RETURN ID(node) AS internal_id, node.id AS nodeId"""
-        )
+        query = """
+            MERGE (node: {label} {{id: %(node_id)s}})
+            ON CREATE SET node += %(properties)s, node.updated_at = now(), node.labels = append_label(node.labels, node_label)
+            ON MATCH SET node += %(properties)s, node.updated_at = now(), node.labels = append_label(node.labels, node_label)
+            RETURN ID(node) AS internal_id, node.id AS nodeId
+            """
 
         params = {
             "node_id": str(node.id),
             "node_label": type(node).__name__,
-            "properties": serialized_properties,
+            "properties": Jsonb(self.serialize_properties(node.model_dump()))
         }
 
-        return await self.query(query, params)
+        return await self.query(
+            sql.SQL(query).format(label=sql.Identifier(BASE_LABEL)),
+            params,
+        )
 
     @record_graph_changes
     async def add_nodes(self, nodes: list[DataPoint]) -> None:
@@ -391,15 +403,18 @@ class AgensgraphAdapter(GraphDBInterface):
             for node in nodes
         ]
 
-        query = f"""
-        UNWIND {nodes} AS node
-        MERGE (n: "{BASE_LABEL}"{{id: node.node_id}})
+        query = """
+        UNWIND %(nodes)s AS node
+        MERGE (n: {label} {{id: node.node_id}})
         ON CREATE SET n += node.properties, n.updated_at = now(), n.labels = append_label(n.labels, node.label)
         ON MATCH SET n += node.properties, n.updated_at = now(), n.labels = append_label(n.labels, node.label)
         RETURN ID(n) AS internal_id, n.id AS nodeId
         """
 
-        results = await self.query(query, dict(nodes=nodes))
+        results = await self.query(
+            sql.SQL(query).format(label=sql.Identifier(BASE_LABEL)),
+            {"nodes": Jsonb(nodes)},
+        )
         return results
 
     async def extract_node(self, node_id: str):
@@ -434,14 +449,17 @@ class AgensgraphAdapter(GraphDBInterface):
 
             A list of nodes represented as dictionaries.
         """
-        query = f"""
-        UNWIND {node_ids} AS id
-        MATCH (node: "{BASE_LABEL}"{{id: id}})
+        query = """
+        UNWIND %(node_ids)s AS id
+        MATCH (node:{label} {{id: id}})
         RETURN node"""
 
-        params = {"node_ids": node_ids}
+        params = {"node_ids": Jsonb(node_ids)}
 
-        results = await self.query(query, params)
+        results = await self.query(
+            sql.SQL(query).format(label=sql.Identifier(BASE_LABEL)),
+            params,
+        )
 
         return [result["node"] for result in results]
 
@@ -459,13 +477,16 @@ class AgensgraphAdapter(GraphDBInterface):
 
             The result of the query execution, typically indicating success or failure.
         """
-        query = f"""
-        MATCH (node: "{BASE_LABEL}"{{id: '{node_id}'}})
+        query = """
+        MATCH (node: {label} {{id: %(node_id)s}})
         DETACH DELETE node
         """
-        params = {"node_id": node_id}
+        params = {"node_id": Jsonb(node_id)}
 
-        return await self.query(query, params)
+        return await self.query(
+            sql.SQL(query).format(label=sql.Identifier(BASE_LABEL)),
+            params
+        )
 
     async def delete_nodes(self, node_ids: list[str]) -> None:
         """
@@ -481,14 +502,17 @@ class AgensgraphAdapter(GraphDBInterface):
 
             - None: None
         """
-        query = f"""
-        UNWIND {node_ids} AS id
-        MATCH (node: "{BASE_LABEL}"{{id: id}})
+        query = """
+        UNWIND %(node_ids)s AS id
+        MATCH (node:{label} {{id: id}})
         DETACH DELETE node"""
 
-        params = {"node_ids": node_ids}
+        params = {"node_ids": Jsonb(node_ids)}
 
-        return await self.query(query, params)
+        return await self.query(
+            sql.SQL(query).format(label=sql.Identifier(BASE_LABEL)),
+            params,
+        )
 
     async def has_edge(self, from_node: UUID, to_node: UUID, edge_label: str) -> bool:
         """
@@ -506,9 +530,9 @@ class AgensgraphAdapter(GraphDBInterface):
 
             - bool: True if the edge exists, otherwise False.
         """
-        query = f"""
-            MATCH (from_node: "{BASE_LABEL}")-[:"{edge_label}"]->(to_node: "{BASE_LABEL}")
-            WHERE from_node.id = '{str(from_node)}' AND to_node.id = '{str(to_node)}'
+        query = """
+            MATCH (from_node: {BASE_LABEL})-[:{edge_label}]->(to_node: {BASE_LABEL})
+            WHERE from_node.id = %(from_node)s AND to_node.id = %(to_node)s
             WITH COUNT(relationship) AS relationships
             RETURN relationships > 0 AS edge_exists
         """
@@ -518,7 +542,12 @@ class AgensgraphAdapter(GraphDBInterface):
             "to_node_id": str(to_node),
         }
 
-        edge_exists = await self.query(query, params)
+        edge_exists = await self.query(
+            sql.SQL(query).format(
+                BASE_LABEL=sql.Identifier(BASE_LABEL),
+                edge_label=sql.Identifier(edge_label)
+            ), params
+        )
         return edge_exists
 
     async def has_edges(self, edges):
@@ -543,14 +572,14 @@ class AgensgraphAdapter(GraphDBInterface):
             }
             for edge in edges
         ]
-        query = f"""
-            UNWIND {edges} AS edge
+        query = """
+            UNWIND %(edges)s AS edge
             MATCH (a)-[r]->(b)
             WHERE id(a)::jsonb = edge.from_node AND id(b)::jsonb = edge.to_node AND type(r) = edge.relationship_name
             RETURN edge.from_node AS from_node, edge.to_node AS to_node, edge.relationship_name AS relationship_name
         """
 
-        params = {"edges": edges}
+        params = {"edges": Jsonb(edges)}
 
         results = await self.query(query, params)
         return results
@@ -579,28 +608,27 @@ class AgensgraphAdapter(GraphDBInterface):
 
             The result of the query execution, typically indicating the created edge.
         """
-        
-        serialized_properties = self.serialize_properties(edge_properties)
-
-        query = dedent(
-            f"""\
-            MATCH (from_node :"{BASE_LABEL}"{{id: '{str(from_node)}'}}),
-                  (to_node :"{BASE_LABEL}"{{id: '{str(to_node)}'}})
-            MERGE (from_node)-[r:"{relationship_name}"]->(to_node)
-            ON CREATE SET r += {serialized_properties}, r.updated_at = now()
-            ON MATCH SET r += {serialized_properties}, r.updated_at = now()
+        query = """
+            MATCH (from_node :{BASE_LABEL} {{id: %(from_node)s}}),
+                  (to_node :{BASE_LABEL} {{id: %(to_node)s}})
+            MERGE (from_node)-[r:{relationship_name}]->(to_node)
+            ON CREATE SET r += %(properties)s, r.updated_at = now()
+            ON MATCH SET r += %(properties)s, r.updated_at = now()
             RETURN r
             """
-        )
 
         params = {
-            "from_node": str(from_node),
-            "to_node": str(to_node),
-            "relationship_name": relationship_name,
-            "properties": serialized_properties,
+            "from_node": Jsonb(str(from_node)),
+            "to_node": Jsonb(str(to_node)),
+            "properties": Jsonb(self.serialize_properties(edge_properties)),
         }
 
-        return await self.query(query, params)
+        return await self.query(
+            sql.SQL(query).format(
+                BASE_LABEL=sql.Identifier(BASE_LABEL),
+                relationship_name=sql.Identifier(relationship_name),
+            ), params
+        )
 
     @record_graph_changes
     async def add_edges(self, edges: list[tuple[str, str, str, dict[str, Any]]]) -> None:
@@ -641,12 +669,15 @@ class AgensgraphAdapter(GraphDBInterface):
 
             A list of edges connecting to the specified node, represented as tuples of details.
         """
-        query = f"""
-        MATCH (n: "{BASE_LABEL}"{{id: '{node_id}'}})-[r]-(m)
+        query = """
+        MATCH (n: {BASE_LABEL} {{id: %(node_id)s}})-[r]-(m)
         RETURN n, r, m
         """
 
-        results = await self.query(query, dict(node_id=node_id))
+        results = await self.query(
+            sql.SQL(query).format(BASE_LABEL=sql.Identifier(BASE_LABEL)),
+            {"node_id": Jsonb(node_id)}
+        )
 
         return [
             (result["n"]["id"], result["m"]["id"], {"relationship_name": result["r"][1]})
@@ -711,32 +742,31 @@ class AgensgraphAdapter(GraphDBInterface):
             - list[str]: A list of predecessor node IDs.
         """
         if edge_label is not None:
-            query = f"""
-            MATCH (node: "{BASE_LABEL}")<-[r:"{edge_label}"]-(predecessor)
-            WHERE node.id = '{node_id}'
+            query = """
+            MATCH (node: {BASE_LABEL})<-[r:{edge_label}]-(predecessor)
+            WHERE node.id = %(node_id)s
             RETURN predecessor
             """
 
             results = await self.query(
-                query,
-                dict(
-                    node_id=node_id,
+                sql.SQL(query).format(
+                    BASE_LABEL=sql.Identifier(BASE_LABEL),
+                    edge_label=sql.Identifier(edge_label),
                 ),
+                {"node_id": Jsonb(node_id)}
             )
 
             return [result["predecessor"] for result in results]
         else:
-            query = f"""
-            MATCH (node: "{BASE_LABEL}")<-[r]-(predecessor)
-            WHERE node.id = '{node_id}'
+            query = """
+            MATCH (node: {BASE_LABEL})<-[r]-(predecessor)
+            WHERE node.id = %(node_id)s
             RETURN predecessor
             """
 
             results = await self.query(
-                query,
-                dict(
-                    node_id=node_id,
-                ),
+                sql.SQL(query).format(BASE_LABEL=sql.Identifier(BASE_LABEL)),
+                {"node_id": Jsonb(node_id)}
             )
 
             return [result["predecessor"] for result in results]
@@ -757,33 +787,31 @@ class AgensgraphAdapter(GraphDBInterface):
             - list[str]: A list of successor node IDs.
         """
         if edge_label is not None:
-            query = f"""
-            MATCH (node: "{BASE_LABEL}")-[r:"{edge_label}"]->(successor)
-            WHERE node.id = '{node_id}'
+            query = """
+            MATCH (node: {BASE_LABEL})-[r:{edge_label}]->(successor)
+            WHERE node.id = %(node_id)s
             RETURN successor
             """
 
             results = await self.query(
-                query,
-                dict(
-                    node_id=node_id,
-                    edge_label=edge_label,
+                sql.SQL(query).format(
+                    BASE_LABEL=sql.Identifier(BASE_LABEL),
+                    edge_label=sql.Identifier(edge_label),
                 ),
+                {"node_id": Jsonb(node_id)}
             )
 
             return [result["successor"] for result in results]
         else:
-            query = f"""
-            MATCH (node: "{BASE_LABEL}")-[r]->(successor)
-            WHERE node.id = '{node_id}'
+            query = """
+            MATCH (node: {BASE_LABEL})-[r]->(successor)
+            WHERE node.id = %(node_id)s
             RETURN successor
             """
 
             results = await self.query(
-                query,
-                dict(
-                    node_id=node_id,
-                ),
+                sql.SQL(query).format(BASE_LABEL=sql.Identifier(BASE_LABEL)),
+                {"node_id": Jsonb(node_id)}
             )
 
             return [result["successor"] for result in results]
@@ -819,11 +847,14 @@ class AgensgraphAdapter(GraphDBInterface):
             - Optional[Dict[str, Any]]: The requested node as a dictionary, or None if it does
               not exist.
         """
-        query = f"""
-        MATCH (node: "{BASE_LABEL}"{{id: '{node_id}'}})
+        query = """
+        MATCH (node: {BASE_LABEL} {{id: %(node_id)s}})
         RETURN node
         """
-        results = await self.query(query, {"node_id": node_id})
+        results = await self.query(
+            sql.SQL(query).format(BASE_LABEL=sql.Identifier(BASE_LABEL)),
+            {"node_id": Jsonb(node_id)}
+        )
         return results[0]["node"] if results else None
 
     async def get_nodes(self, node_ids: List[str]) -> List[Dict[str, Any]]:
@@ -840,12 +871,15 @@ class AgensgraphAdapter(GraphDBInterface):
 
             - List[Dict[str, Any]]: A list of nodes represented as dictionaries.
         """
-        query = f"""
-        UNWIND {node_ids} AS id
-        MATCH (node:"{BASE_LABEL}" {{id: id}})
+        query = """
+        UNWIND %(node_ids)s AS id
+        MATCH (node:{label} {{id: id}})
         RETURN node
         """
-        results = await self.query(query, {"node_ids": node_ids})
+        results = await self.query(
+            sql.SQL(query).format(label=sql.Identifier(BASE_LABEL)),
+            {"node_ids": Jsonb(node_ids)},
+        )
         return [result["node"] for result in results]
 
     async def get_connections(self, node_id: UUID) -> list:
@@ -862,20 +896,28 @@ class AgensgraphAdapter(GraphDBInterface):
 
             - list: A list of connections represented as tuples of details.
         """
-        predecessors_query = f"""
-        MATCH (node:"{BASE_LABEL}")<-[relation]-(neighbour)
-        WHERE node.id = '{node_id}'
+        predecessors_query = """
+        MATCH (node:{BASE_LABEL})<-[relation]-(neighbour)
+        WHERE node.id = %(node_id)s
         RETURN neighbour, relation, node
         """
-        successors_query = f"""
-        MATCH (node:"{BASE_LABEL}")-[relation]->(neighbour)
-        WHERE node.id = '{node_id}'
+        successors_query = """
+        MATCH (node:{BASE_LABEL})-[relation]->(neighbour)
+        WHERE node.id = %(node_id)s
         RETURN node, relation, neighbour
         """
 
         predecessors, successors = await asyncio.gather(
-            self.query(predecessors_query, dict(node_id=str(node_id))),
-            self.query(successors_query, dict(node_id=str(node_id))),
+            self.query(
+                sql.SQL(predecessors_query).format(
+                    BASE_LABEL=sql.Identifier(BASE_LABEL)
+                ), {"node_id": Jsonb(str(node_id))}
+            ),
+            self.query(
+                sql.SQL(successors_query).format(
+                    BASE_LABEL=sql.Identifier(BASE_LABEL)
+                ), {"node_id": Jsonb(str(node_id))}
+            )
         )
 
         connections = []
@@ -908,15 +950,21 @@ class AgensgraphAdapter(GraphDBInterface):
 
             - None: None
         """
-        query = f"""
-        UNWIND {node_ids} AS id
-        MATCH (node:id)-[r:"{edge_label}"]->(predecessor)
+        query = """
+        UNWIND %(node_ids)s AS id
+        MATCH (node:{label1} {{id:id}})-[r:{label2}]->(predecessor:{label3})
         DELETE r;
         """
 
-        params = {"node_ids": node_ids}
+        params = {"node_ids": Jsonb(node_ids)}
 
-        return await self.query(query, params)
+        return await self.query(
+            sql.SQL(query).format(
+                label1=sql.Identifier(BASE_LABEL),
+                label2=sql.Identifier(edge_label),
+                label3=sql.Identifier(BASE_LABEL)
+            ), params
+        )
 
     async def remove_connection_to_successors_of(
         self, node_ids: list[str], edge_label: str
@@ -936,15 +984,21 @@ class AgensgraphAdapter(GraphDBInterface):
 
             - None: None
         """
-        query = f"""
-        UNWIND {node_ids} AS id
-        MATCH (node:id)<-[r:"{edge_label}"]-(successor)
+        query = """
+        UNWIND %(node_ids)s AS id
+        MATCH (node:{label1} {{id:id}})<-[r:{label2}]-(successor:{label3})
         DELETE r;
         """
 
-        params = {"node_ids": node_ids}
+        params = {"node_ids": Jsonb(node_ids)}
 
-        return await self.query(query, params)
+        return await self.query(
+            sql.SQL(query).format(
+                label1=sql.Identifier(BASE_LABEL),
+                label2=sql.Identifier(edge_label),
+                label3=sql.Identifier(BASE_LABEL)
+            ), params
+        )
 
     async def delete_graph(self):
         """
@@ -955,10 +1009,12 @@ class AgensgraphAdapter(GraphDBInterface):
 
             The result of the query execution, typically indicating success or failure.
         """
-        query = """MATCH (node)
+        query = """MATCH (node:{label})
                 DETACH DELETE node;"""
 
-        return await self.query(query)
+        return await self.query(
+            sql.SQL(query).format(label=sql.Identifier(BASE_LABEL))
+        )
 
     def serialize_properties(self, properties=dict()):
         """
@@ -980,18 +1036,6 @@ class AgensgraphAdapter(GraphDBInterface):
         for property_key, property_value in properties.items():
             if isinstance(property_value, UUID):
                 serialized_properties[property_key] = str(property_value)
-                continue
-
-            if isinstance(property_value, dict):
-                serialized_properties[property_key] = self.serialize_properties(property_value)
-                continue
-
-            if isinstance(property_value, str):
-                # Escape single quotes for JSON compatibility
-                serialized_properties[property_key] = property_value.replace("'", "''").replace('"', '\"')  
-                continue
-
-            if property_value is None:
                 continue
 
             serialized_properties[property_key] = property_value
@@ -1073,12 +1117,10 @@ class AgensgraphAdapter(GraphDBInterface):
             - Tuple[List[Tuple[int, dict]], List[Tuple[int, int, str, dict]]}: A tuple
               containing nodes and edges in the requested subgraph.
         """
-        label = node_type.__name__
-
-        query = f"""
-        UNWIND {node_name} AS wantedName
+        query = """
+        UNWIND %(names)s AS wantedName
         MATCH (n)
-        WHERE n.name = wantedName AND n.labels @> '{label}'::jsonb
+        WHERE n.name = wantedName AND n.labels @> %(label)s
         WITH DISTINCT n
         OPTIONAL MATCH (n)-[]-(nbr)
         WITH collect(DISTINCT properties(n)) AS prim, collect(DISTINCT properties(nbr)) AS nbrs
@@ -1090,17 +1132,17 @@ class AgensgraphAdapter(GraphDBInterface):
         WITH nodes, collect(DISTINCT r) AS rels
         RETURN
           [n IN nodes |
-             {{ id: n.id,
-                properties: n }}] AS "rawNodes",
+             { id: n.id,
+                properties: n }] AS "rawNodes",
           [r IN rels  |
-             {{ type: get_label_name(r.id::graphid),
-                properties: r.properties }}] AS "rawRels"
+             { type: get_label_name(r.id::graphid),
+                properties: r.properties }] AS "rawRels"
         """
-        print(query)
-        result = await self.query(query, {"names": node_name})
+
+        result = await self.query(query, {"names": Jsonb(node_name), "label": Jsonb(node_type.__name__)})
         if not result:
             return [], []
-        print(result)
+
         raw_nodes = result[0]["rawNodes"]
         raw_rels = result[0]["rawRels"]
 
@@ -1190,8 +1232,8 @@ class AgensgraphAdapter(GraphDBInterface):
 
             True if the graph exists, otherwise False.
         """
-        query = f"SELECT 1 FROM ag_graph WHERE graphname = '{graph_name}'"
-        result = await self.query(query)
+        query = "SELECT 1 FROM ag_graph WHERE graphname = %(graph_name)s"
+        result = await self.query(query, {"graph_name": graph_name})
         if (len(result) > 0):
             return True
         
@@ -1340,7 +1382,7 @@ class AgensgraphAdapter(GraphDBInterface):
         MATCH (doc)
         WHERE (get_labels(doc) @> 'TextDocument'::jsonb OR
                get_labels(doc) @> 'PdfDocument'::jsonb) AND
-               doc.name = 'text_' + $content_hash
+               doc.name = 'text_' + %(content_hash)s
 
         OPTIONAL MATCH (doc)<-[:is_part_of]-(chunk)
         WHERE get_labels(chunk) @> 'DocumentChunk'::jsonb
@@ -1359,9 +1401,9 @@ class AgensgraphAdapter(GraphDBInterface):
         WHERE get_labels(made_node) @> 'TextSummary'::jsonb
         OPTIONAL MATCH (entity)-[:is_a]->(type)
         WHERE get_labels(type) @> 'EntityType'::jsonb
-        WHERE NOT (
+        AND NOT (
             SELECT EXISTS (
-                MATCH (type)<-[:is_a]-(otherEntity:Entity)<-[:contains]-(otherChunk)-[:is_part_of]->(otherDoc)
+                MATCH (type)<-[:is_a]-(otherEntity)<-[:contains]-(otherChunk)-[:is_part_of]->(otherDoc)
                 WHERE get_labels(otherEntity) @> 'Entity'::jsonb AND
                       get_labels(otherChunk) @> 'DocumentChunk'::jsonb AND
                       (get_labels(otherDoc) @> 'TextDocument'::jsonb OR
@@ -1378,7 +1420,7 @@ class AgensgraphAdapter(GraphDBInterface):
             collect(DISTINCT made_node) as made_from_nodes,
             collect(DISTINCT type) as orphan_types
         """
-        result = await self.query(query, {"content_hash": content_hash})
+        result = await self.query(query, {"content_hash": Jsonb(content_hash)})
         return result[0] if result else None
 
     async def get_degree_one_nodes(self, node_type: str):
@@ -1401,7 +1443,7 @@ class AgensgraphAdapter(GraphDBInterface):
         query = f"""
         MATCH (n)
         WHERE get_labels(n) @> '{node_type}'::jsonb
-        WITH n, COUNT((SELECT * FROM (MATCH (n)-[]-() return 1)t)) as count
+        WITH n, (SELECT count(1) FROM (MATCH (n)-[]-() return 1)t) as count
         WHERE count=1
         RETURN n
         """

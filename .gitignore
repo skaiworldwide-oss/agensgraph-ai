@@ -53,3 +53,7 @@ LightRAG.pdf
 download_models_hf.py
 lightrag-dev/
 gui/
+
+# cognee
+.cognee_system/
+.data_storage/

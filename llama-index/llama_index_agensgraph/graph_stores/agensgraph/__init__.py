@@ -14,8 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 '''
 
-from llama_index.graph_stores.agensgraph.base import AgensGraphStore
-from llama_index.graph_stores.agensgraph.agensgraph_property_graph import (
+from llama_index_agensgraph.graph_stores.agensgraph.base import AgensGraphStore
+from llama_index_agensgraph.graph_stores.agensgraph.agensgraph_property_graph import (
     AgensPropertyGraphStore
 )
 

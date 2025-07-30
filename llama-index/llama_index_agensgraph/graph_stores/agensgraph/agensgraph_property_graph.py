@@ -28,38 +28,12 @@ from llama_index.core.graph_stores.types import (
     ChunkNode,
 )
 from llama_index.core.graph_stores.utils import value_sanitize
-from llama_index.graph_stores.agensgraph.utils import *
+from llama_index_agensgraph.graph_stores.agensgraph.utils import *
 from llama_index.core.prompts import PromptTemplate
 from llama_index.core.vector_stores.types import VectorStoreQuery
-import psycopg2
-import psycopg2.extras
-
-
-def remove_empty_values(input_dict):
-    """
-    Remove entries with empty values from the dictionary.
-
-    Parameters:
-    input_dict (dict): The dictionary from which empty values need to be removed.
-
-    Returns:
-    dict: A new dictionary with all empty values removed.
-    """
-    # Create a new dictionary excluding empty values
-    return {key: value for key, value in input_dict.items() if value}
-
-def remove_nones(input_dict):
-    """
-    Remove entries with None values from the dictionary.
-
-    Parameters:
-    input_dict (dict): The dictionary from which None values need to be removed.
-
-    Returns:
-    dict: A new dictionary with all None values removed.
-    """
-    return {key: value for key, value in input_dict.items() if value is not None}
-
+import psycopg
+from psycopg import sql
+from psycopg.types.json import Jsonb
 
 BASE_ENTITY_LABEL = "__Entity__"
 BASE_NODE_LABEL = "__Node__"
@@ -181,7 +155,7 @@ constraint_wrapper = """
     END;$$;
 """
 
-typeof_function = f"""
+typeof_function = r"""
     CREATE OR REPLACE FUNCTION typeof(element jsonb)
     RETURNS text AS $$
     DECLARE
@@ -224,7 +198,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
     supports_vector_queries: bool = True
     text_to_cypher_template: PromptTemplate = DEFAULT_CYPHER_TEMPALTE
 
-    @require_psycopg2
+    @require_psycopg
     def __init__(
         self,
         graph_name: str,
@@ -241,46 +215,35 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         self.sanitize_query_output = sanitize_query_output
         self.enhanced_schema = enhanced_schema
         self.create_indexes = create_indexes
-        self.connection = psycopg2.connect(**conf)
+        self.connection = psycopg.connect(**conf)
         self.vector_dimension = vector_dimension
 
         with self._get_cursor() as curs:
-            graph_id_query = (
-                """SELECT oid as graphid FROM ag_graph WHERE graphname = '{}';""".format(
-                    graph_name
-                )
-            )
-            execute_query(curs, graph_id_query)
-            data = curs.fetchone()
-
-            if data is None:
+            graphid = get_graph_id(curs, graph_name)
+            if graphid is None:
                 if create:
-                    create_statement = """
-                        CREATE GRAPH {};
-                    """.format(graph_name)
-                    execute_query(curs, create_statement, "Error creating graph")
+                    create_graph(curs, graph_name)
+                    self.connection.commit()
                 else:
                     raise Exception(
                         (
-                            'Graph "{}" does not exist in the database '
+                            'Graph "{}" does not exist in the graphidbase '
                             + 'and "create" is set to False'
                         ).format(graph_name)
                     )
+                graphid = get_graph_id(curs, graph_name)
 
-                curs.execute(graph_id_query)
-                data = curs.fetchone()
-
-            self.graphid = data.graphid
-
-            graph_path = """SET graph_path = '{}';""".format(self.graph_name)
-            execute_query(curs, graph_path)
+            self.graphid = graphid
+            set_graph_path(curs, graph_name)
 
             # Create functions, triggers and catalog to handle multiple labels
             execute_query(curs, append_label_function)
             execute_query(curs, label_catalog)
             execute_query(curs, track_labels.format(self.graphid))
             execute_query(curs, typeof_function)
-            execute_query(curs, f'CREATE VLABEL IF NOT EXISTS "{BASE_NODE_LABEL}"')
+            execute_query(curs, sql.SQL("CREATE VLABEL IF NOT EXISTS {};").format(
+                sql.Identifier(BASE_NODE_LABEL)
+            ))
             self.connection.commit()
 
         self.refresh_schema()
@@ -295,16 +258,23 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             )
             if self._supports_vector_index:
                 self.structured_query(
-                        f"""CREATE INDEX IF NOT EXISTS {VECTOR_INDEX_NAME}
-                        ON {self.graph_name}."{BASE_NODE_LABEL}" USING hnsw 
-                        (((properties->>'embedding')::vector({self.vector_dimension})) vector_cosine_ops)"""
+                    sql.SQL("""
+                        CREATE INDEX IF NOT EXISTS {VECTOR_INDEX_NAME}
+                        ON {graph_name}.{BASE_NODE_LABEL} USING hnsw 
+                        (((properties->>'embedding')::vector({vector_dimension})) vector_cosine_ops)
+                    """).format(
+                        VECTOR_INDEX_NAME=sql.Identifier(VECTOR_INDEX_NAME),
+                        graph_name=sql.Identifier(self.graph_name),
+                        BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL),
+                        vector_dimension=self.vector_dimension
+                    )
                 )
                 self.structured_query(
                     constraint_wrapper.format(
                         f"""CREATE CONSTRAINT embedding_length   
                         ON "{BASE_NODE_LABEL}" 
                         ASSERT jsonb_typeof(embedding) = 'array' AND 
-                                jsonb_array_length(embedding) = {self.vector_dimension};"""
+                               jsonb_array_length(embedding) = {self.vector_dimension};"""
                     )
                 )
 
@@ -317,16 +287,16 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             )
         )
 
-    @require_psycopg2
-    def _get_cursor(self) -> psycopg2.extras.NamedTupleCursor:
-        cursor = self.connection.cursor(cursor_factory=psycopg2.extras.NamedTupleCursor)
+    @require_psycopg
+    def _get_cursor(self) -> psycopg.Cursor:
+        cursor = self.connection.cursor(row_factory=psycopg.rows.namedtuple_row)
         return cursor
 
     @property
     def client(self) -> Any:
         return self.connection
 
-    @require_psycopg2
+    @require_psycopg
     def verify_vector_support(self) -> None:
         """
         Verify if the graph store supports vector operations
@@ -341,7 +311,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 self._supports_vector_store = True
                 if self.vector_dimension:
                     self._supports_vector_index = True
-            except psycopg2.Error:
+            except psycopg.Error:
                 self.connection.rollback()
                 logger.log(logging.WARNING, """Vector extension not supported\nUnable to install pg_vector extension""")
                 pass
@@ -441,43 +411,49 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         if chunk_dicts:
             for index in range(0, len(chunk_dicts), CHUNK_SIZE):
                 chunked_params = chunk_dicts[index : index + CHUNK_SIZE]
-                chunked_params = [remove_nones(row) for row in chunked_params]
                 self.structured_query(
-                    """
-                    UNWIND {} AS row
-                    MERGE (c:"{BASE_NODE_LABEL}" {{id: row.id}})
+                    sql.SQL("""
+                    UNWIND %(chunked_params)s AS row
+                    MERGE (c:{BASE_NODE_LABEL} {{id: row.id}})
                     SET c.text = row.text, c.labels = append_label(c.labels, 'Chunk')
                     WITH c, row
                     SET c += row.properties, c.embedding = row.embedding
                     RETURN count(*)
-                    """.format(chunked_params, BASE_NODE_LABEL=BASE_NODE_LABEL),
+                    """).format(
+                        BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL)
+                    ),{"chunked_params": Jsonb(chunked_params)}
                 )
 
         if entity_dicts:
             for index in range(0, len(entity_dicts), CHUNK_SIZE):
                 chunked_params = entity_dicts[index : index + CHUNK_SIZE]
-                chunked_params = [remove_nones(row) for row in chunked_params]
                 self.structured_query(
-                    """
-                    UNWIND {chunked_params} AS row
-                    MERGE (e:"{BASE_NODE_LABEL}" {{id: row.id}})
+                    sql.SQL("""
+                    UNWIND %(chunked_params)s AS row
+                    MERGE (e:{BASE_NODE_LABEL} {{id: row.id}})
                     SET e += CASE WHEN row.properties IS NOT NULL THEN row.properties ELSE properties(e) END
                     SET e.name = CASE WHEN row.name IS NOT NULL THEN row.name ELSE e.name END,
-                        e.labels = append_label(e.labels, '{BASE_ENTITY_LABEL}')
+                        e.labels = append_label(e.labels, {BASE_ENTITY_LABEL})
                     WITH e, row
-                    SET e.labels = append_label(e.labels, row.label);
-
-                    UNWIND {chunked_params} AS row
-                    MATCH (e:"{BASE_NODE_LABEL}" {{id: row.id}})
+                    SET e.labels = append_label(e.labels, row.label)
+                    """).format(
+                        BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL),
+                        BASE_ENTITY_LABEL=sql.Literal(BASE_ENTITY_LABEL)
+                    ), {"chunked_params": Jsonb(chunked_params)}
+                )
+                self.structured_query(
+                    sql.SQL("""
+                    UNWIND %(chunked_params)s AS row
+                    MATCH (e:{BASE_NODE_LABEL} {{id: row.id}})
                     WHERE row.embedding IS NOT NULL
                     SET e.embedding = row.embedding
                     WITH e, row
                     WHERE row.properties.triplet_source_id IS NOT NULL
-                    MERGE (c:"{BASE_NODE_LABEL}" {{id: row.properties.triplet_source_id}})
+                    MERGE (c:{BASE_NODE_LABEL} {{id: row.properties.triplet_source_id}})
                     MERGE (e)<-[:"MENTIONS"]-(c)
-                    """.format(chunked_params=chunked_params,
-                               BASE_NODE_LABEL=BASE_NODE_LABEL, 
-                               BASE_ENTITY_LABEL=BASE_ENTITY_LABEL),
+                    """).format(
+                        BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL)
+                    ), {"chunked_params": Jsonb(chunked_params)}
                 )
 
     def upsert_relations(self, relations: List[Relation]) -> None:
@@ -486,20 +462,24 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         for index in range(0, len(params), CHUNK_SIZE):
             chunked_params = params[index : index + CHUNK_SIZE]
             for param in chunked_params:
-                formatted_properties = ", ".join(
-                    [f"{key}: {value!r}" for key, value in param["properties"].items()]
-                )
                 self.structured_query(
-                    f"""
-                    MERGE (source: "{BASE_NODE_LABEL}" {{id: '{param["source_id"]}'}})
+                   sql.SQL("""
+                    MERGE (source: {BASE_NODE_LABEL} {{id: %(source_id)s}})
                     ON CREATE SET source.labels = append_label(source.labels, 'Chunk')
-                    MERGE (target: "{BASE_NODE_LABEL}" {{id: '{param["target_id"]}'}})
+                    MERGE (target: {BASE_NODE_LABEL} {{id: %(target_id)s}})
                     ON CREATE SET target.labels = append_label(target.labels, 'Chunk')
                     WITH source, target
-                    MERGE (source)-[r:"{param["label"]}"]->(target)
-                    SET r += {{{formatted_properties}}}
+                    MERGE (source)-[r:{label}]->(target)
+                    SET r += %(properties)s
                     RETURN count(*)
-                    """
+                    """).format(
+                        BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL),
+                        label=sql.Identifier(param["label"])
+                    ), {
+                        "source_id": Jsonb(param["source_id"]),
+                        "target_id": Jsonb(param["target_id"]),
+                        "properties": Jsonb(param["properties"])
+                    }
                 )
 
     def get(
@@ -508,30 +488,30 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         ids: Optional[List[str]] = None,
     ) -> List[LabelledNode]:
         """Get nodes."""
-        wrapper = """SELECT t.name,
+        query = """SELECT t.name,
                             t.type,
                             (t.properties - 'labels') || '{{"embedding": null, "id": null}}'::jsonb AS properties
-                     FROM ({})t"""
-        cypher_statement = f'MATCH (e:"{BASE_NODE_LABEL}") '
-
-        cypher_statement += "WHERE e.id IS NOT NULL "
-
+                     FROM ("""
+        params = {}
+        query += 'MATCH (e:{BASE_NODE_LABEL}) '
+        query += "WHERE e.id IS NOT NULL "
         if ids:
-            cypher_statement += "AND e.id IN {} ".format(ids)
+            query += "AND e.id <@ %(ids)s "
+            params["ids"] = Jsonb(ids)
 
         if properties:
-            prop_list = []
-            for i, prop in enumerate(properties):
-                property = properties[prop] if not isinstance(properties[prop], str) else f"'{properties[prop]}'"
-                prop_list.append(f'e."{prop}" = {property}')
-            cypher_statement += " AND " + " AND ".join(prop_list)
+            prop_params = [f'e."{prop}" = %({prop})s' for prop in properties]
+            query += "AND " + " AND ".join(prop_params)
+            params.update(
+                {f"{prop}": Jsonb(properties[prop]) for prop in properties}
+            )
 
-        return_statement = f"""
+        query += """
             WITH e, e.labels as labels
             RETURN
             e.id AS name,
             CASE
-                WHEN '{BASE_ENTITY_LABEL}' IN labels THEN
+                WHEN {BASE_ENTITY_LABEL} IN labels THEN
                     CASE
                         WHEN length(labels) > 2 THEN labels[2]
                         WHEN length(labels) > 1 THEN labels[1]
@@ -541,8 +521,13 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             END AS type,
             properties(e) AS properties
         """
-        cypher_statement += return_statement
-        response = self.structured_query(wrapper.format(cypher_statement))
+        query += ")t"
+        response = self.structured_query(
+            sql.SQL(query).format(
+                BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL),
+                BASE_ENTITY_LABEL=sql.Literal(BASE_ENTITY_LABEL)
+            ),params=params
+        )
         response = response if response else []
 
         nodes = []
@@ -553,7 +538,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                     ChunkNode(
                         id_=record["name"],
                         text=text,
-                        properties=remove_empty_values(record["properties"]),
+                        properties=record["properties"],
                     )
                 )
             else:
@@ -561,7 +546,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                     EntityNode(
                         name=record["name"],
                         label=record["type"],
-                        properties=remove_empty_values(record["properties"]),
+                        properties=record["properties"],
                     )
                 )
 
@@ -574,37 +559,52 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         properties: Optional[dict] = None,
         ids: Optional[List[str]] = None,
     ) -> List[Triplet]:
-        cypher_statement = "MATCH (e)-[r]->(t) "
-        cypher_statement += f"WHERE '{BASE_ENTITY_LABEL}' IN e.labels "
+        params = {}
+
+        query = """
+                SELECT t.type,
+                        t.rel_prop,
+                        t.source_id,
+                        t.source_type,
+                        (t.source_properties - 'labels') || '{{"embedding": null, "name": null}}'::jsonb AS source_properties,
+                        t.target_id,
+                        t.target_type,
+                        (t.target_properties - 'labels') || '{{"embedding": null, "name": null}}'::jsonb AS target_properties
+                FROM ("""
+        query += "MATCH (e)-[r]->(t) "
+        query += "WHERE {BASE_ENTITY_LABEL} IN e.labels "
 
         if entity_names or relation_names or properties or ids:
-            cypher_statement += "AND "
+            query += "AND "
 
         if entity_names:
-            cypher_statement += "e.name IN {} ".format(entity_names)
+            query += "e.name <@ %(entity_names)s "
+            params["entity_names"] = Jsonb(entity_names)
 
         if relation_names and entity_names:
-            cypher_statement += "AND "
+            query += "AND "
 
         if relation_names:
-            cypher_statement += "type(r) IN {} ".format(relation_names)
+            query += "type(r) <@ %(relation_names)s "
+            params["relation_names"] = Jsonb(relation_names)
 
         if ids:
-            cypher_statement += "e.id IN {} ".format(ids)
+            query += "e.id <@ %(ids)s "
+            params["ids"] = Jsonb(ids)
 
         if properties:
-            prop_list = []
-            for i, prop in enumerate(properties):
-                property = properties[prop] if not isinstance(properties[prop], str) else f"'{properties[prop]}'"
-                prop_list.append(f'e."{prop}" = {property}')
-            cypher_statement += " AND ".join(prop_list)
+            prop_params = [f'e."{prop}" = %({prop})s' for prop in properties]
+            query += "AND " + " AND ".join(prop_params)
+            params.update(
+                {f"{prop}": Jsonb(properties[prop]) for prop in properties}
+            )
 
-        return_statement = f"""
+        query += """
         AND NOT ANY(label IN e.labels WHERE label = 'Chunk')
             WITH *, e.labels as e_labels, t.labels as t_labels
             RETURN type(r) as type, properties(r) as rel_prop, e.id as source_id,
             CASE
-                WHEN '{BASE_ENTITY_LABEL}' IN e_labels THEN
+                WHEN {BASE_ENTITY_LABEL} IN e_labels THEN
                     CASE
                         WHEN length(e_labels) > 2 THEN e_labels[2]
                         WHEN length(e_labels) > 1 THEN e_labels[1]
@@ -615,7 +615,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             properties(e) AS source_properties,
             t.id as target_id,
             CASE
-                WHEN '{BASE_ENTITY_LABEL}' IN t_labels THEN
+                WHEN {BASE_ENTITY_LABEL} IN t_labels THEN
                     CASE
                         WHEN length(t_labels) > 2 THEN t_labels[2]
                         WHEN length(t_labels) > 1 THEN t_labels[1]
@@ -625,19 +625,13 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             END AS target_type, properties(t) AS target_properties LIMIT 100
         """
 
-        cypher_statement += return_statement
-        wrapper = """
-                    SELECT t.type,
-                           t.rel_prop,
-                           t.source_id,
-                           t.source_type,
-                           (t.source_properties - 'labels') || '{{"embedding": null, "name": null}}'::jsonb AS source_properties,
-                           t.target_id,
-                           t.target_type,
-                           (t.target_properties - 'labels') || '{{"embedding": null, "name": null}}'::jsonb AS target_properties
-                    FROM ({})t;
-        """
-        data = self.structured_query(wrapper.format(cypher_statement))
+        query += ")t"
+        data = self.structured_query(
+            sql.SQL(query).format(
+                BASE_ENTITY_LABEL=sql.Literal(BASE_ENTITY_LABEL),
+                BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL)
+            ), params=params
+        )
         data = data if data else []
 
         triplets = []
@@ -645,18 +639,18 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             source = EntityNode(
                 name=record["source_id"],
                 label=record["source_type"],
-                properties=remove_empty_values(record["source_properties"]),
+                properties=record["source_properties"],
             )
             target = EntityNode(
                 name=record["target_id"],
                 label=record["target_type"],
-                properties=remove_empty_values(record["target_properties"]),
+                properties=record["target_properties"],
             )
             rel = Relation(
                 source_id=record["source_id"],
                 target_id=record["target_id"],
                 label=record["type"],
-                properties=remove_empty_values(record["rel_prop"]),
+                properties=record["rel_prop"],
             )
             triplets.append([source, rel, target])
         return triplets
@@ -672,10 +666,22 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         triples = []
 
         ids = [node.id for node in graph_nodes]
-        cypher_statement = f"""
+        query = """SELECT t.source_id,
+                            t.source_type,
+                            (t.source_properties - 'labels') || '{{"embedding": null, "id": null}}'::jsonb AS source_properties,
+                            t.type,
+                            t.rel_properties,
+                            t.target_id,
+                            t.target_type,
+                            (t.target_properties - 'labels') || '{{"embedding": null, "id": null}}'::jsonb AS target_properties
+                      FROM (
+                """
+        query += f"""
             UNWIND {[0] if len(ids) == 1 else f'range(0, {len(ids)} - 1)::jsonb'} AS idx
-            MATCH (e:"{BASE_NODE_LABEL}")
-            WHERE e.id = {ids}[idx]
+            """
+        query += """
+            MATCH (e:{BASE_NODE_LABEL})
+            WHERE e.id = %(ids)s[idx]
             MATCH p=(e)-[r*1..{depth}]-(other)
             UNWIND relationships(p) AS rel
             WITH DISTINCT rel, idx, collect(type(rel)) AS types
@@ -687,10 +693,10 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 idx,
                 startNode(rel).labels AS source_labels,
                 endNode(rel).labels AS target_labels
-            LIMIT {limit}
+            LIMIT %(limit)s
             RETURN source.id AS source_id,
                 CASE
-                    WHEN '{BASE_ENTITY_LABEL}' IN source_labels THEN
+                    WHEN {BASE_ENTITY_LABEL} IN source_labels THEN
                         CASE
                             WHEN length(source_labels) > 2 THEN source_labels[2]
                             WHEN length(source_labels) > 1 THEN source_labels[1]
@@ -703,7 +709,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 properties(rel_properties) as rel_properties,
                 endNode.id AS target_id,
                 CASE
-                    WHEN '{BASE_ENTITY_LABEL}' IN target_labels THEN
+                    WHEN {BASE_ENTITY_LABEL} IN target_labels THEN
                         CASE
                             WHEN length(target_labels) > 2 THEN target_labels[2]
                             WHEN length(target_labels) > 1 THEN target_labels[1] ELSE NULL
@@ -713,19 +719,16 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 properties(endNode) AS target_properties,
                 idx
             ORDER BY idx
-            LIMIT {limit}
+            LIMIT %(limit)s
             """
-        wrapper = """SELECT t.source_id,
-                            t.source_type,
-                            (t.source_properties - 'labels') || '{{"embedding": null, "id": null}}'::jsonb AS source_properties,
-                            t.type,
-                            t.rel_properties,
-                            t.target_id,
-                            t.target_type,
-                            (t.target_properties - 'labels') || '{{"embedding": null, "id": null}}'::jsonb AS target_properties
-                      FROM ({})t;
-          """
-        response = self.structured_query(wrapper.format(cypher_statement))
+        query += ")t"
+        response = self.structured_query(
+            sql.SQL(query).format(
+                BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL),
+                BASE_ENTITY_LABEL=sql.Literal(BASE_ENTITY_LABEL),
+                depth=depth
+            ), {"ids": Jsonb(ids), "limit": limit}
+        )
         response = response if response else []
 
         ignore_rels = ignore_rels or []
@@ -736,18 +739,18 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             source = EntityNode(
                 name=record["source_id"],
                 label=record["source_type"],
-                properties=remove_empty_values(record["source_properties"]),
+                properties=record["source_properties"],
             )
             target = EntityNode(
                 name=record["target_id"],
                 label=record["target_type"],
-                properties=remove_empty_values(record["target_properties"]),
+                properties=record["target_properties"],
             )
             rel = Relation(
                 source_id=record["source_id"],
                 target_id=record["target_id"],
                 label=record["type"],
-                properties=remove_empty_values(record["rel_properties"]),
+                properties=record["rel_properties"],
             )
             triples.append([source, rel, target])
 
@@ -763,40 +766,47 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         """Delete matching data."""
         if entity_names:
             self.structured_query(
-                f"MATCH (n) WHERE n.name IN {entity_names} DETACH DELETE n"
+                "MATCH (n) WHERE n.name <@ %(entity_names)s DETACH DELETE n",
+                {"entity_names": Jsonb(entity_names)}
             )
 
         if ids:
             self.structured_query(
-                f"MATCH (n) WHERE n.id IN {ids} DETACH DELETE n"
+                "MATCH (n) WHERE n.id <@ %(ids)s DETACH DELETE n",
+                {"ids": Jsonb(ids)}
             )
 
         if relation_names:
             for rel in relation_names:
-                self.structured_query(f'MATCH ()-[r:"{rel}"]->() DELETE r')
+                self.structured_query(
+                    sql.SQL(
+                        'MATCH ()-[r:{rel}]->() DELETE r'
+                    ).format(
+                        rel=sql.Identifier(rel)
+                    )
+                )
 
         if properties:
             cypher = "MATCH (e) WHERE "
-            prop_list = []
-            for i, prop in enumerate(properties):
-                property = properties[prop] if not isinstance(properties[prop], str) else f"'{properties[prop]}'"
-                prop_list.append(f'e."{prop}" = {property}')
-            cypher += " AND ".join(prop_list)
-            self.structured_query(cypher + " DETACH DELETE e")
+            props = [f'e."{prop}" = %({prop})s' for prop in properties]
+            cypher += " AND ".join(props)
+            cypher += " DETACH DELETE e"
+            params = {f"{prop}": Jsonb(properties[prop]) for prop in properties}
+            self.structured_query(cypher, params=params)
 
     def vector_query(
         self, query: VectorStoreQuery, **kwargs: Any
     ) -> Tuple[List[LabelledNode], List[float]]:
         """Query the graph store with a vector store query."""
         if self._supports_vector_index:
-            vector_query = f"""
+            vector_query = """
                             SELECT
                                 t.name,
                                 t.type,
                                 (t.properties - 'labels') || '{{"embedding": null, "name": null, "id": null}}'::jsonb AS properties,
-                                1 - ((t.properties->>'embedding')::vector(3) <=> '{query.query_embedding}'::vector({self.vector_dimension})) AS similarity
+                                1 - ((t.properties->>'embedding')::vector(3) <=> %(query_embedding)s::vector({vector_dimension})) AS similarity
                             FROM (
-                                MATCH (n: "__Node__")
+                                MATCH (n: {BASE_NODE_LABEL})
                                 WITH n, n.labels AS labels
                                 RETURN n.id as name,
                                        properties(n) AS properties,
@@ -811,37 +821,52 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                                        END AS type   
                             )t ORDER BY
                                 (properties->>'embedding')::vector(3) <=> '[0.1, 0.2, 0.31]'::vector(3)
-                            LIMIT {query.similarity_top_k};
+                            LIMIT %(top_k)s;
                             """
-            data = self.structured_query(vector_query)
+            data = self.structured_query(sql.SQL(vector_query).format(
+                BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL),
+                vector_dimension=self.vector_dimension
+            ), {
+                "query_embedding": Jsonb(query.query_embedding),
+                "top_k": query.similarity_top_k
+            })
         elif self._supports_vector_store:
-            wrapper = """SELECT t.name,
+            vector_query = """SELECT t.name,
                                 t.type,
                                 t.similarity,
                                 (t.properties - 'labels') || '{{"embedding": null, "name": null, "id": null}}'::jsonb AS properties
-                        FROM ({})t
-                        """
-            vector_query = f"""
-                            MATCH (n: "{BASE_NODE_LABEL}")
+                            FROM (
+                            """
+            vector_query += """
+                            MATCH (n: {BASE_NODE_LABEL})
                             WITH n,
                                 n.labels AS labels,
-                                {query.query_embedding}::vector <=> n.embedding::vector AS cos_d
+                                %(query_embedding)s::vector <=> n.embedding::vector AS cos_d
                             ORDER BY cos_d
-                            LIMIT {query.similarity_top_k}
+                            LIMIT %(top_k)s
                             RETURN n.id as name,
                                 properties(n) AS properties,
                                 1-cos_d as similarity,
                                 CASE
-                                        WHEN '{BASE_ENTITY_LABEL}' IN labels THEN
-                                            CASE
-                                                WHEN length(labels) > 2 THEN labels[2]
-                                                WHEN length(labels) > 1 THEN labels[1]
-                                                ELSE NULL
-                                            END
-                                        ELSE labels[0]
+                                    WHEN {BASE_ENTITY_LABEL} IN labels THEN
+                                        CASE
+                                            WHEN length(labels) > 2 THEN labels[2]
+                                            WHEN length(labels) > 1 THEN labels[1]
+                                            ELSE NULL
+                                        END
+                                    ELSE labels[0]
                                 END AS type
                             """
-            data = self.structured_query(wrapper.format(vector_query))
+            vector_query += ")t"
+            data = self.structured_query(
+                sql.SQL(vector_query).format(
+                    BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL),
+                    BASE_ENTITY_LABEL=sql.Literal(BASE_ENTITY_LABEL)
+                ), {
+                    "query_embedding": Jsonb(query.query_embedding),
+                    "top_k": query.similarity_top_k
+                }
+            )
         else:
             data = []
         data = data if data else []
@@ -852,7 +877,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             node = EntityNode(
                 name=record["name"],
                 label=record["type"],
-                properties=remove_empty_values(record["properties"]),
+                properties=record["properties"],
             )
             nodes.append(node)
             scores.append(record["similarity"])
@@ -914,7 +939,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
 
         return d
 
-    @require_psycopg2
+    @require_psycopg
     def structured_query(self, query: str, params: dict = {}) -> List[Dict[str, Any]]:
         """
         Query the graph by taking a cypher query, executing it and
@@ -931,9 +956,9 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         # execute the query, rolling back on an error
         with self._get_cursor() as curs:
             try:
-                curs.execute(query)
+                curs.execute(query, params)
                 self.connection.commit()
-            except psycopg2.Error as e:
+            except psycopg.Error as e:
                 self.connection.rollback()
                 raise AgensQueryException(
                     {
@@ -943,7 +968,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 )
             try:
                 data = curs.fetchall()
-            except psycopg2.ProgrammingError:
+            except psycopg.ProgrammingError:
                 data = []  # Handle queries that don’t return data
 
             if data is None:
@@ -957,7 +982,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
 
             return result
 
-    @require_psycopg2
+    @require_psycopg
     def _get_node_properties(self) -> Dict[str, Any]:
         node_properties = {}
         with self._get_cursor() as curs:
@@ -969,7 +994,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
 
         return node_properties
 
-    @require_psycopg2
+    @require_psycopg
     def _get_edge_properties(self) -> Dict[str, Any]:
         edge_properties = {}
         with self._get_cursor() as curs:

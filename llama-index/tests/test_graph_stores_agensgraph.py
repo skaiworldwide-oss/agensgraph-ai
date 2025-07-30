@@ -18,7 +18,7 @@ import pytest
 import os
 
 from llama_index.core.graph_stores.types import GraphStore
-from llama_index.graph_stores.agensgraph import AgensGraphStore
+from llama_index_agensgraph.graph_stores.agensgraph import AgensGraphStore
 
 agens_db = os.environ.get("AGENS_DB")
 agens_user = os.environ.get("AGENS_USER")
@@ -47,13 +47,13 @@ def agens_graph_store() -> AgensGraphStore:
     Adjust parameters to match your test database or local AgensGraph setup.
     """
     conf = {
-        "database": agens_db,
+        "dbname": agens_db,
         "user": agens_user,
         "password": agens_password,
         "host": agens_host,
         "port": agens_port,
     }
-    agens_graph_store = AgensGraphStore("test", conf=conf)
+    agens_graph_store = AgensGraphStore("test", conf=conf, create=True)
     # Teardown: remove any remaining data to avoid polluting tests
     # For a small test DB, you can delete all nodes & relationships:
     agens_graph_store.query("MATCH (n) DETACH DELETE n")

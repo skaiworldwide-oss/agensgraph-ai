@@ -15,7 +15,8 @@ limitations under the License.
 '''
 
 from typing import Any, Dict, Union, List
-import psycopg2
+import psycopg
+from psycopg import sql
 from functools import wraps
 
 class AgensQueryException(Exception):
@@ -34,11 +35,32 @@ class AgensQueryException(Exception):
 
     def get_details(self) -> Any:
         return self.details
+    
+def get_graph_id(curs, graph_name: str):
+    graph_id_query = (
+        """SELECT oid as graphid FROM ag_graph WHERE graphname = %(graph_name)s;"""
+    )
+    execute_query(
+        curs, graph_id_query, {"graph_name": graph_name}, "Error getting graph id"
+    )
+    return curs.fetchone().graphid if curs.rowcount > 0 else None
 
-def execute_query(curs, query, error_message = "Error executing query"):
+def create_graph(curs, graph_name: str):
+    create_statement = sql.SQL("""
+                    CREATE GRAPH {};
+                """).format(sql.Identifier(graph_name))
+    execute_query(curs, create_statement, error_message="Error creating graph")
+
+def set_graph_path(curs, graph_name: str):
+    graph_path = sql.SQL("SET graph_path = {};").format(
+        sql.Identifier(graph_name)
+    )
+    execute_query(curs, graph_path)
+
+def execute_query(curs, query, params={}, error_message = "Error executing query"):
     try:
-        curs.execute(query)
-    except psycopg2.Error as e:
+        curs.execute(query, params)
+    except psycopg.Error as e:
 
         raise AgensQueryException(
             {
@@ -47,15 +69,15 @@ def execute_query(curs, query, error_message = "Error executing query"):
             }
         )
 
-def require_psycopg2(func):
+def require_psycopg(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
         try:
-            import psycopg2
+            import psycopg
         except ImportError:
             raise ImportError(
-                "Could not import psycopg2 python package. "
-                "Please install it with `pip install psycopg2`."
+                "Could not import psycopg python package. "
+                "Please install it with `pip install psycopg`."
             )
         return func(*args, **kwargs)
     return wrapper

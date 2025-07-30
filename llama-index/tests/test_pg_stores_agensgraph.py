@@ -17,7 +17,7 @@ limitations under the License.
 import os
 import pytest
 
-from llama_index.graph_stores.agensgraph import AgensPropertyGraphStore
+from llama_index_agensgraph.graph_stores.agensgraph import AgensPropertyGraphStore
 from llama_index.core.graph_stores.types import EntityNode, ChunkNode, Relation
 from llama_index.core.vector_stores.types import VectorStoreQuery
 from llama_index.core.schema import TextNode
@@ -50,13 +50,13 @@ def agens_store() -> AgensPropertyGraphStore:
         pytest.skip("No agensgraph credentials provided")
     
     conf = {
-        "database": agens_db,
+        "dbname": agens_db,
         "user": agens_user,
         "password": agens_password,
         "host": agens_host,
         "port": agens_port,
     }
-    agens_store = AgensPropertyGraphStore("test", conf=conf)
+    agens_store = AgensPropertyGraphStore("test", conf=conf, create=True)
     agens_store.structured_query("MATCH (n) DETACH DELETE n")
     return agens_store
 

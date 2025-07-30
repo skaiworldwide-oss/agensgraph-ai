@@ -21,8 +21,10 @@ import json, re
 from typing import Any, Dict, List, Optional, NamedTuple, Pattern, Tuple
 
 from llama_index.core.graph_stores.types import GraphStore
-import psycopg2.extras
-from llama_index.graph_stores.agensgraph.utils import *
+import psycopg
+from psycopg import sql
+from psycopg.types.json import Jsonb
+from llama_index_agensgraph.graph_stores.agensgraph.utils import *
 
 logger = logging.getLogger(__name__)
 
@@ -127,26 +129,14 @@ class AgensGraphStore(GraphStore):
 
         self.graph_name = graph_name
         self.node_label = node_label
-        self.connection = psycopg2.connect(**conf)
+        self.connection = psycopg.connect(**conf)
 
         with self._get_cursor() as curs:
-            # check if graph with name graph_name exists
-            graph_id_query = (
-                """SELECT oid as graphid FROM ag_graph WHERE graphname = '{}';""".format(
-                    graph_name
-                )
-            )
-
-            execute_query(curs, graph_id_query)
-            data = curs.fetchone()
-
+            graphid = get_graph_id(curs, graph_name)
             # if graph doesn't exist and create is True, create it
-            if data is None:
+            if graphid is None:
                 if create:
-                    create_statement = """
-                        CREATE GRAPH {};
-                    """.format(graph_name)
-                    execute_query(curs, create_statement)
+                    create_graph(curs, graph_name)
                     self.connection.commit()
                 else:
                     raise Exception(
@@ -155,16 +145,11 @@ class AgensGraphStore(GraphStore):
                             + 'and "create" is set to False'
                         ).format(graph_name)
                     )
+                graphid = get_graph_id(curs, graph_name)
 
-                execute_query(curs, graph_id_query)
-                data = curs.fetchone()
-
-            # store graph id and refresh the schema
-            self.graphid = data.graphid
-
-            # set the graph path to the current graph
-            graph_path = """SET graph_path = '{}';""".format(self.graph_name)
-            execute_query(curs, graph_path)
+            self.graphid = graphid
+            set_graph_path(curs, graph_name)
+            # create util functions if they do not exist
             execute_query(curs, flatten_function)
             execute_query(curs, typeof_function)
             self.connection.commit()
@@ -179,29 +164,31 @@ class AgensGraphStore(GraphStore):
             )
         )
 
-    @require_psycopg2
-    def _get_cursor(self) -> psycopg2.extras.NamedTupleCursor:
+    @require_psycopg
+    def _get_cursor(self) -> psycopg.Cursor:
         """
         get cursor and set graph_path to the current graph
         """
-        cursor = self.connection.cursor(cursor_factory=psycopg2.extras.NamedTupleCursor)
+        cursor = self.connection.cursor(row_factory=psycopg.rows.namedtuple_row)
         return cursor
 
     @property
     def client(self) -> Any:
         return self.connection
 
-    @require_psycopg2
+    @require_psycopg
     def get(self, subj: str) -> List[List[str]]:
         """Get triplets."""
-        query = """
-            MATCH (n1:"{}")-[r]->(n2:"{}")
-            WHERE n1.id = '{}'
+        query = sql.SQL("""
+            MATCH (n1:{label})-[r]->(n2:{label})
+            WHERE n1.id = %(subj)s
             RETURN type(r), n2.id;
-        """.format(self.node_label, self.node_label, subj)
+        """).format(
+            label=sql.Identifier(self.node_label)
+        )
 
         with self._get_cursor() as curs:
-            execute_query(curs, query)
+            execute_query(curs, query, params={"subj": Jsonb(subj)}, error_message="Error executing get query")
             rows = curs.fetchall()
         
         result = []
@@ -235,15 +222,18 @@ class AgensGraphStore(GraphStore):
         
         subjs = [subj.lower() for subj in subjs]
 
-        query = (
-            f"""MATCH p=(n1:"{self.node_label}")-[*1..{depth}]->() """
-            f"""WHERE toLower(n1.id) IN {subjs} """
-            "UNWIND relationships(p) AS rel "
-            "WITH n1.id AS subj, p, collect([type(rel), endNode(rel).id]) AS path "
-            f"RETURN subj, collect(DISTINCT flatten(path)) AS flattened_rels LIMIT {limit}"
-        )
+        query = sql.SQL(
+            """MATCH p=(n1:{label})-[*1..{depth}]->() 
+               WHERE toLower(n1.id) <@ %(subjs)s 
+               UNWIND relationships(p) AS rel 
+               WITH n1.id AS subj, p, collect([type(rel), endNode(rel).id]) AS path 
+               RETURN subj, collect(DISTINCT flatten(path)) AS flattened_rels LIMIT %(limit)s;"""
+        ).format(label=sql.Identifier(self.node_label), depth=sql.Literal(depth))
 
-        data = self.query(query)
+        data = self.query(query, params={
+            "subjs": Jsonb(subjs),
+            "limit": limit
+        })
 
         if not data:
             return rel_map
@@ -254,46 +244,49 @@ class AgensGraphStore(GraphStore):
 
     def upsert_triplet(self, subj: str, rel: str, obj: str) -> None:
         """Add triplet."""
-        query = """
-            MERGE (n1:"%s" {{id: '{subj}'}})
-            MERGE (n2:"%s" {{id: '{obj}'}})
-            MERGE (n1)-[:"%s"]->(n2)
-        """
-
-        query = query % (
-            self.node_label,
-            self.node_label,
-            rel.replace(" ", "_").upper(),
+        query = sql.SQL("""
+            MERGE (n1:{label} {{id: %(subj)s}})
+            MERGE (n2:{label} {{id: %(obj)s}})
+            MERGE (n1)-[:{rel_label}]->(n2)
+        """).format(
+            label=sql.Identifier(self.node_label),
+            rel_label=sql.Identifier(rel.replace(" ", "_").upper())
         )
 
-        self.query(query.format(subj=subj, obj=obj))
+        self.query(query, params={"subj": Jsonb(subj), "obj": Jsonb(obj)})
 
     def delete(self, subj: str, rel: str, obj: str) -> None:
         """Delete triplet."""
 
         def delete_rel(subj: str, obj: str, rel: str) -> None:
-            query = """
-                MATCH (n1:"{}")-[r:"{}"]->(n2:"{}")
-                WHERE n1.id = '{}' AND n2.id = '{}'
+            query = sql.SQL("""
+                MATCH (n1:{label})-[r:{rel_label}]->(n2:{label})
+                WHERE n1.id = %(subj)s AND n2.id = %(obj)s
                 DELETE r
-            """.format(self.node_label, rel, self.node_label, subj, obj)
-            self.query(query)
+            """).format(
+                label=sql.Identifier(self.node_label),
+                rel_label=sql.Identifier(rel.replace(" ", "_").upper())
+            )
+            self.query(query, params={
+                "subj": Jsonb(subj),
+                "obj": Jsonb(obj)
+            })
 
         def delete_entity(entity: str) -> None:
-            query = """
-                MATCH (n:"{}")
-                WHERE n.id = '{}'
+            query = sql.SQL("""
+                MATCH (n:{label})
+                WHERE n.id = %(entity)s
                 DELETE n
-            """.format(self.node_label, entity)
-            self.query(query)
+            """).format(label=sql.Identifier(self.node_label))
+            self.query(query, params={"entity": Jsonb(entity)})
 
         def check_edges(entity: str) -> bool:
-            query = """
-                MATCH (n1:"{}")--()
-                WHERE n1.id = '{}'
+            query = sql.SQL("""
+                MATCH (n1:{label})-[]-()
+                WHERE n1.id = %(entity)s
                 RETURN count(*)
-            """.format(self.node_label, entity)
-            data = self.query(query)
+            """).format(label=sql.Identifier(self.node_label))
+            data = self.query(query, params={"entity": Jsonb(entity)})
             return bool(data[0]["count"])
 
         delete_rel(subj, obj, rel)
@@ -396,7 +389,7 @@ class AgensGraphStore(GraphStore):
 
         return d
 
-    @require_psycopg2
+    @require_psycopg
     def query(self, query: str, params: dict = {}) -> List[Dict[str, Any]]:
         """
         Query the graph by taking a cypher query, executing it and
@@ -413,9 +406,9 @@ class AgensGraphStore(GraphStore):
         # execute the query, rolling back on an error
         with self._get_cursor() as curs:
             try:
-                curs.execute(query)
+                curs.execute(query, params)
                 self.connection.commit()
-            except psycopg2.Error as e:
+            except psycopg.Error as e:
                 self.connection.rollback()
                 raise AgensQueryException(
                     {
@@ -425,7 +418,7 @@ class AgensGraphStore(GraphStore):
                 )
             try:
                 data = curs.fetchall()
-            except psycopg2.ProgrammingError:
+            except psycopg.ProgrammingError:
                 data = []  # Handle queries that don’t return data
 
             if data is None:
@@ -436,7 +429,7 @@ class AgensGraphStore(GraphStore):
 
             return result
 
-    @require_psycopg2
+    @require_psycopg
     def _get_node_properties(self) -> List[Dict[str, Any]]:
         """
         Fetch a list of available node properties by node label to be used
@@ -474,7 +467,7 @@ class AgensGraphStore(GraphStore):
 
         return node_properties
 
-    @require_psycopg2
+    @require_psycopg
     def _get_edge_properties(self) -> List[Dict[str, Any]]:
         """
         Fetch a list of available edge properties by edge label to be used

@@ -26,10 +26,10 @@ pip install llama-index llama_index_graph_stores_agensgraph
 
 ### AgensGraphStore
 ```python
-from llama_index.graph_stores.agensgraph import AgensGraphStore
+from llama_index_agensgraph.graph_stores.agensgraph import AgensGraphStore
 
 conf = {
-    "database": "",
+    "dbname": "",
     "user": "",
     "password": "",
     "host": "",
@@ -41,10 +41,10 @@ graph = AgensGraphStore(graph_name="", conf=conf, create=True)
 
 ### AgensPropertyGraphStore
 ```python
-from llama_index.graph_stores.agensgraph import AgensPropertyGraphStore
+from llama_index_agensgraph.graph_stores.agensgraph import AgensPropertyGraphStore
 
 conf = {
-    "database": "",
+    "dbname": "",
     "user": "",
     "password": "",
     "host": "",

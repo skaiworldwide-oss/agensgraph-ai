@@ -1,4 +1,4 @@
-"""Memgraph Adapter for Graph Database"""
+"""Agensgraph Adapter for Graph Database"""
 
 import json, re
 from cognee.shared.logging_utils import get_logger, ERROR
@@ -14,6 +14,7 @@ from cognee.infrastructure.databases.graph.graph_db_interface import (
 )
 from cognee.modules.storage.utils import JSONEncoder
 from cognee.infrastructure.databases.exceptions.exceptions import NodesetFilterNotSupportedError
+from .metrics import *
 
 import psycopg
 from psycopg import sql
@@ -153,7 +154,7 @@ class AgensgraphQueryException(Exception):
 
 class AgensgraphAdapter(GraphDBInterface):
     """
-    Handles interaction with a Memgraph database through various graph operations.
+    Handles interaction with a Agensgraph database through various graph operations.
 
     Public methods include:
     - get_session
@@ -335,14 +336,14 @@ class AgensgraphAdapter(GraphDBInterface):
 
             - bool: True if the node exists, otherwise False.
         """
-        results = self.query(
-            f"""
-                MATCH (n:"{BASE_LABEL}")
-                WHERE n.id = '{node_id}'
+        results = self.query(sql.SQL(
+            """
+                MATCH (n:{BASE_LABEL})
+                WHERE n.id = %(node_id)s
                 WITH COUNT(n) AS nodes
                 RETURN nodes > 0 AS node_exists
-            """,
-            {"node_id": node_id},
+            """).format(BASE_LABEL=sql.Identifier(BASE_LABEL)),
+            {"node_id": Jsonb(node_id)}
         )
         return results[0]["node_exists"] if len(results) > 0 else False
 
@@ -1052,13 +1053,18 @@ class AgensgraphAdapter(GraphDBInterface):
 
             A tuple of nodes and edges data.
         """
-        query_nodes = "MATCH (n) RETURN collect(n) AS nodes"
+        query_nodes = "MATCH (n) RETURN collect(properties(n)) AS nodes"
         nodes = await self.query(query_nodes)
 
-        query_edges = "MATCH (n)-[r]->(m) RETURN collect([n, r, m]) AS elements"
+        query_edges = "MATCH (n)-[r]->(m) RETURN collect([properties(n), properties(r), properties(m)]) AS edges"
         edges = await self.query(query_edges)
 
         return (nodes, edges)
+    
+    async def project_entire_graph(self, graph_name="cognee"):
+        logger.warning(
+            "Agensgraph does not support in-memory graph projection. "
+        )
 
     async def get_graph_data(self):
         """
@@ -1072,7 +1078,6 @@ class AgensgraphAdapter(GraphDBInterface):
         query = "MATCH (n) RETURN ID(n) AS id, get_labels(n) AS labels, properties(n) AS properties"
 
         result = await self.query(query)
-
         nodes = [
             (
                 record["properties"]["id"],
@@ -1217,15 +1222,15 @@ class AgensgraphAdapter(GraphDBInterface):
 
         return (nodes, edges)
 
-    async def graph_exists(self, graph_name="myGraph"):
+    async def graph_exists(self, graph_name="cognee"):
         """
         Check if a graph with a given name exists in the database.
 
         Parameters:
         -----------
 
-            - graph_name: The name of the graph to check for existence, defaults to 'myGraph'.
-              (default 'myGraph')
+            - graph_name: The name of the graph to check for existence, defaults to 'cognee'.
+              (default 'cognee')
 
         Returns:
         --------
@@ -1288,15 +1293,15 @@ class AgensgraphAdapter(GraphDBInterface):
         )
         return relationship_types_undirected_str
 
-    async def drop_graph(self, graph_name="myGraph"):
+    async def drop_graph(self, graph_name="cognee"):
         """
         Drop an existing graph from the database based on its name.
 
         Parameters:
         -----------
 
-            - graph_name: The name of the graph to drop, defaults to 'myGraph'. (default
-              'myGraph')
+            - graph_name: The name of the graph to drop, defaults to 'cognee'. (default
+              'cognee')
         """
         drop_query = f"DROP GRAPH IF EXISTS {graph_name} CASCADE"
         await self.query(drop_query)
@@ -1318,49 +1323,24 @@ class AgensgraphAdapter(GraphDBInterface):
             A dictionary containing graph metrics, both mandatory and optional based on the
             input flag.
         """
+        nodes, edges = await self.get_model_independent_graph_data()
+        num_nodes = len(nodes[0]["nodes"])
+        num_edges = len(edges[0]["edges"])
 
-        logger.error(
-            "get_graph_metrics is not implemented yet. Please implement it according to your "
-            "graph structure and requirements."
-        )
-        # nodes, edges = await self.get_model_independent_graph_data()
-        # graph_name = "myGraph"
-        # await self.drop_graph(graph_name)
-        # await self.project_entire_graph(graph_name)
+        mandatory_metrics = {
+            "num_nodes": num_nodes,
+            "num_edges": num_edges,
+            "mean_degree": (2 * num_edges) / num_nodes if num_nodes != 0 else None,
+            "edge_density": await get_edge_density(self),
+            "num_selfloops": await count_self_loops(self),
+        }
 
-        # num_nodes = len(nodes[0]["nodes"])
-        # num_edges = len(edges[0]["elements"])
+        if include_optional:
+            logger.error(
+                "Optional metrics are not implemented in AgensgraphAdapter yet."
+            )
 
-        # mandatory_metrics = {
-        #     "num_nodes": num_nodes,
-        #     "num_edges": num_edges,
-        #     "mean_degree": (2 * num_edges) / num_nodes if num_nodes != 0 else None,
-        #     "edge_density": await get_edge_density(self),
-        #     "num_connected_components": await get_num_connected_components(self, graph_name),
-        #     "sizes_of_connected_components": await get_size_of_connected_components(
-        #         self, graph_name
-        #     ),
-        # }
-
-        # if include_optional:
-        #     shortest_path_lengths = await get_shortest_path_lengths(self, graph_name)
-        #     optional_metrics = {
-        #         "num_selfloops": await count_self_loops(self),
-        #         "diameter": max(shortest_path_lengths) if shortest_path_lengths else -1,
-        #         "avg_shortest_path_length": sum(shortest_path_lengths) / len(shortest_path_lengths)
-        #         if shortest_path_lengths
-        #         else -1,
-        #         "avg_clustering": await get_avg_clustering(self, graph_name),
-        #     }
-        # else:
-        #     optional_metrics = {
-        #         "num_selfloops": -1,
-        #         "diameter": -1,
-        #         "avg_shortest_path_length": -1,
-        #         "avg_clustering": -1,
-        #     }
-
-        # return mandatory_metrics | optional_metrics
+        return mandatory_metrics
 
     async def get_document_subgraph(self, content_hash: str):
         """
@@ -1414,11 +1394,11 @@ class AgensgraphAdapter(GraphDBInterface):
         )
 
         RETURN
-            collect(DISTINCT doc) as document,
-            collect(DISTINCT chunk) as chunks,
-            collect(DISTINCT entity) as orphan_entities,
-            collect(DISTINCT made_node) as made_from_nodes,
-            collect(DISTINCT type) as orphan_types
+            collect(DISTINCT properties(doc)) as document,
+            collect(DISTINCT properties(chunk)) as chunks,
+            collect(DISTINCT properties(entity)) as orphan_entities,
+            collect(DISTINCT properties(made_node)) as made_from_nodes,
+            collect(DISTINCT properties(type)) as orphan_types
         """
         result = await self.query(query, {"content_hash": Jsonb(content_hash)})
         return result[0] if result else None

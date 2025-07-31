@@ -1,6 +1,7 @@
 import pytest
 from unittest.mock import AsyncMock, patch
 from cognee.tasks.storage.index_graph_edges import index_graph_edges
+import cognee_agensgraph
 
 
 @pytest.mark.asyncio

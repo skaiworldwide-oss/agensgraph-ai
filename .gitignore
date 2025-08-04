@@ -35,6 +35,7 @@ examples/input/
 examples/output/
 output*/
 custom_kg/
+data/
 
 # Miscellaneous
 .DS_Store

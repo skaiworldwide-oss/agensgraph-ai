@@ -7,6 +7,8 @@ This repository currently includes:
 * [LangChain](./langchain/) — LLM agents, tools, and chains
 * [LlamaIndex](./llama-index/) — custom data indexing and retrieval
 * [LightRag](./lightrag/) — graph-aware RAG for accurate, context-rich retrieval
+* [cognee](./cognee) — dynamic memory for Agents
+* [mcp](./mcp-agensgraph/) — Model Context Protocol server for AgensGraph enabling database access and graph exploration.
 
 > ✅ Each library has its own subfolder with a dedicated README to guide you through setup and usage.
 

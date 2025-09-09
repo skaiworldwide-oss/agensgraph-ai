@@ -3,7 +3,7 @@ build-backend = "poetry.core.masonry.api"
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 
 [tool.poetry]
-name = "lightrag_agensgraph"
+name = "lightrag-agensgraph"
 version = "0.1.0"
 description = "Lightrag graph store implementation for agensgraph"
 authors = ["Muhammad Taha Naveed <skaisw@skaiworldwide.com>"]

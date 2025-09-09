@@ -24,7 +24,6 @@ from psycopg import sql
 from psycopg.types.json import Jsonb
 
 import numpy as np
-from langchain_core._api.deprecation import deprecated
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.utils import get_from_dict_or_env

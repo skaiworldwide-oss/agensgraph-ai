@@ -1,6 +1,5 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
-from psycopg import sql
 
 if TYPE_CHECKING:
     from cognee_agensgraph.infrastructure.databases.graph.agensgraph.adapter import AgensgraphAdapter
@@ -65,36 +64,4 @@ async def count_self_loops(adapter: AgensgraphAdapter):
     result = await adapter.query(query)
     return result[0]["adapter_loop_count"] if result else 0
 
-
-# async def get_shortest_path_lengths(adapter: AgensgraphAdapter):
-#     """
-#     Fetches the shortest path lengths for a specified graph.
-
-#     Executes a Cypher query to retrieve the shortest path distances from an Agensgraph graph
-#     If no results are returned, an empty list is provided as output.
-
-#     Parameters:
-#     -----------
-
-#         - adapter (AgensgraphAdapter): The AgensgraphAdapter instance used to communicate with the
-#           Agensgraph database.
-
-#     Returns:
-#     --------
-
-#         A list containing the shortest path distances or an empty list if no results are
-#         found.
-#     """
-#     query = sql.SQL("""
-#         MATCH (source)
-#         UNWIND source.labels as label
-#         MATCH p=allshortestpaths((source)-[*]-(target)) WHERE label IN source.labels
-#         WITH length(p) as path_length WHERE path_length IS NOT NULL
-#         return collect(path_length) as path_lengths;
-#     """).format(
-#         BASE_LABEL=sql.Identifier("__Node__")
-#     )
-
-#     result = await adapter.query(query)
-#     return result[0]["path_lengths"] if result else []
 

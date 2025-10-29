@@ -8,6 +8,7 @@ logger = logging.getLogger(__name__)
 
 ALLOWED_TRANSPORTS = ["stdio", "http", "sse"]
 
+
 def format_namespace(namespace: str) -> str:
     """
     Format the namespace to ensure it ends with a hyphen.
@@ -29,7 +30,8 @@ def format_namespace(namespace: str) -> str:
             return namespace + "-"
     else:
         return ""
-    
+
+
 def parse_transport(args: argparse.Namespace) -> Literal["stdio", "http", "sse"]:
     """
     Parse the transport from the command line arguments or environment variables.
@@ -244,7 +246,9 @@ def parse_allow_origins(args: argparse.Namespace) -> list[str]:
             # split comma-separated string into list.
             return [
                 origin.strip()
-                for origin in os.getenv("AGENSGRAPH_MCP_SERVER_ALLOW_ORIGINS", "").split(",")
+                for origin in os.getenv(
+                    "AGENSGRAPH_MCP_SERVER_ALLOW_ORIGINS", ""
+                ).split(",")
                 if origin.strip()
             ]
         else:
@@ -278,7 +282,9 @@ def parse_allowed_hosts(args: argparse.Namespace) -> list[str]:
             # split comma-separated string into list
             return [
                 host.strip()
-                for host in os.getenv("AGENSGRAPH_MCP_SERVER_ALLOWED_HOSTS", "").split(",")
+                for host in os.getenv("AGENSGRAPH_MCP_SERVER_ALLOWED_HOSTS", "").split(
+                    ","
+                )
                 if host.strip()
             ]
         else:
@@ -287,21 +293,27 @@ def parse_allowed_hosts(args: argparse.Namespace) -> list[str]:
             )
             return ["localhost", "127.0.0.1"]
 
+
 def parse_namespace(args: argparse.Namespace) -> str:
     """
     Parse the namespace from the command line arguments or environment variables.
     """
-        # namespace configuration
+    # namespace configuration
     if args.namespace is not None:
         logger.info(f"Info: Namespace provided for tools: {args.namespace}")
         return args.namespace
     else:
         if os.getenv("AGENSGRAPH_NAMESPACE") is not None:
-            logger.info(f"Info: Namespace provided for tools: {os.getenv('AGENSGRAPH_NAMESPACE')}")
+            logger.info(
+                f"Info: Namespace provided for tools: {os.getenv('AGENSGRAPH_NAMESPACE')}"
+            )
             return os.getenv("AGENSGRAPH_NAMESPACE")
         else:
-            logger.info("Info: No namespace provided for tools. No namespace will be used.")
+            logger.info(
+                "Info: No namespace provided for tools. No namespace will be used."
+            )
             return ""
+
 
 def process_config(args: argparse.Namespace) -> dict[str, Union[str, int, None]]:
     """
@@ -335,8 +347,6 @@ def process_config(args: argparse.Namespace) -> dict[str, Union[str, int, None]]
     config["allow_origins"] = parse_allow_origins(args)
     config["allowed_hosts"] = parse_allowed_hosts(args)
 
-
-
     return config
 
 
@@ -366,52 +376,40 @@ def _quote_identifiers(query: str) -> str:
     query = re.sub(
         r'\b(VLABEL|ELABEL)\s+IF\s+NOT\s+EXISTS\s+(?!")([A-Za-z][a-zA-Z0-9_]*)\b',
         r'\1 IF NOT EXISTS "\2"',
-        query
+        query,
     )
 
     # Quote label names after ON keyword: ON Label -> ON "Label"
     # Used in constraint syntax: CREATE CONSTRAINT x ON Person ASSERT ...
     # Must exclude keywords that might follow ON
     query = re.sub(
-        r'\bON\s+(?!")([A-Za-z][a-zA-Z0-9_]*)\b(?!\s+ASSERT)',
-        r'ON "\1"',
-        query
+        r'\bON\s+(?!")([A-Za-z][a-zA-Z0-9_]*)\b(?!\s+ASSERT)', r'ON "\1"', query
     )
-    
+
     # Quote the label after ON when followed by ASSERT
     query = re.sub(
-        r'\bON\s+(?!")([A-Za-z][a-zA-Z0-9_]*)\b(\s+ASSERT)',
-        r'ON "\1"\2',
-        query
+        r'\bON\s+(?!")([A-Za-z][a-zA-Z0-9_]*)\b(\s+ASSERT)', r'ON "\1"\2', query
     )
 
     # Quote labels with uppercase: :Label or : Label -> :"Label"
     # Avoid already quoted labels: :"Label" should remain unchanged
     # Handle optional whitespace after colon
     # Must have at least one uppercase letter to be quoted
-    query = re.sub(
-        r':\s*(?!")([A-Z][a-zA-Z0-9_]*)\b',
-        r': "\1"',
-        query
-    )
+    query = re.sub(r':\s*(?!")([A-Z][a-zA-Z0-9_]*)\b', r': "\1"', query)
 
     # Quote property names with uppercase in patterns: {PropName: -> {"PropName":
     # This handles property names in CREATE/MERGE/SET statements
     # Match properties after { or , to handle multiple properties
     # Updated to handle both PascalCase and camelCase (e.g., productId, userId)
     query = re.sub(
-        r'([{,]\s*)([a-zA-Z][a-zA-Z0-9_]*[A-Z][a-zA-Z0-9_]*)\s*:',
-        r'\1"\2":',
-        query
+        r"([{,]\s*)([a-zA-Z][a-zA-Z0-9_]*[A-Z][a-zA-Z0-9_]*)\s*:", r'\1"\2":', query
     )
 
     # Quote property access with uppercase: .PropName -> ."PropName"
     # Avoid already quoted properties
     # Updated to handle both PascalCase and camelCase (e.g., .productId, .userId)
     query = re.sub(
-        r'\.(?!")([a-zA-Z][a-zA-Z0-9_]*[A-Z][a-zA-Z0-9_]*)\b',
-        r'."\1"',
-        query
+        r'\.(?!")([a-zA-Z][a-zA-Z0-9_]*[A-Z][a-zA-Z0-9_]*)\b', r'."\1"', query
     )
 
     # Quote property names in ASSERT clause (for constraints)
@@ -420,7 +418,7 @@ def _quote_identifiers(query: str) -> str:
     query = re.sub(
         r'\bASSERT\s+(?!")([a-zA-Z][a-zA-Z0-9_]*[A-Z][a-zA-Z0-9_]*)\b',
         r'ASSERT "\1"',
-        query
+        query,
     )
 
     return query

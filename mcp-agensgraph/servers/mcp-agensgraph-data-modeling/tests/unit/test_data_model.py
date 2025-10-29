@@ -4,7 +4,12 @@ from typing import Any
 import pytest
 from pydantic import ValidationError
 
-from mcp_agensgraph_data_modeling.data_model import DataModel, Node, Property, Relationship
+from mcp_agensgraph_data_modeling.data_model import (
+    DataModel,
+    Node,
+    Property,
+    Relationship,
+)
 
 
 def test_node_add_property_new():

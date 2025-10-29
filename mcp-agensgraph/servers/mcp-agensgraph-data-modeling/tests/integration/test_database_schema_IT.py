@@ -2,10 +2,17 @@
 Integration tests for AgensGraph database schema verification.
 Tests that generated constraints and queries actually work in AgensGraph.
 """
+
 import pytest
-from mcp_agensgraph_data_modeling.data_model import Node, Property, Relationship, DataModel
-from mcp_agensgraph_data_modeling.utils import _quote_identifiers
 from psycopg.types.json import Jsonb
+
+from mcp_agensgraph_data_modeling.data_model import (
+    DataModel,
+    Node,
+    Property,
+    Relationship,
+)
+from mcp_agensgraph_data_modeling.utils import _quote_identifiers
 
 
 @pytest.mark.asyncio
@@ -23,8 +30,8 @@ class TestConstraintCreation:
             key_property=Property(name="personId", type="STRING"),
             properties=[
                 Property(name="firstName", type="STRING"),
-                Property(name="lastName", type="STRING")
-            ]
+                Property(name="lastName", type="STRING"),
+            ],
         )
 
         # Get the constraint query
@@ -50,7 +57,7 @@ class TestConstraintCreation:
             start_node_label="Person",
             end_node_label="Company",
             key_property=Property(name="employmentId", type="STRING"),
-            properties=[Property(name="startDate", type="DATE")]
+            properties=[Property(name="startDate", type="DATE")],
         )
 
         # Get the constraint query
@@ -71,10 +78,7 @@ class TestConstraintCreation:
         conn, cursor = db_connection
 
         # Create node with constraint
-        node = Node(
-            label="User",
-            key_property=Property(name="userId", type="STRING")
-        )
+        node = Node(label="User", key_property=Property(name="userId", type="STRING"))
 
         constraint_query = node.get_cypher_constraint_query()
         await cursor.execute(constraint_query)
@@ -98,7 +102,9 @@ class TestConstraintCreation:
 
         # Verify it's a constraint violation
         error_msg = str(exc_info.value).lower()
-        assert "unique" in error_msg or "duplicate" in error_msg or "violates" in error_msg
+        assert (
+            "unique" in error_msg or "duplicate" in error_msg or "violates" in error_msg
+        )
 
 
 @pytest.mark.asyncio
@@ -116,8 +122,8 @@ class TestNodeIngestion:
             key_property=Property(name="productId", type="STRING"),
             properties=[
                 Property(name="name", type="STRING"),
-                Property(name="price", type="FLOAT")
-            ]
+                Property(name="price", type="FLOAT"),
+            ],
         )
 
         # Get ingest query
@@ -125,9 +131,7 @@ class TestNodeIngestion:
         print(f"\nNode Ingest Query: {ingest_query}")
 
         # Prepare data
-        records = [
-            {"productId": "prod-001", "name": "Laptop", "price": 999.99}
-        ]
+        records = [{"productId": "prod-001", "name": "Laptop", "price": 999.99}]
 
         # Execute ingest
         await cursor.execute(ingest_query, {"records": Jsonb(records)})
@@ -154,8 +158,8 @@ class TestNodeIngestion:
             key_property=Property(name="empId", type="STRING"),
             properties=[
                 Property(name="name", type="STRING"),
-                Property(name="department", type="STRING")
-            ]
+                Property(name="department", type="STRING"),
+            ],
         )
 
         ingest_query = node.get_cypher_ingest_query_for_many_records()
@@ -164,7 +168,7 @@ class TestNodeIngestion:
         records = [
             {"empId": "emp-001", "name": "Alice", "department": "Engineering"},
             {"empId": "emp-002", "name": "Bob", "department": "Sales"},
-            {"empId": "emp-003", "name": "Charlie", "department": "Marketing"}
+            {"empId": "emp-003", "name": "Charlie", "department": "Marketing"},
         ]
 
         # Execute ingest
@@ -190,19 +194,27 @@ class TestNodeIngestion:
             key_property=Property(name="customerId", type="STRING"),
             properties=[
                 Property(name="email", type="STRING"),
-                Property(name="status", type="STRING")
-            ]
+                Property(name="status", type="STRING"),
+            ],
         )
 
         ingest_query = node.get_cypher_ingest_query_for_many_records()
 
         # First ingest
-        records1 = [{"customerId": "cust-001", "email": "alice@example.com", "status": "active"}]
+        records1 = [
+            {"customerId": "cust-001", "email": "alice@example.com", "status": "active"}
+        ]
         await cursor.execute(ingest_query, {"records": Jsonb(records1)})
         await conn.commit()
 
         # Second ingest with updated properties
-        records2 = [{"customerId": "cust-001", "email": "alice@example.com", "status": "inactive"}]
+        records2 = [
+            {
+                "customerId": "cust-001",
+                "email": "alice@example.com",
+                "status": "inactive",
+            }
+        ]
         await cursor.execute(ingest_query, {"records": Jsonb(records2)})
         await conn.commit()
 
@@ -240,20 +252,20 @@ class TestRelationshipIngestion:
             type="WORKS_AT",
             start_node_label="Person",
             end_node_label="Company",
-            properties=[Property(name="since", type="INTEGER")]
+            properties=[Property(name="since", type="INTEGER")],
         )
 
         # Get ingest query
         ingest_query = relationship.get_cypher_ingest_query_for_many_records(
             start_node_key_property_name="personId",
-            end_node_key_property_name="companyId"
+            end_node_key_property_name="companyId",
         )
         print(f"\nRelationship Ingest Query: {ingest_query}")
 
         # Prepare relationship data
         records = [
             {"sourceId": "p1", "targetId": "c1", "since": 2020},
-            {"sourceId": "p2", "targetId": "c1", "since": 2021}
+            {"sourceId": "p2", "targetId": "c1", "since": 2021},
         ]
 
         # Execute ingest
@@ -270,7 +282,9 @@ class TestRelationshipIngestion:
 
         assert result[0] == 2
 
-    async def test_ingest_relationship_with_key_property(self, db_connection, graphname):
+    async def test_ingest_relationship_with_key_property(
+        self, db_connection, graphname
+    ):
         """Test ingesting relationships with key property."""
         conn, cursor = db_connection
 
@@ -289,15 +303,22 @@ class TestRelationshipIngestion:
             start_node_label="Account",
             end_node_label="Transaction",
             key_property=Property(name="linkId", type="STRING"),
-            properties=[Property(name="timestamp", type="INTEGER")]
+            properties=[Property(name="timestamp", type="INTEGER")],
         )
 
         ingest_query = relationship.get_cypher_ingest_query_for_many_records(
             start_node_key_property_name="accountId",
-            end_node_key_property_name="transactionId"
+            end_node_key_property_name="transactionId",
         )
         print(f"\nRelationship Ingest Query: {ingest_query}")
-        records = [{"sourceId": "a1", "targetId": "t1", "linkId": "link-001", "timestamp": 1234567890}]
+        records = [
+            {
+                "sourceId": "a1",
+                "targetId": "t1",
+                "linkId": "link-001",
+                "timestamp": 1234567890,
+            }
+        ]
 
         await cursor.execute(ingest_query, {"records": Jsonb(records)})
         await conn.commit()
@@ -328,7 +349,7 @@ class TestCaseSensitivity:
         node = Node(
             label="ProductCategory",
             key_property=Property(name="categoryId", type="STRING"),
-            properties=[Property(name="categoryName", type="STRING")]
+            properties=[Property(name="categoryName", type="STRING")],
         )
 
         # Create constraint
@@ -371,22 +392,20 @@ class TestCompleteDataModel:
                     key_property=Property(name="id", type="STRING"),
                     properties=[
                         Property(name="name", type="STRING"),
-                        Property(name="age", type="INTEGER")
-                    ]
+                        Property(name="age", type="INTEGER"),
+                    ],
                 ),
                 Node(
                     label="City",
                     key_property=Property(name="id", type="STRING"),
-                    properties=[Property(name="name", type="STRING")]
-                )
+                    properties=[Property(name="name", type="STRING")],
+                ),
             ],
             relationships=[
                 Relationship(
-                    type="LIVES_IN",
-                    start_node_label="Person",
-                    end_node_label="City"
+                    type="LIVES_IN", start_node_label="Person", end_node_label="City"
                 )
-            ]
+            ],
         )
 
         # Step 1: Create constraints
@@ -397,29 +416,34 @@ class TestCompleteDataModel:
         await conn.commit()
 
         # Step 2: Ingest nodes
-        person_ingest = data_model.nodes_dict["Person"].get_cypher_ingest_query_for_many_records()
+        person_ingest = data_model.nodes_dict[
+            "Person"
+        ].get_cypher_ingest_query_for_many_records()
         person_records = [
             {"id": "p1", "name": "Alice", "age": 30},
-            {"id": "p2", "name": "Bob", "age": 25}
+            {"id": "p2", "name": "Bob", "age": 25},
         ]
         await cursor.execute(person_ingest, {"records": Jsonb(person_records)})
 
-        city_ingest = data_model.nodes_dict["City"].get_cypher_ingest_query_for_many_records()
+        city_ingest = data_model.nodes_dict[
+            "City"
+        ].get_cypher_ingest_query_for_many_records()
         city_records = [
             {"id": "c1", "name": "New York"},
-            {"id": "c2", "name": "San Francisco"}
+            {"id": "c2", "name": "San Francisco"},
         ]
         await cursor.execute(city_ingest, {"records": Jsonb(city_records)})
         await conn.commit()
 
         # Step 3: Ingest relationships
-        rel_ingest = data_model.relationships_dict["(:Person)-[:LIVES_IN]->(:City)"].get_cypher_ingest_query_for_many_records(
-            start_node_key_property_name="id",
-            end_node_key_property_name="id"
+        rel_ingest = data_model.relationships_dict[
+            "(:Person)-[:LIVES_IN]->(:City)"
+        ].get_cypher_ingest_query_for_many_records(
+            start_node_key_property_name="id", end_node_key_property_name="id"
         )
         rel_records = [
             {"sourceId": "p1", "targetId": "c1"},
-            {"sourceId": "p2", "targetId": "c2"}
+            {"sourceId": "p2", "targetId": "c2"},
         ]
         await cursor.execute(rel_ingest, {"records": Jsonb(rel_records)})
         await conn.commit()

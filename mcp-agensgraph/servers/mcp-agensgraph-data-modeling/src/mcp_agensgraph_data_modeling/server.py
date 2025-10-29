@@ -7,7 +7,6 @@ from pydantic import Field, ValidationError
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
-from .utils import format_namespace
 
 from .data_model import (
     DataModel,
@@ -26,6 +25,7 @@ from .static import (
     SOFTWARE_DEPENDENCY_MODEL,
     SUPPLY_CHAIN_MODEL,
 )
+from .utils import format_namespace
 
 logger = logging.getLogger("mcp_agensgraph_data_modeling")
 
@@ -64,7 +64,9 @@ def create_mcp_server(namespace: str = "") -> FastMCP:
     @mcp.resource("resource://static/agensgraph_data_ingest_process")
     def agensgraph_data_ingest_process() -> str:
         """Get the process for ingesting data into a AgensGraph database."""
-        logger.info("Getting the process for ingesting data into a AgensGraph database.")
+        logger.info(
+            "Getting the process for ingesting data into a AgensGraph database."
+        )
         return DATA_INGEST_PROCESS
 
     @mcp.resource("resource://examples/patient_journey_model")
@@ -429,7 +431,11 @@ async def main(
                 f"Running AgensGraph Data Modeling MCP Server with HTTP transport on {host}:{port}..."
             )
             await mcp.run_http_async(
-                host=host, port=port, path=path, middleware=custom_middleware, stateless_http=True
+                host=host,
+                port=port,
+                path=path,
+                middleware=custom_middleware,
+                stateless_http=True,
             )
         case "stdio":
             logger.info(

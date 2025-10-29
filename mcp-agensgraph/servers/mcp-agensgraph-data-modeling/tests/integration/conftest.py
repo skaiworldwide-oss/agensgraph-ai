@@ -9,7 +9,6 @@ from psycopg_pool import AsyncConnectionPool  # type: ignore
 
 from mcp_agensgraph_data_modeling.server import create_mcp_server
 
-
 # SQL function to check if a property has unique constraint
 SQL_PROPERTY_CONSTRAINT_FUNCTION = """
 CREATE OR REPLACE FUNCTION property_has_unique_constraint(key_name TEXT)
@@ -39,6 +38,7 @@ def get_pool_connection(pool: AsyncConnectionPool):
 
 
 # ===== Transport Testing Fixtures =====
+
 
 @pytest_asyncio.fixture(scope="function")
 async def mcp_server():
@@ -84,6 +84,7 @@ async def sse_server():
 
 
 # ===== Database Testing Fixtures =====
+
 
 @pytest.fixture(scope="module")
 def graphname():
@@ -147,7 +148,9 @@ async def clean_graph(db_setup, graphname):
             for constraint in constraints:
                 constraint_name, label_name = constraint[0], constraint[1]
                 try:
-                    await cursor.execute(f'DROP CONSTRAINT {constraint_name} ON "{label_name}"')
+                    await cursor.execute(
+                        f'DROP CONSTRAINT {constraint_name} ON "{label_name}"'
+                    )
                 except Exception:
                     pass
 

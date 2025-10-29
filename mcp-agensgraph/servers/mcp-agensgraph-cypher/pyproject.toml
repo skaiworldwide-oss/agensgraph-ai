@@ -5,10 +5,9 @@ description = "A simple Agensgraph MCP server"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
-    "mcp[cli]>=1.6.0",
+    "fastmcp>=2.10.5",
     "pydantic>=2.10.1",
-    "pytest (>=8.4.1,<9.0.0)",
-    "pytest-asyncio (>=1.0.0,<2.0.0)",
+    "tiktoken>=0.11.0",
     "psycopg (>=3.2.9,<4.0.0)",
     "psycopg[binary,pool] (>=3.2.9,<4.0.0)",
     "psycopg-pool (>=3.2.6,<4.0.0)",
@@ -21,9 +20,10 @@ build-backend = "hatchling.build"
 [tool.uv]
 dev-dependencies = [
     "pyright>=1.1.389",
- "pytest>=7.0.0",
- "pytest-asyncio>=0.20.3",
- "ruff>=0.11.5"
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.20.3",
+    "ruff>=0.11.5",
+    "aiohttp>=3.8.0"
 ]
 
 [project.scripts]

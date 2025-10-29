@@ -477,7 +477,9 @@ class TestProcessConfig:
         os.environ["AGENSGRAPH_MCP_SERVER_HOST"] = "env-host"
         os.environ["AGENSGRAPH_MCP_SERVER_PORT"] = "8080"
         os.environ["AGENSGRAPH_MCP_SERVER_PATH"] = "/env/"
-        os.environ["AGENSGRAPH_MCP_SERVER_ALLOW_ORIGINS"] = "http://env.com,https://env.com"
+        os.environ["AGENSGRAPH_MCP_SERVER_ALLOW_ORIGINS"] = (
+            "http://env.com,https://env.com"
+        )
         os.environ["AGENSGRAPH_MCP_SERVER_ALLOWED_HOSTS"] = "env.com,www.env.com"
 
         args = args_factory()
@@ -563,7 +565,9 @@ class TestParseNamespace:
         assert result == ""
 
         # Check that info message was logged
-        mock_logger.info.assert_called_once_with("Info: No namespace provided for tools. No namespace will be used.")
+        mock_logger.info.assert_called_once_with(
+            "Info: No namespace provided for tools. No namespace will be used."
+        )
 
     @patch("mcp_agensgraph_data_modeling.utils.logger")
     def test_parse_namespace_logs_cli_value(self, mock_logger, clean_env, args_factory):
@@ -573,7 +577,9 @@ class TestParseNamespace:
         assert result == "my-app"
 
         # Check that info message was logged
-        mock_logger.info.assert_called_once_with("Info: Namespace provided for tools: my-app")
+        mock_logger.info.assert_called_once_with(
+            "Info: Namespace provided for tools: my-app"
+        )
 
     @patch("mcp_agensgraph_data_modeling.utils.logger")
     def test_parse_namespace_logs_env_value(self, mock_logger, clean_env, args_factory):
@@ -584,7 +590,9 @@ class TestParseNamespace:
         assert result == "env-app"
 
         # Check that info message was logged
-        mock_logger.info.assert_called_once_with("Info: Namespace provided for tools: env-app")
+        mock_logger.info.assert_called_once_with(
+            "Info: Namespace provided for tools: env-app"
+        )
 
 
 class TestNamespaceConfigProcessing:

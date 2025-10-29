@@ -1,0 +1,38 @@
+[project]
+name = "mcp-agensgraph-data-modeling"
+version = "0.1.0"
+description = "A simple AgensGraph MCP server for creating graph data models."
+readme = "README.md"
+requires-python = ">=3.10,<4.0"
+dependencies = [
+    "fastmcp>=2.0.0",
+    "pydantic>=2.10.1",
+    "starlette>=0.47.0",
+]
+
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+dev-dependencies = [
+    "ipykernel>=6.29.5",
+    "pyright>=1.1.389",
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.20.3",
+    "ruff>=0.11.5",
+    "aiohttp>=3.8.0",
+    "psycopg[binary,pool]>=3.2.9,<4.0.0",
+    "psycopg-pool>=3.2.6,<4.0.0"
+]
+
+[project.scripts]
+mcp-agensgraph-data-modeling = "mcp_agensgraph_data_modeling:main"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+markers = [
+    "database: marks tests that require an AgensGraph database connection"
+]

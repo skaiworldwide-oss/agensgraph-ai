@@ -1,0 +1,6 @@
+{
+  "entrypoint": "src/mcp_agensgraph_data_modeling/server.py",
+  "environment": {
+    "dependencies": ["pydantic"]
+  }
+}

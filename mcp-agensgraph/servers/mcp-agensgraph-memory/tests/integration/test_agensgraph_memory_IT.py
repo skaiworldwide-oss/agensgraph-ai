@@ -3,10 +3,10 @@ import pytest
 from mcp_agensgraph_memory.agensgraph_memory import (
     AgensGraphMemory,
     Entity,
-    Relation,
+    KnowledgeGraph,
     ObservationAddition,
     ObservationDeletion,
-    KnowledgeGraph,
+    Relation,
 )
 
 
@@ -15,8 +15,12 @@ async def test_create_and_read_entities(memory: AgensGraphMemory):
     """Test creating and reading entities from the knowledge graph."""
     # Create test entities
     test_entities = [
-        Entity(name="Alice", type="Person", observations=["Likes reading", "Works at Company X"]),
-        Entity(name="Bob", type="Person", observations=["Enjoys hiking"])
+        Entity(
+            name="Alice",
+            type="Person",
+            observations=["Likes reading", "Works at Company X"],
+        ),
+        Entity(name="Bob", type="Person", observations=["Enjoys hiking"]),
     ]
 
     # Create entities in the graph
@@ -44,14 +48,12 @@ async def test_create_and_read_relations(memory: AgensGraphMemory):
     # Create test entities
     test_entities = [
         Entity(name="Alice", type="Person", observations=[]),
-        Entity(name="Bob", type="Person", observations=[])
+        Entity(name="Bob", type="Person", observations=[]),
     ]
     await memory.create_entities(test_entities)
 
     # Create test relation
-    test_relations = [
-        Relation(source="Alice", target="Bob", relationType="KNOWS")
-    ]
+    test_relations = [Relation(source="Alice", target="Bob", relationType="KNOWS")]
 
     # Create relation in the graph
     created_relations = await memory.create_relations(test_relations)
@@ -72,12 +74,17 @@ async def test_create_and_read_relations(memory: AgensGraphMemory):
 async def test_add_observations(memory: AgensGraphMemory):
     """Test adding observations to existing entities."""
     # Create test entity
-    test_entity = Entity(name="Charlie", type="Person", observations=["Initial observation"])
+    test_entity = Entity(
+        name="Charlie", type="Person", observations=["Initial observation"]
+    )
     await memory.create_entities([test_entity])
 
     # Add observations
     observation_additions = [
-        ObservationAddition(entityName="Charlie", observations=["New observation 1", "New observation 2"])
+        ObservationAddition(
+            entityName="Charlie",
+            observations=["New observation 1", "New observation 2"],
+        )
     ]
 
     result = await memory.add_observations(observation_additions)
@@ -103,7 +110,7 @@ async def test_delete_observations(memory: AgensGraphMemory):
     test_entity = Entity(
         name="Dave",
         type="Person",
-        observations=["Observation 1", "Observation 2", "Observation 3"]
+        observations=["Observation 1", "Observation 2", "Observation 3"],
     )
     await memory.create_entities([test_entity])
 
@@ -133,7 +140,7 @@ async def test_delete_entities(memory: AgensGraphMemory):
     # Create test entities
     test_entities = [
         Entity(name="Eve", type="Person", observations=[]),
-        Entity(name="Frank", type="Person", observations=[])
+        Entity(name="Frank", type="Person", observations=[]),
     ]
     await memory.create_entities(test_entities)
 
@@ -155,14 +162,14 @@ async def test_delete_relations(memory: AgensGraphMemory):
     # Create test entities
     test_entities = [
         Entity(name="Grace", type="Person", observations=[]),
-        Entity(name="Hank", type="Person", observations=[])
+        Entity(name="Hank", type="Person", observations=[]),
     ]
     await memory.create_entities(test_entities)
 
     # Create test relations
     test_relations = [
         Relation(source="Grace", target="Hank", relationType="KNOWS"),
-        Relation(source="Grace", target="Hank", relationType="WORKS_WITH")
+        Relation(source="Grace", target="Hank", relationType="WORKS_WITH"),
     ]
     await memory.create_relations(test_relations)
 
@@ -187,7 +194,7 @@ async def test_search_nodes(memory: AgensGraphMemory):
     test_entities = [
         Entity(name="Ian", type="Person", observations=["Likes coffee"]),
         Entity(name="Jane", type="Person", observations=["Likes tea"]),
-        Entity(name="coffee", type="Beverage", observations=["Hot drink"])
+        Entity(name="coffee", type="Beverage", observations=["Hot drink"]),
     ]
     await memory.create_entities(test_entities)
 
@@ -208,7 +215,7 @@ async def test_find_nodes(memory: AgensGraphMemory):
     test_entities = [
         Entity(name="Kevin", type="Person", observations=[]),
         Entity(name="Laura", type="Person", observations=[]),
-        Entity(name="Mike", type="Person", observations=[])
+        Entity(name="Mike", type="Person", observations=[]),
     ]
     await memory.create_entities(test_entities)
 

@@ -7,10 +7,10 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, Field
 
-
 # Set up logging
-logger = logging.getLogger('mcp_agensgraph_memory')
+logger = logging.getLogger("mcp_agensgraph_memory")
 logger.setLevel(logging.INFO)
+
 
 # Models for our knowledge graph
 class Entity(BaseModel):
@@ -23,20 +23,25 @@ class Entity(BaseModel):
         "observations": ["Works at SKAI Worldwide", "Lives in San Francisco", "Expert in graph databases"]
     }
     """
+
     name: str = Field(
         description="Unique identifier/name for the entity. Should be descriptive and specific.",
         min_length=1,
-        examples=["John Smith", "SKAI Worldwide Inc", "San Francisco"]
+        examples=["John Smith", "SKAI Worldwide Inc", "San Francisco"],
     )
     type: str = Field(
         description="Category or classification of the entity. Common types: 'person', 'company', 'location', 'concept', 'event'",
         min_length=1,
-        examples=["person", "company", "location", "concept", "event"]
+        examples=["person", "company", "location", "concept", "event"],
     )
     observations: List[str] = Field(
         description="List of facts, observations, or notes about this entity. Each observation should be a complete, standalone fact.",
-        examples=[["Works at SKAI Worldwide", "Lives in San Francisco"], ["Headquartered in Sweden", "Graph database company"]]
+        examples=[
+            ["Works at SKAI Worldwide", "Lives in San Francisco"],
+            ["Headquartered in Sweden", "Graph database company"],
+        ],
     )
+
 
 class Relation(BaseModel):
     """Represents a relationship between two entities in the knowledge graph.
@@ -48,32 +53,34 @@ class Relation(BaseModel):
         "relationType": "WORKS_AT"
     }
     """
+
     source: str = Field(
         description="Name of the source entity (must match an existing entity name exactly)",
         min_length=1,
-        examples=["John Smith", "SKAI Worldwide Inc"]
+        examples=["John Smith", "SKAI Worldwide Inc"],
     )
     target: str = Field(
         description="Name of the target entity (must match an existing entity name exactly)",
         min_length=1,
-        examples=["SKAI Worldwide Inc", "San Francisco"]
+        examples=["SKAI Worldwide Inc", "San Francisco"],
     )
     relationType: str = Field(
         description="Type of relationship between source and target. Use descriptive, uppercase names with underscores.",
         min_length=1,
-        examples=["WORKS_AT", "LIVES_IN", "MANAGES", "COLLABORATES_WITH", "LOCATED_IN"]
+        examples=["WORKS_AT", "LIVES_IN", "MANAGES", "COLLABORATES_WITH", "LOCATED_IN"],
     )
+
 
 class KnowledgeGraph(BaseModel):
     """Complete knowledge graph containing entities and their relationships."""
+
     entities: List[Entity] = Field(
-        description="List of all entities in the knowledge graph",
-        default=[]
+        description="List of all entities in the knowledge graph", default=[]
     )
     relations: List[Relation] = Field(
-        description="List of all relationships between entities",
-        default=[]
+        description="List of all relationships between entities", default=[]
     )
+
 
 class ObservationAddition(BaseModel):
     """Request to add new observations to an existing entity.
@@ -84,15 +91,17 @@ class ObservationAddition(BaseModel):
         "observations": ["Recently promoted to Senior Engineer", "Speaks fluent German"]
     }
     """
+
     entityName: str = Field(
         description="Exact name of the existing entity to add observations to",
         min_length=1,
-        examples=["John Smith", "SKAI Worldwide Inc"]
+        examples=["John Smith", "SKAI Worldwide Inc"],
     )
     observations: List[str] = Field(
         description="New observations/facts to add to the entity. Each should be unique and informative.",
-        min_length=1
+        min_length=1,
     )
+
 
 class ObservationDeletion(BaseModel):
     """Request to delete specific observations from an existing entity.
@@ -103,26 +112,31 @@ class ObservationDeletion(BaseModel):
         "observations": ["Old job title", "Outdated contact info"]
     }
     """
+
     entityName: str = Field(
         description="Exact name of the existing entity to remove observations from",
         min_length=1,
-        examples=["John Smith", "SKAI Worldwide Inc"]
+        examples=["John Smith", "SKAI Worldwide Inc"],
     )
     observations: List[str] = Field(
         description="Exact observation texts to delete from the entity (must match existing observations exactly)",
-        min_length=1
+        min_length=1,
     )
+
 
 def get_pool_connection(pool: AsyncConnectionPool):
     """Context manager for getting a connection from the pool."""
     return pool.connection()
+
 
 class AgensGraphMemory:
     def __init__(self, connection_pool: AsyncConnectionPool, graphname: str):
         self.pool = connection_pool
         self.graphname = graphname
 
-    async def _execute_cypher(self, conn: AsyncConnection, cypher_query: str, params: dict = None):
+    async def _execute_cypher(
+        self, conn: AsyncConnection, cypher_query: str, params: dict = None
+    ):
         """Execute a Cypher query within AgensGraph."""
         async with conn.cursor(row_factory=namedtuple_row) as cursor:
             # Set graph path
@@ -173,7 +187,9 @@ class AgensGraphMemory:
                         )
                     """)
                     await conn.commit()
-            logger.info("Created Memory VLABEL and fulltext search property index using tsvector")
+            logger.info(
+                "Created Memory VLABEL and fulltext search property index using tsvector"
+            )
         except Exception as e:
             # Index might already exist, which is fine
             logger.debug(f"Fulltext property index creation: {e}")
@@ -187,7 +203,7 @@ class AgensGraphMemory:
             if filter_query and filter_query != "*":
                 # Use tsvector and tsquery for fulltext search
                 # Searches across name, type, and observations with weights
-                filter_condition = f"""
+                filter_condition = """
                     WHERE (
                         setweight(to_tsvector('english', coalesce(entity.name, '')), 'A') ||
                         setweight(to_tsvector('english', coalesce(entity.type, '')), 'B') ||
@@ -210,11 +226,13 @@ class AgensGraphMemory:
             entities = []
             entity_names = []
             for record in entities_data:
-                entities.append(Entity(
-                    name=record.name,
-                    type=record.type,
-                    observations=record.observations or []
-                ))
+                entities.append(
+                    Entity(
+                        name=record.name,
+                        type=record.type,
+                        observations=record.observations or [],
+                    )
+                )
                 entity_names.append(record.name)
 
             # Query to get all relationships for these entities
@@ -226,14 +244,18 @@ class AgensGraphMemory:
                     RETURN source.name AS source, target.name AS target, label(r) AS "relationType"
                 """
 
-                relations_data = await self._execute_cypher(conn, rel_query, {"names": Jsonb(entity_names)})
+                relations_data = await self._execute_cypher(
+                    conn, rel_query, {"names": Jsonb(entity_names)}
+                )
 
                 for record in relations_data:
-                    relations.append(Relation(
-                        source=record.source,
-                        target=record.target,
-                        relationType=record.relationType
-                    ))
+                    relations.append(
+                        Relation(
+                            source=record.source,
+                            target=record.target,
+                            relationType=record.relationType,
+                        )
+                    )
 
             await conn.commit()
 
@@ -255,11 +277,15 @@ class AgensGraphMemory:
                     SET e.type = %(type)s, e.observations = %(observations)s
                 """
 
-                await self._execute_cypher(conn, query, {
-                    "name": Jsonb(entity.name),
-                    "type": Jsonb(entity.type),
-                    "observations": Jsonb(entity.observations)
-                })
+                await self._execute_cypher(
+                    conn,
+                    query,
+                    {
+                        "name": Jsonb(entity.name),
+                        "type": Jsonb(entity.type),
+                        "observations": Jsonb(entity.observations),
+                    },
+                )
 
             await conn.commit()
 
@@ -278,16 +304,22 @@ class AgensGraphMemory:
                     MERGE (fromNode)-[r:"{relation.relationType}"]->(toNode)
                 """
 
-                await self._execute_cypher(conn, query, {
-                    "source": Jsonb(relation.source),
-                    "target": Jsonb(relation.target)
-                })
+                await self._execute_cypher(
+                    conn,
+                    query,
+                    {
+                        "source": Jsonb(relation.source),
+                        "target": Jsonb(relation.target),
+                    },
+                )
 
             await conn.commit()
 
         return relations
 
-    async def add_observations(self, observations: List[ObservationAddition]) -> List[Dict[str, Any]]:
+    async def add_observations(
+        self, observations: List[ObservationAddition]
+    ) -> List[Dict[str, Any]]:
         """Add new observations to existing entities."""
         logger.info(f"Adding observations to {len(observations)} entities")
 
@@ -300,7 +332,9 @@ class AgensGraphMemory:
                     RETURN e.observations AS observations
                 """
 
-                existing_data = await self._execute_cypher(conn, get_query, {"name": Jsonb(obs.entityName)})
+                existing_data = await self._execute_cypher(
+                    conn, get_query, {"name": Jsonb(obs.entityName)}
+                )
 
                 if existing_data:
                     existing_obs = existing_data[0].observations or []
@@ -314,20 +348,19 @@ class AgensGraphMemory:
                             SET e.observations = coalesce(e.observations, []) + %(new_obs)s
                         """
 
-                        await self._execute_cypher(conn, update_query, {
-                            "name": Jsonb(obs.entityName),
-                            "new_obs": Jsonb(new_obs)
-                        })
+                        await self._execute_cypher(
+                            conn,
+                            update_query,
+                            {"name": Jsonb(obs.entityName), "new_obs": Jsonb(new_obs)},
+                        )
 
-                        results.append({
-                            "entityName": obs.entityName,
-                            "addedObservations": new_obs
-                        })
+                        results.append(
+                            {"entityName": obs.entityName, "addedObservations": new_obs}
+                        )
                     else:
-                        results.append({
-                            "entityName": obs.entityName,
-                            "addedObservations": []
-                        })
+                        results.append(
+                            {"entityName": obs.entityName, "addedObservations": []}
+                        )
 
             await conn.commit()
 
@@ -362,12 +395,16 @@ class AgensGraphMemory:
                     RETURN e.observations AS observations
                 """
 
-                existing_data = await self._execute_cypher(conn, get_query, {"name": Jsonb(deletion.entityName)})
+                existing_data = await self._execute_cypher(
+                    conn, get_query, {"name": Jsonb(deletion.entityName)}
+                )
 
                 if existing_data:
                     existing_obs = existing_data[0].observations or []
                     # Filter out observations to delete
-                    remaining_obs = [o for o in existing_obs if o not in deletion.observations]
+                    remaining_obs = [
+                        o for o in existing_obs if o not in deletion.observations
+                    ]
 
                     # Update with remaining observations (no casting needed in Cypher)
                     update_query = """
@@ -375,10 +412,14 @@ class AgensGraphMemory:
                         SET e.observations = %(remaining_obs)s
                     """
 
-                    await self._execute_cypher(conn, update_query, {
-                        "name": Jsonb(deletion.entityName),
-                        "remaining_obs": Jsonb(remaining_obs)
-                    })
+                    await self._execute_cypher(
+                        conn,
+                        update_query,
+                        {
+                            "name": Jsonb(deletion.entityName),
+                            "remaining_obs": Jsonb(remaining_obs),
+                        },
+                    )
 
             await conn.commit()
 
@@ -396,10 +437,14 @@ class AgensGraphMemory:
                     DELETE r
                 """
 
-                await self._execute_cypher(conn, query, {
-                    "source": Jsonb(relation.source),
-                    "target": Jsonb(relation.target)
-                })
+                await self._execute_cypher(
+                    conn,
+                    query,
+                    {
+                        "source": Jsonb(relation.source),
+                        "target": Jsonb(relation.target),
+                    },
+                )
 
             await conn.commit()
 
@@ -426,15 +471,19 @@ class AgensGraphMemory:
                 RETURN e.name AS name, e.type AS type, e.observations AS observations
             """
 
-            entities_data = await self._execute_cypher(conn, entity_query, {"names": Jsonb(names)})
+            entities_data = await self._execute_cypher(
+                conn, entity_query, {"names": Jsonb(names)}
+            )
 
             entities = []
             for record in entities_data:
-                entities.append(Entity(
-                    name=record.name,
-                    type=record.type,
-                    observations=record.observations or []
-                ))
+                entities.append(
+                    Entity(
+                        name=record.name,
+                        type=record.type,
+                        observations=record.observations or [],
+                    )
+                )
 
             # Get relations for found entities
             relations = []
@@ -445,14 +494,18 @@ class AgensGraphMemory:
                     RETURN source.name AS source, target.name AS target, label(r) AS relationType
                 """
 
-                relations_data = await self._execute_cypher(conn, rel_query, {"names": Jsonb(names)})
+                relations_data = await self._execute_cypher(
+                    conn, rel_query, {"names": Jsonb(names)}
+                )
 
                 for record in relations_data:
-                    relations.append(Relation(
-                        source=record.source,
-                        target=record.target,
-                        relationType=record.relationType
-                    ))
+                    relations.append(
+                        Relation(
+                            source=record.source,
+                            target=record.target,
+                            relationType=record.relationType,
+                        )
+                    )
 
             await conn.commit()
 

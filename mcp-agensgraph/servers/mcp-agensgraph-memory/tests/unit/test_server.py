@@ -1,9 +1,10 @@
-import pytest
-from unittest.mock import Mock, AsyncMock
+from unittest.mock import AsyncMock, Mock
 
-from mcp_agensgraph_memory.utils import format_namespace
-from mcp_agensgraph_memory.server import create_mcp_server
+import pytest
+
 from mcp_agensgraph_memory.agensgraph_memory import AgensGraphMemory, KnowledgeGraph
+from mcp_agensgraph_memory.server import create_mcp_server
+from mcp_agensgraph_memory.utils import format_namespace
 
 
 class TestFormatNamespace:
@@ -63,11 +64,13 @@ class TestNamespacing:
             "test-ns-delete_observations",
             "test-ns-delete_relations",
             "test-ns-search_memories",
-            "test-ns-find_memories_by_name"
+            "test-ns-find_memories_by_name",
         ]
 
         for expected_tool in expected_tools:
-            assert expected_tool in tools.keys(), f"Tool {expected_tool} not found in tools"
+            assert expected_tool in tools.keys(), (
+                f"Tool {expected_tool} not found in tools"
+            )
 
         # Test without namespace (default tools)
         default_server = create_mcp_server(mock_memory)
@@ -82,11 +85,13 @@ class TestNamespacing:
             "delete_observations",
             "delete_relations",
             "search_memories",
-            "find_memories_by_name"
+            "find_memories_by_name",
         ]
 
         for expected_tool in expected_default_tools:
-            assert expected_tool in default_tools.keys(), f"Default tool {expected_tool} not found"
+            assert expected_tool in default_tools.keys(), (
+                f"Default tool {expected_tool} not found"
+            )
 
     @pytest.mark.asyncio
     async def test_namespace_tool_functionality(self, mock_memory):
@@ -99,7 +104,7 @@ class TestNamespacing:
         assert read_tool is not None
 
         # Call the tool function and verify it works
-        result = await read_tool.fn()
+        await read_tool.fn()
         mock_memory.read_graph.assert_called_once()
 
     @pytest.mark.asyncio
@@ -145,7 +150,7 @@ class TestNamespacing:
             "company.product",
             "app_v2",
             "client-123",
-            "test.env.staging"
+            "test.env.staging",
         ]
 
         for namespace in complex_namespaces:
@@ -154,7 +159,9 @@ class TestNamespacing:
 
             # Verify tools are properly prefixed
             expected_tool = f"{namespace}-read_graph"
-            assert expected_tool in tools.keys(), f"Tool {expected_tool} not found for namespace '{namespace}'"
+            assert expected_tool in tools.keys(), (
+                f"Tool {expected_tool} not found for namespace '{namespace}'"
+            )
 
     @pytest.mark.asyncio
     async def test_namespace_tool_count_consistency(self, mock_memory):

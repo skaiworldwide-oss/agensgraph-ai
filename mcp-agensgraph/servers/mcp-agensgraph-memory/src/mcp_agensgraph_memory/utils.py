@@ -1,11 +1,12 @@
 import argparse
-import os
 import logging
+import os
 from typing import Union
 from urllib.parse import urlparse
 
 logger = logging.getLogger("mcp_agensgraph_memory")
 logger.setLevel(logging.INFO)
+
 
 def format_namespace(namespace: str) -> str:
     """Format namespace by ensuring it ends with a hyphen if not empty."""
@@ -17,7 +18,10 @@ def format_namespace(namespace: str) -> str:
     else:
         return ""
 
-def build_connection_url(base_url: str, username: str, password: str, database: str) -> str:
+
+def build_connection_url(
+    base_url: str, username: str, password: str, database: str
+) -> str:
     """Build full connection URL from base URL and credentials.
 
     Args:
@@ -31,12 +35,15 @@ def build_connection_url(base_url: str, username: str, password: str, database: 
     """
     parsed = urlparse(base_url)
     if parsed.scheme != "postgresql":
-        raise ValueError(f"Invalid database URL scheme. Expected 'postgresql://', got '{parsed.scheme}://'")
+        raise ValueError(
+            f"Invalid database URL scheme. Expected 'postgresql://', got '{parsed.scheme}://'"
+        )
 
     host = parsed.hostname or "localhost"
     port = parsed.port or 5432
 
     return f"postgresql://{username}:{password}@{host}:{port}/{database}"
+
 
 def process_config(args: argparse.Namespace) -> dict[str, Union[str, int, None]]:
     """
@@ -64,7 +71,9 @@ def process_config(args: argparse.Namespace) -> dict[str, Union[str, int, None]]
         if os.getenv("AGENSGRAPH_URL") is not None:
             config["agensgraph_url"] = os.getenv("AGENSGRAPH_URL")
         else:
-            logger.warning("Warning: No AgensGraph URL provided. Using default: postgresql://localhost:5432")
+            logger.warning(
+                "Warning: No AgensGraph URL provided. Using default: postgresql://localhost:5432"
+            )
             config["agensgraph_url"] = "postgresql://localhost:5432"
 
     # parse username
@@ -74,7 +83,9 @@ def process_config(args: argparse.Namespace) -> dict[str, Union[str, int, None]]
         if os.getenv("AGENSGRAPH_USERNAME") is not None:
             config["agensgraph_user"] = os.getenv("AGENSGRAPH_USERNAME")
         else:
-            logger.warning("Warning: No AgensGraph username provided. Using default: agens")
+            logger.warning(
+                "Warning: No AgensGraph username provided. Using default: agens"
+            )
             config["agensgraph_user"] = "agens"
 
     # parse password
@@ -84,7 +95,9 @@ def process_config(args: argparse.Namespace) -> dict[str, Union[str, int, None]]
         if os.getenv("AGENSGRAPH_PASSWORD") is not None:
             config["agensgraph_password"] = os.getenv("AGENSGRAPH_PASSWORD")
         else:
-            logger.warning("Warning: No AgensGraph password provided. Using default: agens")
+            logger.warning(
+                "Warning: No AgensGraph password provided. Using default: agens"
+            )
             config["agensgraph_password"] = "agens"
 
     # parse database
@@ -94,7 +107,9 @@ def process_config(args: argparse.Namespace) -> dict[str, Union[str, int, None]]
         if os.getenv("AGENSGRAPH_DB") is not None:
             config["agensgraph_database"] = os.getenv("AGENSGRAPH_DB")
         else:
-            logger.warning("Warning: No AgensGraph database provided. Using default: agens")
+            logger.warning(
+                "Warning: No AgensGraph database provided. Using default: agens"
+            )
             config["agensgraph_database"] = "agens"
 
     # parse graphname
@@ -104,7 +119,9 @@ def process_config(args: argparse.Namespace) -> dict[str, Union[str, int, None]]
         if os.getenv("AGENSGRAPH_GRAPH_NAME") is not None:
             config["agensgraph_graphname"] = os.getenv("AGENSGRAPH_GRAPH_NAME")
         else:
-            logger.warning("Warning: No AgensGraph graph name provided. Using default: memory")
+            logger.warning(
+                "Warning: No AgensGraph graph name provided. Using default: memory"
+            )
             config["agensgraph_graphname"] = "memory"
 
     # parse transport
@@ -120,63 +137,92 @@ def process_config(args: argparse.Namespace) -> dict[str, Union[str, int, None]]
     # parse server host
     if args.server_host is not None:
         if config["transport"] == "stdio":
-            logger.warning("Warning: Server host provided, but transport is `stdio`. The `server_host` argument will be set, but ignored.")
+            logger.warning(
+                "Warning: Server host provided, but transport is `stdio`. The `server_host` argument will be set, but ignored."
+            )
         config["host"] = args.server_host
     else:
         if os.getenv("AGENSGRAPH_MCP_SERVER_HOST") is not None:
             if config["transport"] == "stdio":
-                logger.warning("Warning: Server host provided, but transport is `stdio`. The `AGENSGRAPH_MCP_SERVER_HOST` environment variable will be set, but ignored.")
+                logger.warning(
+                    "Warning: Server host provided, but transport is `stdio`. The `AGENSGRAPH_MCP_SERVER_HOST` environment variable will be set, but ignored."
+                )
             config["host"] = os.getenv("AGENSGRAPH_MCP_SERVER_HOST")
         elif config["transport"] != "stdio":
-            logger.warning("Warning: No server host provided and transport is not `stdio`. Using default server host: 127.0.0.1")
+            logger.warning(
+                "Warning: No server host provided and transport is not `stdio`. Using default server host: 127.0.0.1"
+            )
             config["host"] = "127.0.0.1"
         else:
-            logger.info("Info: No server host provided and transport is `stdio`. `server_host` will be None.")
+            logger.info(
+                "Info: No server host provided and transport is `stdio`. `server_host` will be None."
+            )
             config["host"] = None
 
     # parse server port
     if args.server_port is not None:
         if config["transport"] == "stdio":
-            logger.warning("Warning: Server port provided, but transport is `stdio`. The `server_port` argument will be set, but ignored.")
+            logger.warning(
+                "Warning: Server port provided, but transport is `stdio`. The `server_port` argument will be set, but ignored."
+            )
         config["port"] = args.server_port
     else:
         if os.getenv("AGENSGRAPH_MCP_SERVER_PORT") is not None:
             if config["transport"] == "stdio":
-                logger.warning("Warning: Server port provided, but transport is `stdio`. The `AGENSGRAPH_MCP_SERVER_PORT` environment variable will be set, but ignored.")
+                logger.warning(
+                    "Warning: Server port provided, but transport is `stdio`. The `AGENSGRAPH_MCP_SERVER_PORT` environment variable will be set, but ignored."
+                )
             config["port"] = int(os.getenv("AGENSGRAPH_MCP_SERVER_PORT"))
         elif config["transport"] != "stdio":
-            logger.warning("Warning: No server port provided and transport is not `stdio`. Using default server port: 8000")
+            logger.warning(
+                "Warning: No server port provided and transport is not `stdio`. Using default server port: 8000"
+            )
             config["port"] = 8000
         else:
-            logger.info("Info: No server port provided and transport is `stdio`. `server_port` will be None.")
+            logger.info(
+                "Info: No server port provided and transport is `stdio`. `server_port` will be None."
+            )
             config["port"] = None
 
     # parse server path
     if args.server_path is not None:
         if config["transport"] == "stdio":
-            logger.warning("Warning: Server path provided, but transport is `stdio`. The `server_path` argument will be set, but ignored.")
+            logger.warning(
+                "Warning: Server path provided, but transport is `stdio`. The `server_path` argument will be set, but ignored."
+            )
         config["path"] = args.server_path
     else:
         if os.getenv("AGENSGRAPH_MCP_SERVER_PATH") is not None:
             if config["transport"] == "stdio":
-                logger.warning("Warning: Server path provided, but transport is `stdio`. The `AGENSGRAPH_MCP_SERVER_PATH` environment variable will be set, but ignored.")
+                logger.warning(
+                    "Warning: Server path provided, but transport is `stdio`. The `AGENSGRAPH_MCP_SERVER_PATH` environment variable will be set, but ignored."
+                )
             config["path"] = os.getenv("AGENSGRAPH_MCP_SERVER_PATH")
         elif config["transport"] != "stdio":
-            logger.warning("Warning: No server path provided and transport is not `stdio`. Using default server path: /mcp/")
+            logger.warning(
+                "Warning: No server path provided and transport is not `stdio`. Using default server path: /mcp/"
+            )
             config["path"] = "/mcp/"
         else:
-            logger.info("Info: No server path provided and transport is `stdio`. `server_path` will be None.")
+            logger.info(
+                "Info: No server path provided and transport is `stdio`. `server_path` will be None."
+            )
             config["path"] = None
 
     # parse allow origins
     if args.allow_origins is not None:
         # Handle comma-separated string from CLI
-        config["allow_origins"] = [origin.strip() for origin in args.allow_origins.split(",") if origin.strip()]
+        config["allow_origins"] = [
+            origin.strip() for origin in args.allow_origins.split(",") if origin.strip()
+        ]
     else:
         if os.getenv("AGENSGRAPH_MCP_SERVER_ALLOW_ORIGINS") is not None:
             # split comma-separated string into list
             config["allow_origins"] = [
-                origin.strip() for origin in os.getenv("AGENSGRAPH_MCP_SERVER_ALLOW_ORIGINS", "").split(",")
+                origin.strip()
+                for origin in os.getenv(
+                    "AGENSGRAPH_MCP_SERVER_ALLOW_ORIGINS", ""
+                ).split(",")
                 if origin.strip()
             ]
         else:
@@ -188,12 +234,17 @@ def process_config(args: argparse.Namespace) -> dict[str, Union[str, int, None]]
     # parse allowed hosts for DNS rebinding protection
     if args.allowed_hosts is not None:
         # Handle comma-separated string from CLI
-        config["allowed_hosts"] = [host.strip() for host in args.allowed_hosts.split(",") if host.strip()]
+        config["allowed_hosts"] = [
+            host.strip() for host in args.allowed_hosts.split(",") if host.strip()
+        ]
     else:
         if os.getenv("AGENSGRAPH_MCP_SERVER_ALLOWED_HOSTS") is not None:
             # split comma-separated string into list
             config["allowed_hosts"] = [
-                host.strip() for host in os.getenv("AGENSGRAPH_MCP_SERVER_ALLOWED_HOSTS", "").split(",")
+                host.strip()
+                for host in os.getenv("AGENSGRAPH_MCP_SERVER_ALLOWED_HOSTS", "").split(
+                    ","
+                )
                 if host.strip()
             ]
         else:
@@ -208,10 +259,14 @@ def process_config(args: argparse.Namespace) -> dict[str, Union[str, int, None]]
         config["namespace"] = args.namespace
     else:
         if os.getenv("AGENSGRAPH_NAMESPACE") is not None:
-            logger.info(f"Info: Namespace provided for tools: {os.getenv('AGENSGRAPH_NAMESPACE')}")
+            logger.info(
+                f"Info: Namespace provided for tools: {os.getenv('AGENSGRAPH_NAMESPACE')}"
+            )
             config["namespace"] = os.getenv("AGENSGRAPH_NAMESPACE")
         else:
-            logger.info("Info: No namespace provided for tools. No namespace will be used.")
+            logger.info(
+                "Info: No namespace provided for tools. No namespace will be used."
+            )
             config["namespace"] = ""
 
     return config

@@ -2,26 +2,30 @@ import json
 import logging
 from typing import Literal
 
+from fastmcp.exceptions import ToolError
+from fastmcp.server import FastMCP
+from fastmcp.tools.tool import ToolResult
+from mcp.types import TextContent, ToolAnnotations
 from psycopg_pool import AsyncConnectionPool
 from pydantic import Field
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
 
-from fastmcp.server import FastMCP
-from fastmcp.exceptions import ToolError
-from fastmcp.tools.tool import ToolResult
-from mcp.types import TextContent
-from mcp.types import ToolAnnotations
-
-from .agensgraph_memory import AgensGraphMemory, Entity, Relation, ObservationAddition, ObservationDeletion, KnowledgeGraph
-from .utils import format_namespace, build_connection_url
+from .agensgraph_memory import (
+    AgensGraphMemory,
+    Entity,
+    ObservationAddition,
+    ObservationDeletion,
+    Relation,
+)
+from .utils import build_connection_url, format_namespace
 
 # Set up logging
-logger = logging.getLogger('mcp_agensgraph_memory')
+logger = logging.getLogger("mcp_agensgraph_memory")
 logger.setLevel(logging.INFO)
 
-jsonb_to_string = r'''
+jsonb_to_string = r"""
     CREATE OR REPLACE FUNCTION jsonb_to_string(j jsonb, sep text DEFAULT ', ')
     RETURNS text AS $$
     SELECT                           
@@ -37,7 +41,8 @@ jsonb_to_string = r'''
         ELSE j::text
     END;
     $$ LANGUAGE sql IMMUTABLE
-'''
+"""
+
 
 def create_mcp_server(memory: AgensGraphMemory, namespace: str = "") -> FastMCP:
     """Create an MCP server instance for memory management."""
@@ -47,11 +52,14 @@ def create_mcp_server(memory: AgensGraphMemory, namespace: str = "") -> FastMCP:
 
     @mcp.tool(
         name=namespace_prefix + "read_graph",
-        annotations=ToolAnnotations(title="Read Graph",
-                                          readOnlyHint=True,
-                                          destructiveHint=False,
-                                          idempotentHint=True,
-                                          openWorldHint=True))
+        annotations=ToolAnnotations(
+            title="Read Graph",
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+    )
     async def read_graph() -> ToolResult:
         """Read the entire knowledge graph with all entities and relationships.
 
@@ -75,20 +83,30 @@ def create_mcp_server(memory: AgensGraphMemory, namespace: str = "") -> FastMCP:
         logger.info("MCP tool: read_graph")
         try:
             result = await memory.read_graph()
-            return ToolResult(content=[TextContent(type="text", text=result.model_dump_json())],
-                          structured_content=result)
+            return ToolResult(
+                content=[TextContent(type="text", text=result.model_dump_json())],
+                structured_content=result,
+            )
         except Exception as e:
             logger.error(f"Error reading full knowledge graph: {e}")
             raise ToolError(f"Error reading full knowledge graph: {e}")
 
     @mcp.tool(
         name=namespace_prefix + "create_entities",
-        annotations=ToolAnnotations(title="Create Entities",
-                                          readOnlyHint=False,
-                                          destructiveHint=False,
-                                          idempotentHint=True,
-                                          openWorldHint=True))
-    async def create_entities(entities: list[Entity] = Field(..., description="List of entities to create with name, type, and observations")) -> ToolResult:
+        annotations=ToolAnnotations(
+            title="Create Entities",
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+    )
+    async def create_entities(
+        entities: list[Entity] = Field(
+            ...,
+            description="List of entities to create with name, type, and observations",
+        ),
+    ) -> ToolResult:
         """Create multiple new entities in the knowledge graph.
 
         Creates new memory entities with their associated observations. If an entity with the same name
@@ -118,20 +136,33 @@ def create_mcp_server(memory: AgensGraphMemory, namespace: str = "") -> FastMCP:
         try:
             entity_objects = [Entity.model_validate(entity) for entity in entities]
             result = await memory.create_entities(entity_objects)
-            return ToolResult(content=[TextContent(type="text", text=json.dumps([e.model_dump() for e in result]))],
-                          structured_content={"result": result})
+            return ToolResult(
+                content=[
+                    TextContent(
+                        type="text", text=json.dumps([e.model_dump() for e in result])
+                    )
+                ],
+                structured_content={"result": result},
+            )
         except Exception as e:
             logger.error(f"Error creating entities: {e}")
             raise ToolError(f"Error creating entities: {e}")
 
     @mcp.tool(
         name=namespace_prefix + "create_relations",
-        annotations=ToolAnnotations(title="Create Relations",
-                                          readOnlyHint=False,
-                                          destructiveHint=False,
-                                          idempotentHint=True,
-                                          openWorldHint=True))
-    async def create_relations(relations: list[Relation] = Field(..., description="List of relations to create between existing entities")) -> ToolResult:
+        annotations=ToolAnnotations(
+            title="Create Relations",
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+    )
+    async def create_relations(
+        relations: list[Relation] = Field(
+            ..., description="List of relations to create between existing entities"
+        ),
+    ) -> ToolResult:
         """Create multiple new relationships between existing entities in the knowledge graph.
 
         Creates directed relationships between entities that already exist. Both source and target
@@ -158,22 +189,37 @@ def create_mcp_server(memory: AgensGraphMemory, namespace: str = "") -> FastMCP:
         """
         logger.info(f"MCP tool: create_relations ({len(relations)} relations)")
         try:
-            relation_objects = [Relation.model_validate(relation) for relation in relations]
+            relation_objects = [
+                Relation.model_validate(relation) for relation in relations
+            ]
             result = await memory.create_relations(relation_objects)
-            return ToolResult(content=[TextContent(type="text", text=json.dumps([r.model_dump() for r in result]))],
-                          structured_content={"result": result})
+            return ToolResult(
+                content=[
+                    TextContent(
+                        type="text", text=json.dumps([r.model_dump() for r in result])
+                    )
+                ],
+                structured_content={"result": result},
+            )
         except Exception as e:
             logger.error(f"Error creating relations: {e}")
             raise ToolError(f"Error creating relations: {e}")
 
     @mcp.tool(
         name=namespace_prefix + "add_observations",
-        annotations=ToolAnnotations(title="Add Observations",
-                                          readOnlyHint=False,
-                                          destructiveHint=False,
-                                          idempotentHint=True,
-                                          openWorldHint=True))
-    async def add_observations(observations: list[ObservationAddition] = Field(..., description="List of observations to add to existing entities")) -> ToolResult:
+        annotations=ToolAnnotations(
+            title="Add Observations",
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+    )
+    async def add_observations(
+        observations: list[ObservationAddition] = Field(
+            ..., description="List of observations to add to existing entities"
+        ),
+    ) -> ToolResult:
         """Add new observations/facts to existing entities in the knowledge graph.
 
         Appends new observations to entities that already exist. The entity must be present
@@ -198,22 +244,33 @@ def create_mcp_server(memory: AgensGraphMemory, namespace: str = "") -> FastMCP:
         """
         logger.info(f"MCP tool: add_observations ({len(observations)} additions)")
         try:
-            observation_objects = [ObservationAddition.model_validate(obs) for obs in observations]
+            observation_objects = [
+                ObservationAddition.model_validate(obs) for obs in observations
+            ]
             result = await memory.add_observations(observation_objects)
-            return ToolResult(content=[TextContent(type="text", text=json.dumps(result))],
-                          structured_content={"result": result})
+            return ToolResult(
+                content=[TextContent(type="text", text=json.dumps(result))],
+                structured_content={"result": result},
+            )
         except Exception as e:
             logger.error(f"Error adding observations: {e}")
             raise ToolError(f"Error adding observations: {e}")
 
     @mcp.tool(
         name=namespace_prefix + "delete_entities",
-        annotations=ToolAnnotations(title="Delete Entities",
-                                          readOnlyHint=False,
-                                          destructiveHint=True,
-                                          idempotentHint=True,
-                                          openWorldHint=True))
-    async def delete_entities(entityNames: list[str] = Field(..., description="List of exact entity names to delete permanently")) -> ToolResult:
+        annotations=ToolAnnotations(
+            title="Delete Entities",
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+    )
+    async def delete_entities(
+        entityNames: list[str] = Field(
+            ..., description="List of exact entity names to delete permanently"
+        ),
+    ) -> ToolResult:
         """Delete entities and all their associated relationships from the knowledge graph.
 
         Permanently removes entities from the graph along with all relationships they participate in.
@@ -232,20 +289,31 @@ def create_mcp_server(memory: AgensGraphMemory, namespace: str = "") -> FastMCP:
         logger.info(f"MCP tool: delete_entities ({len(entityNames)} entities)")
         try:
             await memory.delete_entities(entityNames)
-            return ToolResult(content=[TextContent(type="text", text="Entities deleted successfully")],
-                              structured_content={"result": "Entities deleted successfully"})
+            return ToolResult(
+                content=[
+                    TextContent(type="text", text="Entities deleted successfully")
+                ],
+                structured_content={"result": "Entities deleted successfully"},
+            )
         except Exception as e:
             logger.error(f"Error deleting entities: {e}")
             raise ToolError(f"Error deleting entities: {e}")
 
     @mcp.tool(
         name=namespace_prefix + "delete_observations",
-        annotations=ToolAnnotations(title="Delete Observations",
-                                          readOnlyHint=False,
-                                          destructiveHint=True,
-                                          idempotentHint=True,
-                                          openWorldHint=True))
-    async def delete_observations(deletions: list[ObservationDeletion] = Field(..., description="List of specific observations to remove from entities")) -> ToolResult:
+        annotations=ToolAnnotations(
+            title="Delete Observations",
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+    )
+    async def delete_observations(
+        deletions: list[ObservationDeletion] = Field(
+            ..., description="List of specific observations to remove from entities"
+        ),
+    ) -> ToolResult:
         """Delete specific observations from existing entities in the knowledge graph.
 
         Removes specific observation texts from entities. The observation text must match exactly
@@ -272,22 +340,35 @@ def create_mcp_server(memory: AgensGraphMemory, namespace: str = "") -> FastMCP:
         """
         logger.info(f"MCP tool: delete_observations ({len(deletions)} deletions)")
         try:
-            deletion_objects = [ObservationDeletion.model_validate(deletion) for deletion in deletions]
+            deletion_objects = [
+                ObservationDeletion.model_validate(deletion) for deletion in deletions
+            ]
             await memory.delete_observations(deletion_objects)
-            return ToolResult(content=[TextContent(type="text", text="Observations deleted successfully")],
-                          structured_content={"result": "Observations deleted successfully"})
+            return ToolResult(
+                content=[
+                    TextContent(type="text", text="Observations deleted successfully")
+                ],
+                structured_content={"result": "Observations deleted successfully"},
+            )
         except Exception as e:
             logger.error(f"Error deleting observations: {e}")
             raise ToolError(f"Error deleting observations: {e}")
 
     @mcp.tool(
         name=namespace_prefix + "delete_relations",
-        annotations=ToolAnnotations(title="Delete Relations",
-                                          readOnlyHint=False,
-                                          destructiveHint=True,
-                                          idempotentHint=True,
-                                          openWorldHint=True))
-    async def delete_relations(relations: list[Relation] = Field(..., description="List of specific relationships to delete from the graph")) -> ToolResult:
+        annotations=ToolAnnotations(
+            title="Delete Relations",
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+    )
+    async def delete_relations(
+        relations: list[Relation] = Field(
+            ..., description="List of specific relationships to delete from the graph"
+        ),
+    ) -> ToolResult:
         """Delete specific relationships between entities in the knowledge graph.
 
         Removes relationships while keeping the entities themselves. The source, target, and
@@ -317,22 +398,36 @@ def create_mcp_server(memory: AgensGraphMemory, namespace: str = "") -> FastMCP:
         """
         logger.info(f"MCP tool: delete_relations ({len(relations)} relations)")
         try:
-            relation_objects = [Relation.model_validate(relation) for relation in relations]
+            relation_objects = [
+                Relation.model_validate(relation) for relation in relations
+            ]
             await memory.delete_relations(relation_objects)
-            return ToolResult(content=[TextContent(type="text", text="Relations deleted successfully")],
-                          structured_content={"result": "Relations deleted successfully"})
+            return ToolResult(
+                content=[
+                    TextContent(type="text", text="Relations deleted successfully")
+                ],
+                structured_content={"result": "Relations deleted successfully"},
+            )
         except Exception as e:
             logger.error(f"Error deleting relations: {e}")
             raise ToolError(f"Error deleting relations: {e}")
 
     @mcp.tool(
         name=namespace_prefix + "search_memories",
-        annotations=ToolAnnotations(title="Search Memories",
-                                          readOnlyHint=True,
-                                          destructiveHint=False,
-                                          idempotentHint=True,
-                                          openWorldHint=True))
-    async def search_memories(query: str = Field(..., description="Search query to find entities by name, type, or observations")) -> ToolResult:
+        annotations=ToolAnnotations(
+            title="Search Memories",
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+    )
+    async def search_memories(
+        query: str = Field(
+            ...,
+            description="Search query to find entities by name, type, or observations",
+        ),
+    ) -> ToolResult:
         """Search for entities in the knowledge graph using text search.
 
         Searches across entity names, types, and observations.
@@ -351,20 +446,29 @@ def create_mcp_server(memory: AgensGraphMemory, namespace: str = "") -> FastMCP:
         logger.info(f"MCP tool: search_memories ('{query}')")
         try:
             result = await memory.search_memories(query)
-            return ToolResult(content=[TextContent(type="text", text=result.model_dump_json())],
-                              structured_content=result)
+            return ToolResult(
+                content=[TextContent(type="text", text=result.model_dump_json())],
+                structured_content=result,
+            )
         except Exception as e:
             logger.error(f"Error searching memories: {e}")
             raise ToolError(f"Error searching memories: {e}")
 
     @mcp.tool(
         name=namespace_prefix + "find_memories_by_name",
-        annotations=ToolAnnotations(title="Find Memories by Name",
-                                          readOnlyHint=True,
-                                          destructiveHint=False,
-                                          idempotentHint=True,
-                                          openWorldHint=True))
-    async def find_memories_by_name(names: list[str] = Field(..., description="List of exact entity names to retrieve")) -> ToolResult:
+        annotations=ToolAnnotations(
+            title="Find Memories by Name",
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+    )
+    async def find_memories_by_name(
+        names: list[str] = Field(
+            ..., description="List of exact entity names to retrieve"
+        ),
+    ) -> ToolResult:
         """Find specific entities by their exact names.
 
         Retrieves entities that exactly match the provided names, along with all their
@@ -383,8 +487,10 @@ def create_mcp_server(memory: AgensGraphMemory, namespace: str = "") -> FastMCP:
         logger.info(f"MCP tool: find_memories_by_name ({len(names)} names)")
         try:
             result = await memory.find_memories_by_name(names)
-            return ToolResult(content=[TextContent(type="text", text=result.model_dump_json())],
-                              structured_content=result)
+            return ToolResult(
+                content=[TextContent(type="text", text=result.model_dump_json())],
+                structured_content=result,
+            )
         except Exception as e:
             logger.error(f"Error finding memories by name: {e}")
             raise ToolError(f"Error finding memories by name: {e}")
@@ -406,11 +512,13 @@ async def main(
     allow_origins: list[str] = [],
     allowed_hosts: list[str] = [],
 ) -> None:
-    logger.info(f"Starting AgensGraph MCP Memory Server")
+    logger.info("Starting AgensGraph MCP Memory Server")
     logger.info(f"Connecting to AgensGraph with URL: {agensgraph_url}")
 
     # Build full connection URL
-    db_url = build_connection_url(agensgraph_url, agensgraph_user, agensgraph_password, agensgraph_database)
+    db_url = build_connection_url(
+        agensgraph_url, agensgraph_user, agensgraph_password, agensgraph_database
+    )
 
     # Create connection pool
     connection_pool = AsyncConnectionPool(db_url, open=False)
@@ -418,19 +526,22 @@ async def main(
     # Verify connection
     try:
         await connection_pool.open()
-        logger.info(f"Connected to AgensGraph successfully")
+        logger.info("Connected to AgensGraph successfully")
     except Exception as e:
         logger.error(f"Failed to connect to AgensGraph: {e}")
         exit(1)
 
     # Create graph if it doesn't exist
     try:
-        from .agensgraph_memory import get_pool_connection
         from psycopg.rows import namedtuple_row
+
+        from .agensgraph_memory import get_pool_connection
 
         async with get_pool_connection(connection_pool) as conn:
             async with conn.cursor(row_factory=namedtuple_row) as cursor:
-                await cursor.execute(f"CREATE GRAPH IF NOT EXISTS {agensgraph_graphname}")
+                await cursor.execute(
+                    f"CREATE GRAPH IF NOT EXISTS {agensgraph_graphname}"
+                )
                 await cursor.execute(jsonb_to_string)
                 await conn.commit()
         logger.info(f"Ensured graph '{agensgraph_graphname}' exists")
@@ -453,8 +564,7 @@ async def main(
             allow_methods=["GET", "POST"],
             allow_headers=["*"],
         ),
-        Middleware(TrustedHostMiddleware,
-                   allowed_hosts=allowed_hosts)
+        Middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts),
     ]
 
     # Create MCP server
@@ -466,12 +576,24 @@ async def main(
     match transport:
         case "http":
             logger.info(f"HTTP server starting on {host}:{port}{path}")
-            await mcp.run_http_async(host=host, port=port, path=path, middleware=custom_middleware, stateless_http=True)
+            await mcp.run_http_async(
+                host=host,
+                port=port,
+                path=path,
+                middleware=custom_middleware,
+                stateless_http=True,
+            )
         case "stdio":
             logger.info("STDIO server starting")
             await mcp.run_stdio_async()
         case "sse":
             logger.info(f"SSE server starting on {host}:{port}{path}")
-            await mcp.run_http_async(host=host, port=port, path=path, middleware=custom_middleware, transport="sse")
+            await mcp.run_http_async(
+                host=host,
+                port=port,
+                path=path,
+                middleware=custom_middleware,
+                transport="sse",
+            )
         case _:
             raise ValueError(f"Unsupported transport: {transport}")

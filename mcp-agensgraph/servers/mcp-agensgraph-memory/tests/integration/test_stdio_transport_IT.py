@@ -48,11 +48,14 @@ async def test_stdio_transport():
         stderr_text = stderr.decode()
 
         # Check for startup success message
-        assert "Starting MCP server" in stderr_text or "FastMCP" in stdout_text, \
+        assert "Starting MCP server" in stderr_text or "FastMCP" in stdout_text, (
             f"Server failed to start properly.\nSTDOUT: {stdout_text}\nSTDERR: {stderr_text}"
+        )
 
         # Return code 0 is ok for stdio (means it started and exited cleanly)
-        assert process.returncode == 0, f"Server exited with error code {process.returncode}"
+        assert process.returncode == 0, (
+            f"Server exited with error code {process.returncode}"
+        )
     else:
         # Process is still running, terminate it
         process.terminate()

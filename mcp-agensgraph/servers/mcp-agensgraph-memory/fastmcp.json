@@ -1,0 +1,9 @@
+{
+    "entrypoint": "src/mcp_agensgraph_memory/server.py",
+    "environment": {
+        "dependencies": [
+            "psycopg",
+            "pydantic"
+        ]
+    }
+}

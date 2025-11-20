@@ -45,18 +45,41 @@ Can be found on PyPi https://pypi.org/project/mcp-agensgraph-cypher/
 
 Add the server to your `claude_desktop_config.json` with the database connection configuration through environment variables. You may also specify the transport method and namespace with cli arguments or environment variables.
 
+If running locally, use the following configuration after running `uv sync` in the server directory:
+
+```json
+"mcpServers": {
+  "agensgraph-cypher": {
+    "command": "uv",
+    "args": [
+      "--directory",
+      "/path/to/agensgraph-ai/mcp-agensgraph/servers/mcp-agensgraph-cypher",
+      "run",
+      "mcp-agensgraph-cypher"
+    ],
+    "env": {
+      "AGENSGRAPH_URL": "postgresql://<host>:<port>",
+      "AGENSGRAPH_USERNAME": "<your-username>",
+      "AGENSGRAPH_PASSWORD": "<your-password>",
+      "AGENSGRAPH_DB": "<dbname>",
+      "AGENSGRAPH_GRAPHNAME": "<graphname>"
+    }
+  }
+}
+```
+
+Alternatively, using the released package(not available at the moment):
 ```json
 "mcpServers": {
   "agensgraph-cypher": {
     "command": "uvx",
     "args": [ "mcp-agensgraph-cypher@0.1.0", "--transport", "stdio"  ],
     "env": {
+      "AGENSGRAPH_URL": "postgresql://<host>:<port>",
       "AGENSGRAPH_USERNAME": "<your-username>",
       "AGENSGRAPH_PASSWORD": "<your-password>",
       "AGENSGRAPH_DB": "<dbname>",
-      "AGENSGRAPH_HOST": "localhost",
-      "AGENSGRAPH_PORT": "5432",
-      "AGENSGRAPH_GRAPH_NAME": "graph",
+      "AGENSGRAPH_GRAPHNAME": "<graphname>"
     }
   }
 }
@@ -66,6 +89,48 @@ Add the server to your `claude_desktop_config.json` with the database connection
 
 Here's an example of connecting to multiple Graphs within a single agensgraph db using namespaces:
 
+If running locally, use the following configuration after running `uv sync` in the server directory:
+
+```json
+{
+  "mcpServers": {
+    "graph1-agensgraph": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/path/to/agensgraph-ai/mcp-agensgraph/servers/mcp-agensgraph-cypher",
+        "run",
+        "mcp-agensgraph-cypher"
+      ],
+      "env": {
+        "AGENSGRAPH_URL": "postgresql://<host>:<port>",
+        "AGENSGRAPH_USERNAME": "<your-username>",
+        "AGENSGRAPH_PASSWORD": "<your-password>",
+        "AGENSGRAPH_DB": "<dbname>",
+        "AGENSGRAPH_GRAPHNAME": "graph1"
+      }
+    },
+    "graph2-agensgraph": {
+      "command": "uv",
+      "args": [
+        "--directory",
+        "/path/to/agensgraph-ai/mcp-agensgraph/servers/mcp-agensgraph-cypher",
+        "run",
+        "mcp-agensgraph-cypher"
+      ],
+      "env": {
+        "AGENSGRAPH_URL": "postgresql://<host>:<port>",
+        "AGENSGRAPH_USERNAME": "<your-username>",
+        "AGENSGRAPH_PASSWORD": "<your-password>",
+        "AGENSGRAPH_DB": "<dbname>",
+        "AGENSGRAPH_GRAPHNAME": "graph2"
+      }
+    }
+  }
+}
+```
+
+Alternatively, using the released package(not available at the moment) with namespaces:
 ```json
 {
   "mcpServers": {
@@ -73,24 +138,22 @@ Here's an example of connecting to multiple Graphs within a single agensgraph db
       "command": "uvx",
       "args": [ "mcp-agensgraph-cypher@0.1.0", "--namespace", "graph1" ],
       "env": {
+        "AGENSGRAPH_URL": "postgresql://<host>:<port>",
         "AGENSGRAPH_USERNAME": "<your-username>",
         "AGENSGRAPH_PASSWORD": "<your-password>",
         "AGENSGRAPH_DB": "<dbname>",
-        "AGENSGRAPH_HOST": "localhost",
-        "AGENSGRAPH_PORT": "5432",
-        "AGENSGRAPH_GRAPH_NAME": "graph1"
+        "AGENSGRAPH_GRAPHNAME": "graph1"
       }
     },
     "graph2-agensgraph": {
       "command": "uvx",
       "args": [ "mcp-agensgraph-cypher@0.1.0", "--namespace", "graph2" ],
       "env": {
+        "AGENSGRAPH_URL": "postgresql://<host>:<port>",
         "AGENSGRAPH_USERNAME": "<your-username>",
         "AGENSGRAPH_PASSWORD": "<your-password>",
         "AGENSGRAPH_DB": "<dbname>",
-        "AGENSGRAPH_HOST": "localhost",
-        "AGENSGRAPH_PORT": "5432",
-        "AGENSGRAPH_GRAPH_NAME": "graph2"
+        "AGENSGRAPH_GRAPHNAME": "graph2"
       }
     }
   }
@@ -112,16 +175,14 @@ Syntax with `--db-url`, `--username`, `--password` and other command line argume
     "command": "uvx",
     "args": [
       "mcp-agensgraph-cypher@0.1.0",
+      "--db-url",
+      "postgresql://<host>:<port>",
       "--db-name",
       "<your-db-name>",
-      "--username"
+      "--username",
       "<your-username>",
       "--password",
       "<your-password>",
-      "--db-host",
-      "localhost",
-      "--db-port",
-      "5432",
       "--namespace",
       "mydb",
       "--transport",

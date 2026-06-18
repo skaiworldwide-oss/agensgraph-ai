@@ -634,6 +634,24 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         for query, params in self._build_upsert_relations_ops(relations):
             await self.astructured_query(query, params)
 
+    @staticmethod
+    def _or_equalities(
+        field: str, values: List[str], prefix: str
+    ) -> Tuple[str, Dict[str, Any]]:
+        """Build an index-friendly ``(field = v0 OR field = v1 ...)`` fragment.
+
+        The ``<@`` / ``IN`` containment forms never use the btree index; an
+        OR-of-equalities is served via a BitmapOr index scan when ``field`` is
+        indexed (``id`` always is; other properties when explicitly indexed).
+        """
+        terms = []
+        params: Dict[str, Any] = {}
+        for i, value in enumerate(values):
+            pname = f"{prefix}_{i}"
+            params[pname] = Jsonb(value)
+            terms.append(f"{field} = %({pname})s")
+        return "(" + " OR ".join(terms) + ")", params
+
     def _build_get(
         self,
         properties: Optional[dict] = None,
@@ -648,15 +666,9 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         query += 'MATCH (e:{BASE_NODE_LABEL}) '
         query += "WHERE e.id IS NOT NULL "
         if ids:
-            # OR-of-equalities rather than ``e.id <@ [...]``: only the equality
-            # form matches the ``unique_id`` btree index (served as a BitmapOr
-            # index scan); the ``<@`` containment operator always seq-scans.
-            id_terms = []
-            for i, _id in enumerate(ids):
-                pname = f"get_id_{i}"
-                params[pname] = Jsonb(_id)
-                id_terms.append(f"e.id = %({pname})s")
-            query += "AND (" + " OR ".join(id_terms) + ") "
+            frag, id_params = self._or_equalities("e.id", ids, "get_id")
+            query += "AND " + frag + " "
+            params.update(id_params)
 
         if properties:
             prop_params = [f'e."{prop}" = %({prop})s' for prop in properties]
@@ -762,19 +774,23 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             query += "AND "
 
         if entity_names:
-            query += "e.name <@ %(entity_names)s "
-            params["entity_names"] = Jsonb(entity_names)
+            frag, p = self._or_equalities("e.name", entity_names, "etn")
+            query += frag + " "
+            params.update(p)
 
         if relation_names and entity_names:
             query += "AND "
 
         if relation_names:
+            # type(r) is the edge label, not a property, so it can't use a
+            # property index; the containment form is fine here.
             query += "type(r) <@ %(relation_names)s "
             params["relation_names"] = Jsonb(relation_names)
 
         if ids:
-            query += "e.id <@ %(ids)s "
-            params["ids"] = Jsonb(ids)
+            frag, p = self._or_equalities("e.id", ids, "gtid")
+            query += frag + " "
+            params.update(p)
 
         if properties:
             prop_params = [f'e."{prop}" = %({prop})s' for prop in properties]
@@ -949,15 +965,15 @@ class AgensPropertyGraphStore(PropertyGraphStore):
     ) -> None:
         """Delete matching data."""
         if entity_names:
+            frag, p = self._or_equalities("n.name", entity_names, "etn")
             self.structured_query(
-                "MATCH (n) WHERE n.name <@ %(entity_names)s DETACH DELETE n",
-                {"entity_names": Jsonb(entity_names)}
+                'MATCH (n:"__Node__") WHERE ' + frag + " DETACH DELETE n", p
             )
 
         if ids:
+            frag, p = self._or_equalities("n.id", ids, "delid")
             self.structured_query(
-                "MATCH (n) WHERE n.id <@ %(ids)s DETACH DELETE n",
-                {"ids": Jsonb(ids)}
+                'MATCH (n:"__Node__") WHERE ' + frag + " DETACH DELETE n", p
             )
 
         if relation_names:

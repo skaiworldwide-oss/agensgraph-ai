@@ -866,6 +866,8 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         triples = []
 
         ids = [node.id for node in graph_nodes]
+        if not ids:
+            return triples
         query = """SELECT t.source_id,
                             t.source_type,
                             (t.source_properties - 'labels') || '{{"embedding": null, "id": null}}'::jsonb AS source_properties,
@@ -876,21 +878,21 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                             (t.target_properties - 'labels') || '{{"embedding": null, "id": null}}'::jsonb AS target_properties
                       FROM (
                 """
-        query += f"""
-            UNWIND {[0] if len(ids) == 1 else f'range(0, {len(ids)} - 1)::jsonb'} AS idx
-            """
+        # OR-of-equalities seed match uses the id index (BitmapOr), whereas the
+        # previous `UNWIND idx ... WHERE e.id = ids[idx]` dynamic subscript
+        # forced a sequential scan of the whole node set per call.
+        seed_frag, seed_params = self._or_equalities("e.id", ids, "rmid")
         query += """
             MATCH (e:{BASE_NODE_LABEL})
-            WHERE e.id = %(ids)s[idx]
+            WHERE """ + seed_frag + """
             MATCH p=(e)-[r*1..{depth}]-(other)
             UNWIND relationships(p) AS rel
-            WITH DISTINCT rel, idx, collect(type(rel)) AS types
+            WITH DISTINCT rel, collect(type(rel)) AS types
             WHERE all(x IN types WHERE x <> 'MENTIONS')
             WITH startNode(rel) AS source,
                 type(rel) AS type,
                 rel AS rel_properties,
                 endNode(rel) AS endNode,
-                idx,
                 startNode(rel).labels AS source_labels,
                 endNode(rel).labels AS target_labels
             LIMIT %(limit)s
@@ -916,9 +918,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                         END
                     ELSE target_labels[0]
                 END AS target_type,
-                properties(endNode) AS target_properties,
-                idx
-            ORDER BY idx
+                properties(endNode) AS target_properties
             LIMIT %(limit)s
             """
         query += ")t"
@@ -927,7 +927,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL),
                 BASE_ENTITY_LABEL=sql.Literal(BASE_ENTITY_LABEL),
                 depth=depth
-            ), {"ids": Jsonb(ids), "limit": limit}
+            ), {**seed_params, "limit": limit}
         )
         response = response if response else []
 

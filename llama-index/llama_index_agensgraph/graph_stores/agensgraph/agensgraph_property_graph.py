@@ -1244,7 +1244,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
     def _enhance_schema(self) -> None:
         """
         Attach a small sample of example values to each node-label property in
-        ``structured_schema`` (parity with the Neo4j enhanced schema), so that a
+        ``structured_schema`` (an enhanced schema), so that a
         text-to-Cypher prompt can show concrete examples.
 
         The sampling is bounded — at most ``ENHANCED_SAMPLE_SIZE`` nodes are

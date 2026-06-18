@@ -1,17 +1,40 @@
 # LlamaIndex AgensGraph
 
-This plugin provides support for AgensGraphStore integration in [llamaindex](https://www.llamaindex.ai/), for persisting graphs directly in [AgensGraph](https://github.com/skaiworldwide-oss/agensgraph). Additionally, we support the PropertyGraphIndex and VectorStore, which allows you to store and query property graphs and vectors in AgensGraph.
+This plugin integrates [AgensGraph](https://github.com/skaiworldwide-oss/agensgraph)
+with [LlamaIndex](https://www.llamaindex.ai/), persisting graphs and vectors
+directly in AgensGraph. It powers `PropertyGraphIndex` and `VectorStoreIndex`,
+so you can store and query property graphs and embeddings in one database.
 
 - Property Graph Store: `AgensPropertyGraphStore`
-- Knowledege Graph Store: `AgensGraphStore`
 - Vector Store: `AgensgraphVectorStore`
+- Connection pool: `AgensEngine` (optional, shared across stores)
 
 See the associated guides below:
 
-- [Agens Graph Store](./examples/index_structs/knowledge_graph/AgensgraphDemo.ipynb)
 - [Agens Property Graph Store](./examples//property_graph/property_graph_agensgraph.ipynb)
 - [Agensgraph Vector Store](./examples/vector_stores/AgensgraphVectorDemo.ipynb)
 
+## Requirements
+
+- Python 3.10+
+- AgensGraph with the `vector` extension (for vector / HNSW search). The `meta`
+  extension is used for schema introspection when present, with a catalog
+  fallback otherwise.
+
+## What's new in 0.2.0
+
+- **Fixed `AgensPropertyGraphStore.vector_query`.** It previously hard-coded a
+  3-dimension embedding cast and ordered by a fixed literal vector, so results
+  ignored the query embedding and errored at any other dimension. It now uses
+  the configured `vector_dimension` consistently and ranks by the actual query
+  embedding, backed by the HNSW index.
+- **Performance.** The vector store now creates a btree index on its `id` MERGE
+  key (ingest was O(N²) without it), bulk `add` is batched, and schema
+  introspection no longer materializes every distinct property value (it would
+  ship full embedding vectors on every refresh).
+- **True async + connection pooling.** See [Async & connection pooling](#async--connection-pooling).
+- **Breaking change.** The deprecated triplet `AgensGraphStore` (Knowledge Graph
+  Store) has been removed. Use `AgensPropertyGraphStore` with `PropertyGraphIndex`.
 
 ## Installation
 
@@ -65,9 +88,13 @@ conf = {
     "port": "",
 }
 
+# Pass vector_dimension to enable the HNSW vector index (match your embedding
+# model's dimension, e.g. 1536 for text-embedding-ada-002). Without it, vector
+# search still works but is unindexed.
 graph_store = AgensPropertyGraphStore(
     graph_name="graph",
-    conf=conf
+    conf=conf,
+    vector_dimension=1536,
 )
 
 index = PropertyGraphIndex.from_documents(
@@ -89,79 +116,12 @@ print("\nDetailed Query Response:")
 print(str(response))
 ```
 
-### Knowledge Graph Store
-
-```python
-import os
-import logging
-from llama_index.llms.openai import OpenAI
-from llama_index.core import Settings
-from llama_index.core import (
-    KnowledgeGraphIndex,
-    SimpleDirectoryReader,
-    StorageContext,
-)
-from llama_index_agensgraph.graph_stores.agensgraph import AgensGraphStore
-
-os.environ[
-    "OPENAI_API_KEY"
-] = "<YOUR_API_KEY>"  # Replace with your OpenAI API key
-
-logging.basicConfig(level=logging.INFO)
-
-llm = OpenAI(temperature=0, model="gpt-3.5-turbo")
-Settings.llm = llm
-Settings.chunk_size = 512
-
-documents = {
-    "doc1.txt": "Python is a popular programming language known for its readability and simplicity. It was created by Guido van Rossum and first released in 1991. Python supports multiple programming paradigms, including procedural, object-oriented, and functional programming. It is widely used in web development, data science, artificial intelligence, and scientific computing.",
-    "doc2.txt": "JavaScript is a high-level programming language primarily used for web development. It was created by Brendan Eich and first appeared in 1995. JavaScript is a core technology of the World Wide Web, alongside HTML and CSS. It enables interactive web pages and is an essential part of web applications. JavaScript is also used in server-side development with environments like Node.js.",
-    "doc3.txt": "Java is a high-level, class-based, object-oriented programming language that is designed to have as few implementation dependencies as possible. It was developed by James Gosling and first released by Sun Microsystems in 1995. Java is widely used for building enterprise-scale applications, mobile applications, and large systems development.",
-}
-
-for filename, content in documents.items():
-    with open(filename, "w") as file:
-        file.write(content)
-
-loaded_documents = SimpleDirectoryReader(".").load_data()
-
-# Setup AgensGraph connection (ensure AgensGraph is running)
-conf = {
-    "dbname": "",
-    "user": "",
-    "password": "",
-    "host": "",
-    "port": "",
-}
-
-graph_store = AgensGraphStore(
-    graph_name="graph",
-    conf=conf
-)
-
-storage_context = StorageContext.from_defaults(graph_store=graph_store)
-
-index = KnowledgeGraphIndex.from_documents(
-    loaded_documents,
-    storage_context=storage_context,
-    max_triplets_per_chunk=3,
-)
-
-query_engine = index.as_query_engine(
-    include_text=False, response_mode="tree_summarize"
-)
-response = query_engine.query("Tell me about Python and its uses")
-
-print("Query Response:")
-print(response)
-```
-
 ### Vector Store
 ```python
 import os
 import urllib.request
 from llama_index.core import SimpleDirectoryReader, VectorStoreIndex, StorageContext
-from llama_index_agensgraph.vector_stores.agensgraph.base import AgensgraphVectorStore
+from llama_index_agensgraph.vector_stores.agensgraph import AgensgraphVectorStore
 
 # Set your OpenAI API key
 os.environ["OPENAI_API_KEY"] = "<YOUR_API_KEY>"  # Replace with your key
@@ -192,3 +152,39 @@ response = query_engine.query("What happened at Interleaf?")
 print("\nQuery Response:")
 print(str(response))
 ```
+
+## Async & connection pooling
+
+By default each store opens a single dedicated connection. For concurrent
+workloads, share an `AgensEngine` (a `psycopg` connection pool) across stores so
+each request checks out its own connection instead of serializing on one:
+
+```python
+from llama_index_agensgraph.engine import AgensEngine
+from llama_index_agensgraph.graph_stores.agensgraph import AgensPropertyGraphStore
+from llama_index_agensgraph.vector_stores.agensgraph import AgensgraphVectorStore
+
+engine = AgensEngine.from_url(
+    "postgresql://user:pwd@host:5432/db", min_size=2, max_size=20
+)
+
+graph_store = AgensPropertyGraphStore(graph_name="graph", conf=conf, engine=engine)
+vector_store = AgensgraphVectorStore(
+    url="postgresql://user:pwd@host:5432/db",
+    embedding_dimension=1536,
+    engine=engine,
+)
+
+# ... use the stores ...
+engine.close()  # await engine.aclose() if you used the async pool
+```
+
+The stores also provide true-async hot paths backed by `psycopg.AsyncConnection`
+(no thread-pool wrapping):
+
+- Vector store: `async_add`, `aquery`, `adelete`
+- Property graph store: `aupsert_nodes`, `aupsert_relations`, `aget`,
+  `avector_query`, `astructured_query`
+
+These work with or without an `AgensEngine`; with one, they draw from the async
+pool.

@@ -22,3 +22,12 @@ __all__ = [
     "Relationship",
     "__version__",
 ]
+
+# The LangGraph checkpointer is re-exported lazily so the package still imports
+# if langgraph is not installed.
+try:  # pragma: no cover - import guard
+    from langchain_agensgraph.checkpoint import AgensSaver, AsyncAgensSaver
+
+    __all__ += ["AgensSaver", "AsyncAgensSaver"]
+except ImportError:  # pragma: no cover
+    pass

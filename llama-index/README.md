@@ -41,10 +41,14 @@ See the associated guides below:
   `min` / `max` / `distinct_count`, list properties get `min_size` / `max_size`,
   and other properties get example values + `distinct_count` (computed
   exhaustively under a row threshold, sampled above it).
-- **Performance.** The vector store now creates a btree index on its `id` MERGE
-  key (ingest was O(N²) without it), bulk `add` is batched, and schema
-  introspection no longer materializes every distinct property value (it would
-  ship full embedding vectors on every refresh).
+- **Performance.** Ingest is index-backed and near-linear (a btree index on the
+  `id` MERGE key; bulk `add`/`upsert` batched). Id-keyed lookups (`get`,
+  `get_nodes`, `get_triplets`, `get_rel_map`, `delete_nodes`) and the vector
+  store's `delete(ref_doc_id)` are index-backed rather than sequential scans,
+  relation upserts are UNWIND-batched per type, and schema introspection no
+  longer materializes every distinct property value. Metadata-filter keys can be
+  indexed with `create_property_index(...)`. See
+  [Performance & indexing](#performance--indexing).
 - **True async + connection pooling.** See [Async & connection pooling](#async--connection-pooling).
 - **Breaking change.** The deprecated triplet `AgensGraphStore` (Knowledge Graph
   Store) has been removed. Use `AgensPropertyGraphStore` with `PropertyGraphIndex`.

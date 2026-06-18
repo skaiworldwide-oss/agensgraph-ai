@@ -73,7 +73,7 @@ class AgensEngine:
         # Track which graphs / relational schema we have already bootstrapped so
         # the DDL runs once per engine, not on every query or store init.
         self._bootstrapped_graphs: set[str] = set()
-        self._relational_bootstrapped = False
+        self._bootstrapped_relational: set[str] = set()
 
     # ---- lifecycle ----
 
@@ -113,7 +113,7 @@ class AgensEngine:
                 self._refcount = 0
                 pool, self._pool, self._opened = self._pool, None, False
                 self._bootstrapped_graphs.clear()
-                self._relational_bootstrapped = False
+                self._bootstrapped_relational.clear()
                 _ENGINES.pop(self.conninfo, None)
             else:
                 pool = None
@@ -183,17 +183,21 @@ class AgensEngine:
         async with self._lock:
             self._bootstrapped_graphs.add(graph_name)
 
-    async def ensure_relational(self, ddl) -> None:
-        """Run relational (table/index) bootstrap DDL once per engine."""
+    async def ensure_relational(self, tag: str, ddl) -> None:
+        """Run a named relational (table/index) bootstrap once per engine.
+
+        ``tag`` distinguishes the KV / vector / doc-status schemas so each runs
+        exactly once even though several storage instances share the engine.
+        """
         async with self._lock:
-            if self._relational_bootstrapped:
+            if tag in self._bootstrapped_relational:
                 return
         async with self.aconnection() as conn:
             async with conn.cursor() as cur:
                 await ddl(cur)
             await conn.commit()
         async with self._lock:
-            self._relational_bootstrapped = True
+            self._bootstrapped_relational.add(tag)
 
 
 __all__ = ["AgensEngine", "conninfo_from_env"]

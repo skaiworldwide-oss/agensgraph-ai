@@ -171,6 +171,22 @@ class _AgensStorageBase:
                 except psycopg.ProgrammingError:
                     return []
 
+    async def _executemany(self, query: str, seq_params) -> None:
+        """Run a plain SQL statement once per row of ``seq_params`` (no decode)."""
+        seq = list(seq_params)
+        if not seq:
+            return
+        async with self._connection(graph_path=None) as conn:
+            async with conn.cursor() as cur:
+                try:
+                    await cur.executemany(query, seq)
+                    await conn.commit()
+                except psycopg.Error as e:
+                    await conn.rollback()
+                    raise AgensgraphQueryException(
+                        {"message": f"Error executing SQL: {query}", "detail": str(e)}
+                    ) from e
+
 
 __all__ = [
     "AgensgraphQueryException",

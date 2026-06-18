@@ -227,7 +227,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 else:
                     raise Exception(
                         (
-                            'Graph "{}" does not exist in the graphidbase '
+                            'Graph "{}" does not exist in the database '
                             + 'and "create" is set to False'
                         ).format(graph_name)
                     )
@@ -248,6 +248,12 @@ class AgensPropertyGraphStore(PropertyGraphStore):
 
         self.refresh_schema()
         self.verify_vector_support()
+        if create_indexes and self._supports_vector_store and not self.vector_dimension:
+            logger.warning(
+                "vector_dimension was not provided; the HNSW vector index will "
+                "not be created. Pass vector_dimension=<N> to enable indexed "
+                "vector search (search still works without it, but unindexed)."
+            )
         if create_indexes:
             self.structured_query(
                 constraint_wrapper.format(
@@ -257,16 +263,20 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 )
             )
             if self._supports_vector_index:
+                # Create the HNSW index with a property-index expression that
+                # matches what the Cypher vector query generates
+                # (``n.embedding::vector(N)``), so the planner uses the index
+                # (an index on ``properties->>'embedding'`` would NOT match a
+                # Cypher property cast and would fall back to a seq scan).
                 self.structured_query(
-                    sql.SQL("""
-                        CREATE INDEX IF NOT EXISTS {VECTOR_INDEX_NAME}
-                        ON {graph_name}.{BASE_NODE_LABEL} USING hnsw 
-                        (((properties->>'embedding')::vector({vector_dimension})) vector_cosine_ops)
-                    """).format(
-                        VECTOR_INDEX_NAME=sql.Identifier(VECTOR_INDEX_NAME),
-                        graph_name=sql.Identifier(self.graph_name),
-                        BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL),
-                        vector_dimension=self.vector_dimension
+                    sql.SQL(
+                        "CREATE PROPERTY INDEX IF NOT EXISTS {name} ON {label} "
+                        "USING hnsw ((embedding::vector("
+                        + str(int(self.vector_dimension))
+                        + ")) vector_cosine_ops)"
+                    ).format(
+                        name=sql.Identifier(VECTOR_INDEX_NAME),
+                        label=sql.Identifier(BASE_NODE_LABEL),
                     )
                 )
                 self.structured_query(
@@ -799,33 +809,44 @@ class AgensPropertyGraphStore(PropertyGraphStore):
     ) -> Tuple[List[LabelledNode], List[float]]:
         """Query the graph store with a vector store query."""
         if self._supports_vector_index:
-            vector_query = """
-                            SELECT
-                                t.name,
-                                t.type,
-                                (t.properties - 'labels') || '{{"embedding": null, "name": null, "id": null}}'::jsonb AS properties,
-                                1 - ((t.properties->>'embedding')::vector(3) <=> %(query_embedding)s::vector({vector_dimension})) AS similarity
-                            FROM (
-                                MATCH (n: {BASE_NODE_LABEL})
-                                WITH n, n.labels AS labels
-                                RETURN n.id as name,
-                                       properties(n) AS properties,
-                                       CASE
-                                            WHEN '__Entity__' IN labels THEN
-                                                CASE
-                                                    WHEN length(labels) > 2 THEN labels[2]
-                                                    WHEN length(labels) > 1 THEN labels[1]
-                                                    ELSE NULL
-                                                END
-                                            ELSE labels[0]
-                                       END AS type   
-                            )t ORDER BY
-                                (properties->>'embedding')::vector(3) <=> '[0.1, 0.2, 0.31]'::vector(3)
-                            LIMIT %(top_k)s;
-                            """
+            # The nearest-neighbour ORDER BY + LIMIT live INSIDE the Cypher
+            # sub-query against the actual query embedding, so AgensGraph can
+            # use the HNSW index; the outer SQL only reshapes the properties.
+            # Dimension is the store's configured dimension (a pgvector typmod
+            # must be a literal, so it is interpolated, not bound).
+            vector_query = (
+                """
+                SELECT
+                    t.name,
+                    t.type,
+                    (t.properties - 'labels') || '{{"embedding": null, "name": null, "id": null}}'::jsonb AS properties,
+                    t.similarity
+                FROM (
+                    MATCH (n: {BASE_NODE_LABEL})
+                    WHERE n.embedding IS NOT NULL
+                    WITH n, n.labels AS labels,
+                         (n.embedding::vector({dim}) <=> %(query_embedding)s::vector({dim})) AS dist
+                    ORDER BY dist
+                    LIMIT %(top_k)s
+                    RETURN n.id as name,
+                           properties(n) AS properties,
+                           (1 - dist) AS similarity,
+                           CASE
+                                WHEN {BASE_ENTITY_LABEL} IN labels THEN
+                                    CASE
+                                        WHEN length(labels) > 2 THEN labels[2]
+                                        WHEN length(labels) > 1 THEN labels[1]
+                                        ELSE NULL
+                                    END
+                                ELSE labels[0]
+                           END AS type
+                )t;
+                """
+            )
             data = self.structured_query(sql.SQL(vector_query).format(
                 BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL),
-                vector_dimension=self.vector_dimension
+                BASE_ENTITY_LABEL=sql.Literal(BASE_ENTITY_LABEL),
+                dim=sql.SQL(str(int(self.vector_dimension))),
             ), {
                 "query_embedding": Jsonb(query.query_embedding),
                 "top_k": query.similarity_top_k

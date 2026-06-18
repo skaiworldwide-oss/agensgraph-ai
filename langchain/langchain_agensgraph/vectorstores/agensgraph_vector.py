@@ -30,7 +30,7 @@ from langchain_core.utils import get_from_dict_or_env
 from langchain_core.vectorstores import VectorStore
 
 from langchain_agensgraph.graphs.agensgraph import AgensGraph
-from langchain_community.vectorstores.utils import (
+from langchain_agensgraph.vectorstores.utils import (
     DistanceStrategy,
     maximal_marginal_relevance,
 )
@@ -221,7 +221,7 @@ class VectorIndexAM(str, enum.Enum):
     """Enumerator of the vector index access methods."""
 
     HNSW = "HNSW"
-    IVFFLAT = "IVFLLAT"
+    IVFFLAT = "ivfflat"
     DISKANN = "DISKANN"
 
 class FullTextIndexAM(str, enum.Enum):
@@ -594,7 +594,7 @@ class AgensgraphVector(VectorStore):
         .. code-block:: python
 
             from langchain_agensgraph.vectorstores.agensgraph_vector import AgensgraphVector
-            from langchain_community.embeddings.openai import OpenAIEmbeddings
+            from langchain_openai import OpenAIEmbeddings
 
             url="postgresql://username:password@host:port/dbname"
             graph_name="my_graph"
@@ -647,12 +647,17 @@ class AgensgraphVector(VectorStore):
         if graph:
             self.connection = graph.connection
             self.graph_name = graph.graph_name
+            self._graph = graph  # share its async connection too
+            self._url = None
         else:
             url = get_from_dict_or_env({"url": url}, "url", "AGENSGRAPH_URL")
 
             # If graph is not provided, create a new one
             self.connection = psycopg.connect(url)
             self.graph_name = graph_name
+            self._graph = None
+            self._url = url
+        self._aconn: Optional[psycopg.AsyncConnection] = None
 
         self.schema = ""
 
@@ -737,7 +742,7 @@ class AgensgraphVector(VectorStore):
         # sort by index_name
         index_information = sort_by_index_name(index_information, self.index_name)
         try:
-            print("DEBUG: Index information:", index_information[0])
+            self.logger.debug("Index information: %s", index_information[0])
             self.index_name = index_information[0]["name"]
             self.node_label = index_information[0]["labelortype"]
             self.embedding_node_property = index_information[0]["property"]
@@ -777,7 +782,7 @@ class AgensgraphVector(VectorStore):
             self.text_node_property = index_information[0]["properties"][0]
             node_label = index_information[0]["labelortype"]
 
-            print("DEBUG: Keyword index information:", index_information[0])
+            self.logger.debug("Keyword index information: %s", index_information[0])
             return node_label
         except IndexError:
             return None
@@ -935,6 +940,8 @@ class AgensgraphVector(VectorStore):
         embeddings: List[List[float]],
         metadatas: Optional[List[dict]] = None,
         ids: Optional[List[str]] = None,
+        *,
+        batch_size: int = 1000,
         **kwargs: Any,
     ) -> List[str]:
         """Add embeddings to the vectorstore.
@@ -943,36 +950,59 @@ class AgensgraphVector(VectorStore):
             texts: Iterable of strings to add to the vectorstore.
             embeddings: List of list of embedding vectors.
             metadatas: List of metadatas associated with the texts.
+            batch_size: Maximum rows per Cypher UNWIND batch. Large ingests
+                (>10k rows) are split so each round-trip stays bounded in
+                memory/lock duration.
             kwargs: vectorstore specific parameters
         """
+        texts_list = list(texts)
         if ids is None:
-            ids = [md5(text.encode("utf-8")).hexdigest() for text in texts]
+            ids = [md5(text.encode("utf-8")).hexdigest() for text in texts_list]
+        else:
+            # ``add_documents`` (LangChain base) builds ``ids`` from
+            # ``doc.id``; missing entries arrive as ``None``. Fill them
+            # in deterministically so MERGE keys cannot be NULL.
+            ids = [
+                i if i is not None else md5(t.encode("utf-8")).hexdigest()
+                for i, t in zip(ids, texts_list)
+            ]
 
         if not metadatas:
-            metadatas = [{} for _ in texts]
+            metadatas = [{} for _ in texts_list]
 
-        parameters = {
-            "data": Jsonb([
-                {"text": text, "metadata": metadata, "embedding": embedding, "id": id}
-                for text, metadata, embedding, id in zip(
-                    texts, metadatas, embeddings, ids
-                )
-            ])
-        }
+        if not (len(texts_list) == len(embeddings) == len(metadatas) == len(ids)):
+            raise ValueError(
+                "add_embeddings: texts, embeddings, metadatas, ids must have "
+                "the same length"
+            )
 
         import_query = sql.SQL(
-             """UNWIND %(data)s AS row 
-                MERGE (c:{label} {{id: row.id}}) 
-                WITH c, row 
-                SET c.{embedding_property} = row.embedding 
-                SET c.{text_property} = row.text 
+             """UNWIND %(data)s AS row
+                MERGE (c:{label} {{__id__: row.id}})
+                WITH c, row
+                SET c.{embedding_property} = row.embedding
+                SET c.{text_property} = row.text
                 SET c += row.metadata """
         ).format(
             label=sql.Identifier(self.node_label),
             embedding_property=sql.Identifier(self.embedding_node_property),
             text_property=sql.Identifier(self.text_node_property),
         )
-        self.query(import_query, params=parameters)
+
+        n = len(texts_list)
+        step = max(1, int(batch_size))
+        for start in range(0, n, step):
+            end = min(start + step, n)
+            batch_rows = [
+                {"text": t, "metadata": m, "embedding": e, "id": i}
+                for t, m, e, i in zip(
+                    texts_list[start:end],
+                    metadatas[start:end],
+                    embeddings[start:end],
+                    ids[start:end],
+                )
+            ]
+            self.query(import_query, params={"data": Jsonb(batch_rows)})
 
         return ids
 
@@ -981,6 +1011,9 @@ class AgensgraphVector(VectorStore):
         texts: Iterable[str],
         metadatas: Optional[List[dict]] = None,
         ids: Optional[List[str]] = None,
+        *,
+        batch_size: int = 1000,
+        embed_batch_size: Optional[int] = None,
         **kwargs: Any,
     ) -> List[str]:
         """Run more texts through the embeddings and add to the vectorstore.
@@ -988,14 +1021,33 @@ class AgensgraphVector(VectorStore):
         Args:
             texts: Iterable of strings to add to the vectorstore.
             metadatas: Optional list of metadatas associated with the texts.
+            batch_size: Insert-side batch size (see ``add_embeddings``).
+            embed_batch_size: If set, batch the embedding API calls too.
+                Useful when the embedding provider has per-request payload
+                limits. Defaults to None (one call for all texts).
             kwargs: vectorstore specific parameters
 
         Returns:
             List of ids from adding the texts into the vectorstore.
         """
-        embeddings = self.embedding.embed_documents(list(texts))
+        texts_list = list(texts)
+        if embed_batch_size and embed_batch_size > 0 and len(texts_list) > embed_batch_size:
+            embeddings: List[List[float]] = []
+            for start in range(0, len(texts_list), embed_batch_size):
+                embeddings.extend(
+                    self.embedding.embed_documents(
+                        texts_list[start : start + embed_batch_size]
+                    )
+                )
+        else:
+            embeddings = self.embedding.embed_documents(texts_list)
         return self.add_embeddings(
-            texts=texts, embeddings=embeddings, metadatas=metadatas, ids=ids, **kwargs
+            texts=texts_list,
+            embeddings=embeddings,
+            metadatas=metadatas,
+            ids=ids,
+            batch_size=batch_size,
+            **kwargs,
         )
 
     def similarity_search(
@@ -1004,6 +1056,7 @@ class AgensgraphVector(VectorStore):
         k: int = 4,
         params: Dict[str, Any] = {},
         filter: Optional[Dict[str, Any]] = None,
+        effective_search_ratio: float = 1.0,
         **kwargs: Any,
     ) -> List[Document]:
         """Run similarity search with AgensgraphVector.
@@ -1016,6 +1069,11 @@ class AgensgraphVector(VectorStore):
             filter (Optional[Dict[str, Any]]): Dictionary of argument(s) to
                     filter on metadata.
                 Defaults to None.
+            effective_search_ratio (float): Over-fetch multiplier passed to
+                the HNSW/IVFFlat scan. Use ``>1.0`` for higher recall (esp.
+                when combined with ``filter``); the index returns
+                ``int(k * ratio)`` candidates and the final ``k`` are taken
+                after scoring. Defaults to ``1.0``.
 
         Returns:
             List of Documents most similar to the query.
@@ -1027,6 +1085,7 @@ class AgensgraphVector(VectorStore):
             query=query,
             params=params,
             filter=filter,
+            effective_search_ratio=effective_search_ratio,
             **kwargs,
         )
 
@@ -1036,6 +1095,7 @@ class AgensgraphVector(VectorStore):
         k: int = 4,
         params: Dict[str, Any] = {},
         filter: Optional[Dict[str, Any]] = None,
+        effective_search_ratio: float = 1.0,
         **kwargs: Any,
     ) -> List[Tuple[Document, float]]:
         """Return docs most similar to query.
@@ -1048,6 +1108,9 @@ class AgensgraphVector(VectorStore):
             filter (Optional[Dict[str, Any]]): Dictionary of argument(s) to
                     filter on metadata.
                 Defaults to None.
+            effective_search_ratio (float): Over-fetch multiplier for the
+                ANN index. ``>1.0`` increases recall at marginal latency
+                cost.
 
         Returns:
             List of Documents most similar to the query and score for each
@@ -1059,6 +1122,7 @@ class AgensgraphVector(VectorStore):
             query=query,
             params=params,
             filter=filter,
+            effective_search_ratio=effective_search_ratio,
             **kwargs,
         )
         return docs
@@ -1069,6 +1133,7 @@ class AgensgraphVector(VectorStore):
         k: int = 4,
         filter: Optional[Dict[str, Any]] = None,
         params: Dict[str, Any] = {},
+        effective_search_ratio: float = 1.0,
         **kwargs: Any,
     ) -> List[Tuple[Document, float]]:
         """
@@ -1160,7 +1225,7 @@ class AgensgraphVector(VectorStore):
                                     COALESCE(1.0 / (60 + semantic_search.rank), 0.0) +
                                     COALESCE(1.0 / (60 + keyword_search.rank), 0.0) AS score
                                 FROM semantic_search
-                                FULL OUTER JOIN keyword_search ON semantic_search.n->'id' = keyword_search.n->'id'
+                                FULL OUTER JOIN keyword_search ON semantic_search.n->'__id__' = keyword_search.n->'__id__'
                                 ORDER BY score DESC
                             )
                         ) AS outputs
@@ -1182,16 +1247,18 @@ class AgensgraphVector(VectorStore):
         if not self.retrieval_query:
             if kwargs.get("return_embeddings"):
                 retrieval_query = (
-                    """RETURN {var}.{text_property} AS text, score, 
-                    {var} || jsonb_build_object({text_property_literal}, Null, 
-                    {embedding_property_literal}, Null, 'id', Null, 
+                    """RETURN {var}.{text_property} AS text, score,
+                    {var}.__id__ AS doc_id,
+                    {var} || jsonb_build_object({text_property_literal}, Null,
+                    {embedding_property_literal}, Null, '__id__', Null,
                     '_embedding_', {var}.{embedding_property}) AS metadata"""
                 ).replace("{var}", var)
             else:
                 retrieval_query = (
-                    """RETURN {var}.{text_property} AS text, score, 
-                    {var} || jsonb_build_object({text_property_literal}, Null, 
-                    {embedding_property_literal}, Null, 'id', Null) AS metadata"""
+                    """RETURN {var}.{text_property} AS text, score,
+                    {var}.__id__ AS doc_id,
+                    {var} || jsonb_build_object({text_property_literal}, Null,
+                    {embedding_property_literal}, Null, '__id__', Null) AS metadata"""
                 ).replace("{var}", var)
             read_query = index_query + retrieval_query
         else:
@@ -1199,8 +1266,13 @@ class AgensgraphVector(VectorStore):
 
         read_query = index_query + retrieval_query
 
+        # Over-fetch from the ANN index when caller asks for higher recall.
+        # ``effective_search_ratio`` >= 1.0; final results are trimmed to k.
+        ratio = max(1.0, float(effective_search_ratio))
+        fetch_k = max(k, int(k * ratio))
+
         parameters = {
-            "k": k,
+            "k": fetch_k,
             "embedding": embedding,
             "query": remove_lucene_chars(kwargs["query"]),
             "embedding_property": self.embedding_node_property,
@@ -1250,11 +1322,15 @@ class AgensgraphVector(VectorStore):
         docs = [
             (
                 Document(
+                    id=result.get("doc_id"),
                     page_content=dict_to_yaml_str(result["text"])
                     if isinstance(result["text"], dict)
                     else result["text"],
                     metadata={
-                        k: v for k, v in result["metadata"].items() if v is not None
+                        # Drop both our system field and any None values.
+                        k: v
+                        for k, v in result["metadata"].items()
+                        if v is not None and k != "__id__"
                     },
                 ),
                 result["score"],
@@ -1262,7 +1338,8 @@ class AgensgraphVector(VectorStore):
             for result in results
         ]
 
-        return docs
+        # Trim over-fetch back to caller-requested k.
+        return docs[:k]
 
     def similarity_search_by_vector(
         self,
@@ -1340,7 +1417,7 @@ class AgensgraphVector(VectorStore):
             .. code-block:: python
 
                 from langchain_agensgraph.vectorstores.agensgraph_vector import AgensgraphVector
-                from langchain_community.embeddings import OpenAIEmbeddings
+                from langchain_openai import OpenAIEmbeddings
                 embeddings = OpenAIEmbeddings()
                 text_embeddings = embeddings.embed_documents(texts)
                 text_embedding_pairs = list(zip(texts, text_embeddings))
@@ -1564,7 +1641,8 @@ class AgensgraphVector(VectorStore):
                           SELECT string_agg(E'\\n' || k || ': ' || coalesce(n->>k, ''), '')
                           FROM jsonb_array_elements_text(%(text_node_properties)s) AS k
                         ) AS text,
-                        n || jsonb_build_object({embedding_property_literal}, NULL, 'id', Null,"""
+                        n.__id__ AS doc_id,
+                        n || jsonb_build_object({embedding_property_literal}, NULL, '__id__', Null,"""
                      + ",".join([f"'{prop}', Null" for prop in text_node_properties]) + """) AS metadata, score
                 """
             )
@@ -1751,18 +1829,27 @@ class AgensgraphVector(VectorStore):
         return cursor
 
     def verify_vector_support(self) -> None:
-        """
-        Verify if the graph store supports vector operations
+        """Make sure the pgvector extension is installed in the database.
+
+        AgensGraph's distribution does not bundle the ``vector`` extension; it
+        must be built from source against the install's ``pg_config`` and
+        copied into ``<prefix>/share/postgresql/extension/``. If the extension
+        isn't on disk this method raises a ``ValueError`` pointing the operator
+        at the build step.
         """
         with self._get_cursor() as curs:
             try:
                 curs.execute("CREATE EXTENSION IF NOT EXISTS vector;")
                 self.connection.commit()
-            except psycopg.Error:
+            except psycopg.Error as e:
                 self.connection.rollback()
                 raise ValueError(
-                    """Vector extension not supported\nUnable to install pg_vector extension"""
-                )
+                    "AgensGraph could not load the pgvector extension. "
+                    "AgensGraph does not bundle it; build pgvector from "
+                    "https://github.com/pgvector/pgvector against the "
+                    "install's pg_config and `make install`, then retry. "
+                    f"Underlying error: {e}"
+                ) from e
 
     @staticmethod
     def _record_to_dict(record: NamedTuple) -> Dict[str, Any]:
@@ -1833,12 +1920,15 @@ class AgensgraphVector(VectorStore):
         """
 
         # execute the query, rolling back on an error
+        in_txn = getattr(self, "_in_transaction", False)
         with self._get_cursor() as curs:
             try:
                 curs.execute(query, params)
-                self.connection.commit()
+                if not in_txn:
+                    self.connection.commit()
             except psycopg.Error as e:
-                self.connection.rollback()
+                if not in_txn:
+                    self.connection.rollback()
                 raise AgensQueryException(
                     {
                         "message": "Error executing graph query: {}".format(query),
@@ -1857,3 +1947,310 @@ class AgensgraphVector(VectorStore):
                 result = [self._record_to_dict(d) for d in data]
 
             return result
+
+    # ----- v0.2.0: VectorStore parity (delete / get_by_ids / etc.) -----
+
+    def delete(
+        self,
+        ids: Optional[List[str]] = None,
+        **kwargs: Any,
+    ) -> Optional[bool]:
+        """Delete nodes whose ``id`` property is in ``ids``.
+
+        Uses ``DETACH DELETE`` so any incident edges are removed too. Returns
+        ``True`` if the request was issued. ``None`` if ``ids`` is empty/None.
+        """
+        if not ids:
+            return None
+        delete_query = sql.SQL(
+            "MATCH (n:{label}) WHERE n.__id__ IN %(ids)s DETACH DELETE n"
+        ).format(label=sql.Identifier(self.node_label))
+        # Wrap as Jsonb so AgensGraph parses the parameter as a CypherList.
+        # A plain text[] is rejected by the planner with
+        # "CypherList is expected but unknown".
+        self.query(delete_query, params={"ids": Jsonb(list(ids))})
+        return True
+
+    def get_by_ids(self, ids: List[str], /) -> List[Document]:
+        """Return ``Document`` objects for nodes whose ``id`` is in ``ids``.
+
+        Order of the returned list is **not** guaranteed to match ``ids``.
+        Missing ids are simply absent — no exception is raised.
+        """
+        if not ids:
+            return []
+        fetch_query = sql.SQL(
+            "MATCH (n:{label}) WHERE n.__id__ IN %(ids)s "
+            "RETURN n.__id__ AS id, n.{text_property} AS text, properties(n) AS meta"
+        ).format(
+            label=sql.Identifier(self.node_label),
+            text_property=sql.Identifier(self.text_node_property),
+        )
+        # Jsonb wrap for the same reason as ``delete``: AG needs a CypherList.
+        rows = self.query(fetch_query, params={"ids": Jsonb(list(ids))})
+        docs: List[Document] = []
+        for row in rows:
+            meta = row.get("meta") or {}
+            # Strip the AgensgraphVector system fields so user metadata is clean.
+            for sys_field in ("__id__", self.embedding_node_property, self.text_node_property):
+                meta.pop(sys_field, None)
+            text = row.get("text") or ""
+            doc_id = row.get("id")
+            docs.append(Document(id=doc_id, page_content=text, metadata=meta))
+        return docs
+
+    # ----- v0.2.0: async surface (hot RAG paths) -----
+
+    async def _aconn_get(self) -> psycopg.AsyncConnection:
+        """Lazily-open an async connection bound to ``self.graph_name``.
+
+        Shares with the parent ``AgensGraph`` if one was passed to ``__init__``.
+        Otherwise opens its own ``AsyncConnection`` against the stored URL.
+        """
+        if self._graph is not None:
+            return await self._graph._aconn_get()
+        if self._aconn is None or self._aconn.closed:
+            self._aconn = await psycopg.AsyncConnection.connect(self._url)
+            async with self._aconn.cursor() as cur:
+                await cur.execute(
+                    sql.SQL("SET graph_path = {n}").format(
+                        n=sql.Identifier(self.graph_name)
+                    )
+                )
+            await self._aconn.commit()
+        return self._aconn
+
+    async def aquery(
+        self, query: Any, params: dict = {}
+    ) -> List[Dict[str, Any]]:
+        """Async sibling of :meth:`query`."""
+        conn = await self._aconn_get()
+        async with conn.cursor(row_factory=psycopg.rows.namedtuple_row) as cur:
+            try:
+                await cur.execute(query, params)
+                await conn.commit()
+            except psycopg.Error as e:
+                await conn.rollback()
+                raise AgensQueryException(
+                    {
+                        "message": "Error executing graph query: {}".format(query),
+                        "detail": str(e),
+                    }
+                )
+            try:
+                data = await cur.fetchall()
+            except psycopg.ProgrammingError:
+                data = []
+            return [self._record_to_dict(d) for d in (data or [])]
+
+    async def aadd_embeddings(
+        self,
+        texts: Iterable[str],
+        embeddings: List[List[float]],
+        metadatas: Optional[List[dict]] = None,
+        ids: Optional[List[str]] = None,
+        *,
+        batch_size: int = 1000,
+        **kwargs: Any,
+    ) -> List[str]:
+        """Async sibling of :meth:`add_embeddings`."""
+        texts_list = list(texts)
+        if ids is None:
+            ids = [md5(text.encode("utf-8")).hexdigest() for text in texts_list]
+        else:
+            ids = [
+                i if i is not None else md5(t.encode("utf-8")).hexdigest()
+                for i, t in zip(ids, texts_list)
+            ]
+        if not metadatas:
+            metadatas = [{} for _ in texts_list]
+        if not (len(texts_list) == len(embeddings) == len(metadatas) == len(ids)):
+            raise ValueError(
+                "aadd_embeddings: texts, embeddings, metadatas, ids must have "
+                "the same length"
+            )
+        import_query = sql.SQL(
+            """UNWIND %(data)s AS row
+               MERGE (c:{label} {{__id__: row.id}})
+               WITH c, row
+               SET c.{embedding_property} = row.embedding
+               SET c.{text_property} = row.text
+               SET c += row.metadata """
+        ).format(
+            label=sql.Identifier(self.node_label),
+            embedding_property=sql.Identifier(self.embedding_node_property),
+            text_property=sql.Identifier(self.text_node_property),
+        )
+        n = len(texts_list)
+        step = max(1, int(batch_size))
+        for start in range(0, n, step):
+            end = min(start + step, n)
+            batch_rows = [
+                {"text": t, "metadata": m, "embedding": e, "id": i}
+                for t, m, e, i in zip(
+                    texts_list[start:end],
+                    metadatas[start:end],
+                    embeddings[start:end],
+                    ids[start:end],
+                )
+            ]
+            await self.aquery(import_query, params={"data": Jsonb(batch_rows)})
+        return ids
+
+    async def aadd_texts(
+        self,
+        texts: Iterable[str],
+        metadatas: Optional[List[dict]] = None,
+        ids: Optional[List[str]] = None,
+        *,
+        batch_size: int = 1000,
+        embed_batch_size: Optional[int] = None,
+        **kwargs: Any,
+    ) -> List[str]:
+        """Async sibling of :meth:`add_texts`.
+
+        ``self.embedding`` is invoked synchronously since LangChain's
+        :class:`Embeddings` interface does not require async support; callers
+        that need fully async embedding should pre-compute embeddings and use
+        :meth:`aadd_embeddings`.
+        """
+        texts_list = list(texts)
+        if embed_batch_size and embed_batch_size > 0 and len(texts_list) > embed_batch_size:
+            embeddings: List[List[float]] = []
+            for start in range(0, len(texts_list), embed_batch_size):
+                embeddings.extend(
+                    self.embedding.embed_documents(
+                        texts_list[start : start + embed_batch_size]
+                    )
+                )
+        else:
+            embeddings = self.embedding.embed_documents(texts_list)
+        return await self.aadd_embeddings(
+            texts=texts_list,
+            embeddings=embeddings,
+            metadatas=metadatas,
+            ids=ids,
+            batch_size=batch_size,
+            **kwargs,
+        )
+
+    async def asimilarity_search(
+        self,
+        query: str,
+        k: int = 4,
+        params: Dict[str, Any] = {},
+        filter: Optional[Dict[str, Any]] = None,
+        effective_search_ratio: float = 1.0,
+        **kwargs: Any,
+    ) -> List[Document]:
+        """Async sibling of :meth:`similarity_search`."""
+        embedding = self.embedding.embed_query(text=query)
+        results = await self.asimilarity_search_with_score_by_vector(
+            embedding=embedding,
+            k=k,
+            query=query,
+            params=params,
+            filter=filter,
+            effective_search_ratio=effective_search_ratio,
+            **kwargs,
+        )
+        return [doc for doc, _ in results]
+
+    async def asimilarity_search_with_score(
+        self,
+        query: str,
+        k: int = 4,
+        params: Dict[str, Any] = {},
+        filter: Optional[Dict[str, Any]] = None,
+        effective_search_ratio: float = 1.0,
+        **kwargs: Any,
+    ) -> List[Tuple[Document, float]]:
+        """Async sibling of :meth:`similarity_search_with_score`."""
+        embedding = self.embedding.embed_query(query)
+        return await self.asimilarity_search_with_score_by_vector(
+            embedding=embedding,
+            k=k,
+            query=query,
+            params=params,
+            filter=filter,
+            effective_search_ratio=effective_search_ratio,
+            **kwargs,
+        )
+
+    async def asimilarity_search_with_score_by_vector(
+        self,
+        embedding: List[float],
+        k: int = 4,
+        filter: Optional[Dict[str, Any]] = None,
+        params: Dict[str, Any] = {},
+        effective_search_ratio: float = 1.0,
+        **kwargs: Any,
+    ) -> List[Tuple[Document, float]]:
+        """Async sibling of :meth:`similarity_search_with_score_by_vector`.
+
+        The query construction in the sync method is non-trivial (hybrid
+        fusion, custom retrieval queries, metadata filter assembly), so this
+        method delegates to the sync implementation via
+        ``asyncio.to_thread`` to avoid duplicating ~150 lines of Cypher.
+
+        .. note:: The sync method touches ``self.connection`` (a psycopg
+            ``Connection`` that is **not** safe under concurrent use from
+            multiple threads). We serialize concurrent callers with an
+            ``asyncio.Lock`` so the event loop stays responsive but the
+            shared connection is touched by one coroutine at a time. For
+            higher throughput, use :meth:`aquery` directly with your own
+            Cypher, or pin one ``AgensgraphVector`` instance per worker.
+        """
+        import asyncio
+        if not hasattr(self, "_asearch_lock"):
+            self._asearch_lock = asyncio.Lock()
+        async with self._asearch_lock:
+            return await asyncio.to_thread(
+                self.similarity_search_with_score_by_vector,
+                embedding,
+                k,
+                filter,
+                params,
+                effective_search_ratio,
+                **kwargs,
+            )
+
+    async def adelete(
+        self, ids: Optional[List[str]] = None, **kwargs: Any
+    ) -> Optional[bool]:
+        """Async sibling of :meth:`delete`."""
+        if not ids:
+            return None
+        delete_query = sql.SQL(
+            "MATCH (n:{label}) WHERE n.__id__ IN %(ids)s DETACH DELETE n"
+        ).format(label=sql.Identifier(self.node_label))
+        await self.aquery(delete_query, params={"ids": Jsonb(list(ids))})
+        return True
+
+    async def aget_by_ids(self, ids: List[str], /) -> List[Document]:
+        """Async sibling of :meth:`get_by_ids`."""
+        if not ids:
+            return []
+        fetch_query = sql.SQL(
+            "MATCH (n:{label}) WHERE n.__id__ IN %(ids)s "
+            "RETURN n.__id__ AS id, n.{text_property} AS text, properties(n) AS meta"
+        ).format(
+            label=sql.Identifier(self.node_label),
+            text_property=sql.Identifier(self.text_node_property),
+        )
+        rows = await self.aquery(fetch_query, params={"ids": Jsonb(list(ids))})
+        docs: List[Document] = []
+        for row in rows:
+            meta = row.get("meta") or {}
+            for sys_field in ("__id__", self.embedding_node_property, self.text_node_property):
+                meta.pop(sys_field, None)
+            text = row.get("text") or ""
+            doc_id = row.get("id")
+            docs.append(Document(id=doc_id, page_content=text, metadata=meta))
+        return docs
+
+    async def aclose(self) -> None:
+        """Close the async connection (if any)."""
+        if self._aconn is not None and not self._aconn.closed:
+            await self._aconn.close()
+            self._aconn = None

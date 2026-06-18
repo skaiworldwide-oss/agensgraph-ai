@@ -18,11 +18,12 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from hashlib import md5
-from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Pattern, Tuple, Union
+from typing import Any, Dict, List, NamedTuple, Optional, Pattern, Tuple, Union
 
-from langchain_community.graphs.graph_document import GraphDocument
-from langchain_community.graphs.graph_store import GraphStore
+from langchain_agensgraph.graphs.graph_document import GraphDocument
+from langchain_agensgraph.graphs.graph_store import GraphStore
 from functools import wraps
 
 import psycopg
@@ -58,8 +59,9 @@ typeof_function = r"""
 node_properties_query = f"""
     MATCH (a)
     UNWIND keys(properties(a)) AS prop
-    WITH label(a) as label, prop, properties(a)[prop] AS value 
-    WITH                
+    WITH label(a) as label, prop, properties(a)[prop] AS value
+    WHERE value IS NOT NULL
+    WITH
         label,
         prop AS property,
         COLLECT(DISTINCT value) AS values
@@ -70,8 +72,9 @@ edge_properties_query = f"""
     MATCH ()-[e]->()
     WITH type(e) as label, properties(e) as properties
     UNWIND keys(properties) AS prop
-    WITH label, prop, properties[prop] AS value 
-    WITH                
+    WITH label, prop, properties[prop] AS value
+    WHERE value IS NOT NULL
+    WITH
         label,
         prop AS property,
         COLLECT(DISTINCT value) AS values
@@ -80,9 +83,10 @@ edge_properties_query = f"""
 
 triple_query = f"""
     MATCH (start_node)-[r]->(end_node)
-    WITH labels(start_node) AS start, type(r) AS relationship_type, labels(end_node) AS endd, keys(r) AS relationship_properties
-    UNWIND endd as end_label
-    RETURN DISTINCT {{start: start[0], type: relationship_type, end: end_label}} AS output;
+    WITH labels(start_node) AS startlbls, type(r) AS relationship_type, labels(end_node) AS endlbls
+    UNWIND startlbls AS start_label
+    UNWIND endlbls AS end_label
+    RETURN DISTINCT {{start: start_label, type: relationship_type, end: end_label}} AS output;
 """
 
 def require_psycopg(func):
@@ -157,12 +161,32 @@ class AgensGraph(GraphStore):
 
     @require_psycopg
     def __init__(
-        self, graph_name: str, conf: Dict[str, Any], create: bool = False
+        self,
+        graph_name: str,
+        conf: Dict[str, Any],
+        create: bool = False,
+        schema_cache_ttl: float = 0.0,
     ) -> None:
-        """Create a new Agensgraph Graph instance."""
+        """Create a new Agensgraph Graph instance.
+
+        Args:
+            graph_name: Name of the AgensGraph graph to use.
+            conf: psycopg connection kwargs.
+            create: Create the graph if it does not exist.
+            schema_cache_ttl: When > 0, ``refresh_schema`` short-circuits if it
+                ran within the last ``schema_cache_ttl`` seconds. Set to 0
+                (default) to disable caching.
+        """
 
         self.graph_name = graph_name
+        # Keep the conf for lazy async-connection creation (see ``_aconn_get``).
+        self._conf = dict(conf)
         self.connection = psycopg.connect(**conf)
+        self.schema_cache_ttl = schema_cache_ttl
+        self._schema_refreshed_at: float = 0.0
+        self._server_version: Optional[Tuple[int, int, int]] = None
+        self._has_meta_extension: bool = False
+        self._aconn: Optional[psycopg.AsyncConnection] = None
 
         with self._get_cursor() as curs:
             # check if graph with name graph_name exists
@@ -199,7 +223,75 @@ class AgensGraph(GraphStore):
             execute_query(curs, typeof_function)
             self.connection.commit()
 
+        self._detect_capabilities()
         self.refresh_schema()
+
+    @require_psycopg
+    def _detect_capabilities(self) -> None:
+        """Probe AgensGraph version and the ``meta`` extension.
+
+        Sets ``self._server_version`` to a 3-tuple (major, minor, patch) and
+        ``self._has_meta_extension`` to a bool. Both default to a safe
+        ``(0,0,0)`` / ``False`` if the probe itself fails — so the integration
+        always falls back to behaviors that work on older AgensGraph builds.
+        """
+        try:
+            rows = self.query("SELECT version() AS v")
+            ver_str = rows[0]["v"] if rows else ""
+            match = re.search(r"AgensGraph\s+(\d+)\.(\d+)\.(\d+)", ver_str)
+            if match:
+                self._server_version = (
+                    int(match.group(1)),
+                    int(match.group(2)),
+                    int(match.group(3)),
+                )
+        except Exception:
+            pass
+        try:
+            rows = self.query(
+                "SELECT 1 AS ok FROM pg_extension WHERE extname = 'meta'"
+            )
+            self._has_meta_extension = bool(rows)
+        except Exception:
+            self._has_meta_extension = False
+
+    @require_psycopg
+    def _meta_vertex_labels(self) -> List[str]:
+        """List vertex labels for ``self.graph_name`` via the ``meta`` extension.
+
+        Falls back to scanning ``ag_label`` if the extension isn't installed.
+        """
+        if self._has_meta_extension:
+            rows = self.query(
+                "SELECT label_name FROM meta.vertex_labels(%(g)s::name)",
+                {"g": self.graph_name},
+            )
+            return [r["label_name"] for r in rows]
+        # Fallback for older AgensGraph: read the catalog directly.
+        rows = self.query(
+            "SELECT l.labname AS label_name FROM ag_label l "
+            "JOIN ag_graph g ON l.graphid = g.oid "
+            "WHERE g.graphname = %(g)s::name AND l.labkind = 'v'",
+            {"g": self.graph_name},
+        )
+        return [r["label_name"] for r in rows]
+
+    @require_psycopg
+    def _meta_edge_labels(self) -> List[str]:
+        """List edge labels via the ``meta`` extension or catalog fallback."""
+        if self._has_meta_extension:
+            rows = self.query(
+                "SELECT label_name FROM meta.edge_labels(%(g)s::name)",
+                {"g": self.graph_name},
+            )
+            return [r["label_name"] for r in rows]
+        rows = self.query(
+            "SELECT l.labname AS label_name FROM ag_label l "
+            "JOIN ag_graph g ON l.graphid = g.oid "
+            "WHERE g.graphname = %(g)s::name AND l.labkind = 'e'",
+            {"g": self.graph_name},
+        )
+        return [r["label_name"] for r in rows]
 
     @require_psycopg
     def _get_cursor(self) -> psycopg.Cursor:
@@ -224,23 +316,6 @@ class AgensGraph(GraphStore):
             triple_schema = [row.output for row in rows]
         
         return triple_schema
-
-    def _get_triples_str(self, e_labels: List[str]) -> List[str]:
-        """
-        Get a set of distinct relationship types (as a list of strings) in the graph
-        to be used as context by an llm.
-
-        Args:
-            e_labels (List[str]): a list of edge labels to filter for
-
-        Returns:
-            List[str]: relationships as a list of strings in the format
-                "(:"<from_label>")-[:"<edge_label>"]->(:"<to_label>")"
-        """
-
-        triples = self._get_triples(e_labels)
-
-        return self._format_triples(triples)
 
     @staticmethod
     def _format_triples(triples: List[Dict[str, str]]) -> List[str]:
@@ -336,11 +411,20 @@ class AgensGraph(GraphStore):
 
         return edge_properties
 
-    def refresh_schema(self) -> None:
+    def refresh_schema(self, *, force: bool = False) -> None:
+        """Refresh the graph schema information.
+
+        When ``schema_cache_ttl > 0`` and a refresh happened more recently than
+        that, this is a no-op unless ``force=True``. Useful for read-mostly
+        applications where the schema changes infrequently.
         """
-        Refresh the graph schema information by updating the available
-        labels, relationships, and properties
-        """
+
+        if (
+            not force
+            and self.schema_cache_ttl > 0
+            and (time.monotonic() - self._schema_refreshed_at) < self.schema_cache_ttl
+        ):
+            return
 
         # fetch graph schema information
         node_properties = self._get_node_properties()
@@ -362,8 +446,12 @@ class AgensGraph(GraphStore):
             "node_props": {el["labels"]: el["properties"] for el in node_properties},
             "rel_props": {el["type"]: el["properties"] for el in edge_properties},
             "relationships": triple_schema,
-            "metadata": {},
+            "metadata": {
+                "agensgraph_version": self._server_version,
+                "has_meta_extension": self._has_meta_extension,
+            },
         }
+        self._schema_refreshed_at = time.monotonic()
 
     @property
     def get_schema(self) -> str:
@@ -418,7 +506,7 @@ class AgensGraph(GraphStore):
 
                 # convert edge from id-label->id by replacing id with node information
                 # we only do this if the vertex was also returned in the query
-                # this is an attempt to be consistent with neo4j implementation
+                # resolve the edge endpoints to their node property maps
                 elif edge:
                     elabel, edge_id, start_id, end_id, properties = edge.groups()
                     d[k] = (
@@ -451,12 +539,15 @@ class AgensGraph(GraphStore):
             List[Dict[str, Any]]: a list of dictionaries containing the result set
         """
         # execute the query, rolling back on an error
+        in_txn = getattr(self, "_in_transaction", False)
         with self._get_cursor() as curs:
             try:
                 curs.execute(query, params)
-                self.connection.commit()
+                if not in_txn:
+                    self.connection.commit()
             except psycopg.Error as e:
-                self.connection.rollback()
+                if not in_txn:
+                    self.connection.rollback()
                 raise AgensQueryException(
                     {
                         "message": "Error executing graph query: {}".format(query),
@@ -476,6 +567,54 @@ class AgensGraph(GraphStore):
 
             return result
 
+    # ---------- v0.2.0: async surface ----------
+
+    async def _aconn_get(self) -> psycopg.AsyncConnection:
+        """Return a lazily-opened ``AsyncConnection`` bound to ``graph_path``.
+
+        Built on demand so users that never call any ``a*`` method do not
+        pay the cost of a second TCP/socket connection.
+        """
+        if self._aconn is None or self._aconn.closed:
+            self._aconn = await psycopg.AsyncConnection.connect(**self._conf)
+            async with self._aconn.cursor() as cur:
+                await cur.execute(
+                    sql.SQL("SET graph_path = {n}").format(
+                        n=sql.Identifier(self.graph_name)
+                    )
+                )
+            await self._aconn.commit()
+        return self._aconn
+
+    async def aquery(
+        self, query: str, params: dict = {}
+    ) -> List[Dict[str, Any]]:
+        """Async sibling of :meth:`query` using a dedicated ``AsyncConnection``."""
+        conn = await self._aconn_get()
+        async with conn.cursor(row_factory=psycopg.rows.namedtuple_row) as cur:
+            try:
+                await cur.execute(query, params)
+                await conn.commit()
+            except psycopg.Error as e:
+                await conn.rollback()
+                raise AgensQueryException(
+                    {
+                        "message": "Error executing graph query: {}".format(query),
+                        "detail": str(e),
+                    }
+                )
+            try:
+                data = await cur.fetchall()
+            except psycopg.ProgrammingError:
+                data = []
+            return [self._record_to_dict(d) for d in (data or [])]
+
+    async def aclose(self) -> None:
+        """Close the async connection (if any). Safe to call multiple times."""
+        if self._aconn is not None and not self._aconn.closed:
+            await self._aconn.close()
+            self._aconn = None
+
     @staticmethod
     def _format_properties(
         properties: Dict[str, Any], id: Union[str, None] = None
@@ -491,15 +630,22 @@ class AgensGraph(GraphStore):
         Returns:
             str: the properties dictionary as a properly formatted string
         """
+        def _esc(s: str) -> str:
+            return s.replace("\\", "\\\\").replace("'", "\\'")
+
         props = []
         # wrap property key in double quotes to escape
         for k, v in properties.items():
-            prop = f'"{k}": \'{v}\'' if isinstance(v, str) else f'"{k}": {v}'
+            if isinstance(v, str):
+                prop = f'"{k}": \'{_esc(v)}\''
+            else:
+                prop = f'"{k}": {v}'
             props.append(prop)
         if id is not None and "id" not in properties:
-            props.append(
-                f"id: '{id}'" if isinstance(id, str) else f"id: {id}"
-            )
+            if isinstance(id, str):
+                props.append(f"id: '{_esc(id)}'")
+            else:
+                props.append(f"id: {id}")
         return "{" + ", ".join(props) + "}"
 
     @staticmethod
@@ -528,6 +674,10 @@ class AgensGraph(GraphStore):
 
         Returns:
             None
+
+        All statements for one ``add_graph_documents`` call commit atomically:
+        if any insert (label DDL, node, edge) fails partway through, the entire
+        batch is rolled back so the graph never holds orphan nodes/edges.
         """
         # query for inserting nodes
         node_insert_query = (
@@ -549,7 +699,26 @@ class AgensGraph(GraphStore):
             MERGE ("to":{t_label} %(t_properties)s)
             MERGE ("from")-[:{r_label} %(r_properties)s]->("to")
         """
-        # iterate docs and insert them
+        # iterate docs and insert them — wrapped in a single transaction so a
+        # failure halfway through can never leave orphan nodes behind.
+        self._in_transaction = True
+        try:
+            with self.connection.transaction():
+                self._add_graph_documents_inner(
+                    graph_documents, include_source,
+                    node_insert_query, edge_insert_query,
+                )
+        finally:
+            self._in_transaction = False
+        return
+
+    def _add_graph_documents_inner(
+        self,
+        graph_documents: List[GraphDocument],
+        include_source: bool,
+        node_insert_query: str,
+        edge_insert_query: str,
+    ) -> None:
         for doc in graph_documents:
             # if we are adding sources, create an id for the source
             if include_source:

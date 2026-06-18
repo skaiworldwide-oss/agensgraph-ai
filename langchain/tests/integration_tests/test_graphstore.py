@@ -22,7 +22,11 @@ from typing import Any, Dict
 from langchain_core.documents import Document
 
 from langchain_agensgraph.graphs.agensgraph import AgensGraph
-from langchain_community.graphs.graph_document import GraphDocument, Node, Relationship
+from langchain_agensgraph.graphs.graph_document import (
+    GraphDocument,
+    Node,
+    Relationship,
+)
 
 test_data = [
     GraphDocument(
@@ -56,7 +60,7 @@ class TestAgensGraph(unittest.TestCase):
         self.assertIsNotNone(conf["user"])
         self.assertIsNotNone(conf["password"])
 
-        self.graph = AgensGraph("test", conf)
+        self.graph = AgensGraph("test", conf, create=True)
         self.graph.query("MATCH (n) DETACH DELETE n")
 
     def test_node_properties(self) -> None:
@@ -156,8 +160,8 @@ class TestAgensGraph(unittest.TestCase):
         )
 
         expected = [
-            {"label": "bar", "count": 1},
             {"label": "Document", "count": 1},
+            {"label": "bar", "count": 1},
             {"label": "foo", "count": 2},
         ]
         self.assertEqual(output, expected)
@@ -180,14 +184,12 @@ class TestAgensGraph(unittest.TestCase):
             re.sub(r"\s", "", graph_schema), re.sub(r"\s", "", expected)
         )
 
-        expected_structured: Dict[str, Any] = {
-            "node_props": {},
-            "rel_props": {},
-            "relationships": [],
-            "metadata": {},
-        }
-
-        self.assertEqual(self.graph.get_structured_schema, expected_structured)
+        actual_structured = self.graph.get_structured_schema
+        # 0.2.0 added capability metadata; compare structure ignoring it.
+        self.assertEqual(actual_structured["node_props"], {})
+        self.assertEqual(actual_structured["rel_props"], {})
+        self.assertEqual(actual_structured["relationships"], [])
+        self.assertIn("metadata", actual_structured)
 
         # Create two nodes and a relationship
         self.graph.query(
@@ -203,7 +205,10 @@ class TestAgensGraph(unittest.TestCase):
         self.assertEqual(
             re.sub(r"\s", "", self.graph.get_schema), re.sub(r"\s", "", expected)
         )
-        self.assertEqual(self.graph.get_structured_schema, expected_structured)
+        stale = self.graph.get_structured_schema
+        self.assertEqual(stale["node_props"], {})
+        self.assertEqual(stale["rel_props"], {})
+        self.assertEqual(stale["relationships"], [])
 
         # two possible orderings of node props
         expected_possibilities = [
@@ -239,16 +244,6 @@ class TestAgensGraph(unittest.TestCase):
             """,
         ]
 
-        expected_structured2 = {
-            "node_props": {
-                "a": [{"property": "id", "type": "INTEGER"}],
-                "c": [{"property": "id", "type": "INTEGER"}],
-            },
-            "rel_props": {"b": [{"property": "id", "type": "INTEGER"}]},
-            "relationships": [{"start": "a", "type": "b", "end": "c"}],
-            "metadata": {},
-        }
-
         self.graph.refresh_schema()
 
         # check that schema is refreshed
@@ -256,4 +251,17 @@ class TestAgensGraph(unittest.TestCase):
             re.sub(r"\s", "", self.graph.get_schema),
             [re.sub(r"\s", "", x) for x in expected_possibilities],
         )
-        self.assertEqual(self.graph.get_structured_schema, expected_structured2)
+        refreshed = self.graph.get_structured_schema
+        self.assertEqual(
+            refreshed["node_props"],
+            {
+                "a": [{"property": "id", "type": "INTEGER"}],
+                "c": [{"property": "id", "type": "INTEGER"}],
+            },
+        )
+        self.assertEqual(
+            refreshed["rel_props"], {"b": [{"property": "id", "type": "INTEGER"}]}
+        )
+        self.assertEqual(
+            refreshed["relationships"], [{"start": "a", "type": "b", "end": "c"}]
+        )

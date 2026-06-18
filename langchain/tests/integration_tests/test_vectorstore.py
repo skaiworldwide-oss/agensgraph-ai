@@ -7,12 +7,31 @@ from typing import Any, Dict, List, cast
 from langchain_core.documents import Document
 from yaml import safe_load
 
+
+def _no_id(docs):
+    """Drop ``Document.id`` from results.
+
+    These tests pre-date 0.2.0's ``Document.id`` population (which the
+    LangChain conformance suite requires). Comparing on page_content +
+    metadata only preserves the original test intent.
+    """
+    out = []
+    for item in docs:
+        if isinstance(item, tuple):
+            d, s = item
+            out.append((Document(page_content=d.page_content, metadata=d.metadata), s))
+        else:
+            out.append(
+                Document(page_content=item.page_content, metadata=item.metadata)
+            )
+    return out
+
 from langchain_agensgraph.graphs.agensgraph import AgensGraph
 from langchain_agensgraph.vectorstores.agensgraph_vector import (
     AgensgraphVector,
     SearchType,
 )
-from langchain_community.vectorstores.utils import DistanceStrategy
+from langchain_agensgraph.vectorstores.utils import DistanceStrategy
 from tests.integration_tests.fake_embeddings import (
     AngularTwoDimensionalEmbeddings,
     FakeEmbeddings,
@@ -88,7 +107,7 @@ def test_agensgraph_vector() -> None:
         pre_delete_collection=True,
     )
     output = docsearch.similarity_search("foo", k=1)
-    assert output == [Document(page_content="foo")]
+    assert _no_id(output) == [Document(page_content="foo")]
 
     drop_vector_indexes(docsearch)
 
@@ -103,7 +122,7 @@ def test_agensgraph_vector_euclidean() -> None:
         distance_strategy=DistanceStrategy.EUCLIDEAN_DISTANCE,
     )
     output = docsearch.similarity_search("foo", k=1)
-    assert output == [Document(page_content="foo")]
+    assert _no_id(output) == [Document(page_content="foo")]
 
     drop_vector_indexes(docsearch)
 
@@ -119,7 +138,7 @@ def test_agensgraph_vector_embeddings() -> None:
         pre_delete_collection=True,
     )
     output = docsearch.similarity_search("foo", k=1)
-    assert output == [Document(page_content="foo")]
+    assert _no_id(output) == [Document(page_content="foo")]
 
     drop_vector_indexes(docsearch)
 
@@ -140,7 +159,7 @@ def test_agensgraph_vector_catch_wrong_index_name() -> None:
         index_name="test",
     )
     output = existing.similarity_search("foo", k=1)
-    assert output == [Document(page_content="foo")]
+    assert _no_id(output) == [Document(page_content="foo")]
 
     drop_vector_indexes(existing)
 
@@ -162,7 +181,7 @@ def test_agensgraph_vector_catch_wrong_node_label() -> None:
         node_label="test",
     )
     output = existing.similarity_search("foo", k=1)
-    assert output == [Document(page_content="foo")]
+    assert _no_id(output) == [Document(page_content="foo")]
 
     drop_vector_indexes(existing)
 
@@ -178,7 +197,7 @@ def test_agensgraph_vector_with_metadatas() -> None:
         pre_delete_collection=True,
     )
     output = docsearch.similarity_search("foo", k=1)
-    assert output == [Document(page_content="foo", metadata={"page": "0"})]
+    assert _no_id(output) == [Document(page_content="foo", metadata={"page": "0"})]
 
     drop_vector_indexes(docsearch)
 
@@ -197,7 +216,7 @@ def test_agensgraph_vector_with_metadatas_with_scores() -> None:
         (doc, round(score, 1))
         for doc, score in docsearch.similarity_search_with_score("foo", k=1)
     ]
-    assert output == [(Document(page_content="foo", metadata={"page": "0"}), 1.0)]
+    assert _no_id(output) == [(Document(page_content="foo", metadata={"page": "0"}), 1.0)]
 
     drop_vector_indexes(docsearch)
 
@@ -248,7 +267,7 @@ def test_agensgraph_vector_retriever_search_threshold() -> None:
         search_kwargs={"k": 3, "score_threshold": 0.9999},
     )
     output = retriever.invoke("foo")
-    assert output == [
+    assert _no_id(output) == [
         Document(page_content="foo", metadata={"page": "0"}),
     ]
 
@@ -265,7 +284,7 @@ def test_custom_return_agensgraph_vector() -> None:
         retrieval_query="RETURN 'foo' AS text, score, {{test: 'test'}} AS metadata",
     )
     output = docsearch.similarity_search("foo", k=1)
-    assert output == [Document(page_content="foo", metadata={"test": "test"})]
+    assert _no_id(output) == [Document(page_content="foo", metadata={"test": "test"})]
 
     drop_vector_indexes(docsearch)
 
@@ -298,7 +317,7 @@ def test_agensgraph_vector_prefer_indexname() -> None:
     )
 
     output = existing_index.similarity_search("bar", k=1)
-    assert output == [Document(page_content="bar", metadata={})]
+    assert _no_id(output) == [Document(page_content="bar", metadata={})]
     drop_vector_indexes(existing_index)
 
 def test_agensgraph_vector_hybrid() -> None:
@@ -313,7 +332,7 @@ def test_agensgraph_vector_hybrid() -> None:
         search_type=SearchType.HYBRID,
     )
     output = docsearch.similarity_search("foo", k=1)
-    assert output == [Document(page_content="foo")]
+    assert _no_id(output) == [Document(page_content="foo")]
 
     drop_vector_indexes(docsearch)
 
@@ -330,7 +349,7 @@ def test_agensgraph_vector_hybrid_deduplicate() -> None:
         search_type=SearchType.HYBRID,
     )
     output = docsearch.similarity_search("foo", k=3)
-    assert output == [
+    assert _no_id(output) == [
         Document(page_content="foo"),
         Document(page_content="bar"),
         Document(page_content="baz"),
@@ -352,7 +371,7 @@ def test_agensgraph_vector_hybrid_retrieval_query() -> None:
         retrieval_query="RETURN 'moo' AS text, score, {{test: 'test'}} AS metadata",
     )
     output = docsearch.similarity_search("foo", k=1)
-    assert output == [Document(page_content="moo", metadata={"test": "test"})]
+    assert _no_id(output) == [Document(page_content="moo", metadata={"test": "test"})]
 
     drop_vector_indexes(docsearch)
 
@@ -370,7 +389,7 @@ def test_agensgraph_vector_hybrid_retrieval_query2() -> None:
         retrieval_query="RETURN node.text AS text, score, {{test: 'test'}} AS metadata",
     )
     output = docsearch.similarity_search("foo", k=1)
-    assert output == [Document(page_content="foo", metadata={"test": "test"})]
+    assert _no_id(output) == [Document(page_content="foo", metadata={"test": "test"})]
 
     drop_vector_indexes(docsearch)
 
@@ -419,7 +438,7 @@ def test_agensgraph_vector_hybrid_from_existing() -> None:
     )
 
     output = existing.similarity_search("foo", k=1)
-    assert output == [Document(page_content="foo")]
+    assert _no_id(output) == [Document(page_content="foo")]
 
     drop_vector_indexes(existing)
 
@@ -451,7 +470,7 @@ def test_agensgraph_vector_from_existing_graph() -> None:
     )
 
     output = existing.similarity_search("foo", k=1)
-    assert output == [Document(page_content="\nname: Foo")]
+    assert _no_id(output) == [Document(page_content="\nname: Foo")]
 
     drop_vector_indexes(existing)
 
@@ -484,7 +503,7 @@ def test_agensgraph_vector_from_existing_graph_hybrid() -> None:
     )
 
     output = existing.similarity_search("foo", k=1)
-    assert output == [Document(page_content="\nname: foo")]
+    assert _no_id(output) == [Document(page_content="\nname: foo")]
 
     drop_vector_indexes(existing)
 
@@ -515,7 +534,7 @@ def test_agensgraph_vector_from_existing_graph_multiple_properties() -> None:
     )
 
     output = existing.similarity_search("foo", k=1)
-    assert output == [Document(page_content="\nname: Foo\nname2: Fooz")]
+    assert _no_id(output) == [Document(page_content="\nname: Foo\nname2: Fooz")]
 
     drop_vector_indexes(existing)
 
@@ -547,7 +566,7 @@ def test_agensgraph_vector_from_existing_graph_multiple_properties_hybrid() -> N
     )
 
     output = existing.similarity_search("foo", k=1)
-    assert output == [Document(page_content="\nname: Foo\nname2: Fooz")]
+    assert _no_id(output) == [Document(page_content="\nname: Foo\nname2: Fooz")]
 
     drop_vector_indexes(existing)
 
@@ -566,7 +585,7 @@ def test_agensgraph_vector_special_character() -> None:
     output = docsearch.similarity_search(
         "It is the end of the world. Take shelter!", k=1
     )
-    assert output == [
+    assert _no_id(output) == [
         Document(page_content="It is the end of the world. Take shelter!", metadata={})
     ]
 
@@ -628,7 +647,7 @@ def test_retrieval_params() -> None:
     output = docsearch.similarity_search(
         "Foo", k=2, params={"test": json.dumps("test"), "test1": json.dumps("test1")}
     )
-    assert output == [
+    assert _no_id(output) == [
         Document(page_content="test", metadata={"test": "test1"}),
         Document(page_content="test", metadata={"test": "test1"}),
     ]
@@ -691,18 +710,16 @@ def test_metadata_filters_type1() -> None:
         indices = cast(List[int], example[1])
         adjusted_indices = [index - 1 for index in indices]
         expected_output = [DOCUMENTS[index] for index in adjusted_indices]
-        # We don't return id properties from similarity search by default
-        # Also remove any key where the value is None
+        # 0.2.0 separated system id (__id__) from user metadata, so user's
+        # metadata["id"] now round-trips. Only strip None-valued keys.
         for doc in expected_output:
-            if "id" in doc.metadata:
-                del doc.metadata["id"]
             keys_with_none = [
                 key for key, value in doc.metadata.items() if value is None
             ]
             for key in keys_with_none:
                 del doc.metadata[key]
 
-        assert output == expected_output
+        assert _no_id(output) == expected_output
     drop_vector_indexes(docsearch)
 
 
@@ -737,7 +754,7 @@ def test_agensgraph_vector_relationship_index() -> None:
     )
 
     output = relationship_index.similarity_search("foo", k=1)
-    assert output == [Document(page_content="foo")]
+    assert _no_id(output) == [Document(page_content="foo")]
 
     drop_vector_indexes(docsearch)
 
@@ -777,7 +794,7 @@ def test_agensgraph_vector_relationship_index_retrieval() -> None:
     )
 
     output = relationship_index.similarity_search("foo", k=1)
-    assert output == [Document(page_content="foo-text", metadata={"foo": "bar"})]
+    assert _no_id(output) == [Document(page_content="foo-text", metadata={"foo": "bar"})]
 
     drop_vector_indexes(docsearch)
 
@@ -826,7 +843,7 @@ def test_agensgraph_vector_passing_graph_object() -> None:
     """Test end to end construction and search with passing graph object."""
     graph = AgensGraph(conf=conf, graph_name="test", create=True)
     # Rewrite env vars to make sure it fails if env is used
-    os.environ["NEO4J_URI"] = "foo"
+    os.environ["AGENSGRAPH_URI"] = "foo"
     docsearch = AgensgraphVector.from_texts(
         texts=texts,
         embedding=FakeEmbeddingsWithOsDimension(),
@@ -835,6 +852,6 @@ def test_agensgraph_vector_passing_graph_object() -> None:
         url=url,
     )
     output = docsearch.similarity_search("foo", k=1)
-    assert output == [Document(page_content="foo")]
+    assert _no_id(output) == [Document(page_content="foo")]
 
     drop_vector_indexes(docsearch)

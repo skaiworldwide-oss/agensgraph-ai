@@ -20,6 +20,7 @@ from psycopg import sql
 from psycopg.types.json import Jsonb
 
 from llama_index_agensgraph.engine import AgensEngine
+from llama_index_agensgraph.filters import metadata_filters_to_cypher
 
 from llama_index.core.bridge.pydantic import PrivateAttr
 from llama_index.core.schema import BaseNode, MetadataMode
@@ -27,10 +28,7 @@ from llama_index.core.vector_stores.types import (
     BasePydanticVectorStore,
     VectorStoreQuery,
     VectorStoreQueryResult,
-    FilterOperator,
     MetadataFilters,
-    MetadataFilter,
-    FilterCondition,
 )
 from llama_index.core.vector_stores.utils import (
     metadata_dict_to_node,
@@ -225,77 +223,9 @@ def remove_lucene_chars(text: Optional[str]) -> Optional[str]:
     return text.strip()
 
 
-def _to_agensgraph_operator(operator: FilterOperator) -> str:
-    if operator == FilterOperator.EQ:
-        return "="
-    elif operator == FilterOperator.GT:
-        return ">"
-    elif operator == FilterOperator.LT:
-        return "<"
-    elif operator == FilterOperator.NE:
-        return "<>"
-    elif operator == FilterOperator.GTE:
-        return ">="
-    elif operator == FilterOperator.LTE:
-        return "<="
-    elif operator == FilterOperator.IN:
-        return "IN"
-    elif operator == FilterOperator.NIN:
-        return "NOT IN"
-    elif operator == FilterOperator.CONTAINS:
-        return "CONTAINS"
-    else:
-        _logger.warning(f"Unknown operator: {operator}, fallback to '='")
-        return "="
-
-
-def collect_params(
-    input_data: List[Tuple[str, Dict[str, str]]],
-) -> Tuple[List[str], Dict[str, Any]]:
-    """
-    Transform the input data into the desired format.
-
-    Args:
-    - input_data (list of tuples): Input data to transform.
-      Each tuple contains a string and a dictionary.
-
-    Returns:
-    - tuple: A tuple containing a list of strings and a dictionary.
-
-    """
-    # Initialize variables to hold the output parts
-    query_parts = []
-    params = {}
-
-    # Loop through each item in the input data
-    for query_part, param in input_data:
-        # Append the query part to the list
-        query_parts.append(query_part)
-        # Update the params dictionary with the param dictionary
-        params.update(param)
-
-    # Return the transformed data
-    return (query_parts, params)
-
-
-def filter_to_cypher(index: int, filter: MetadataFilter) -> str:
-    return (
-        f'n."{filter.key}" {_to_agensgraph_operator(filter.operator)} %(param_{index})s',
-        {f"param_{index}": Jsonb(filter.value)},
-    )
-
-
-def construct_metadata_filter(filters: MetadataFilters):
-    cypher_snippets = []
-    for index, filter in enumerate(filters.filters):
-        cypher_snippets.append(filter_to_cypher(index, filter))
-
-    collected_snippets = collect_params(cypher_snippets)
-
-    if filters.condition == FilterCondition.OR:
-        return (" OR ".join(collected_snippets[0]), collected_snippets[1])
-    else:
-        return (" AND ".join(collected_snippets[0]), collected_snippets[1])
+# Metadata-filter translation now lives in
+# ``llama_index_agensgraph.filters.metadata_filters_to_cypher`` (shared with the
+# property graph store and supporting all 14 FilterOperators).
 
 class AgensQueryException(Exception):
     """Exception for the Agensgraph queries."""
@@ -633,7 +563,7 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         base_index_query = (
                 """MATCH (n:{label})
                 WHERE n.{embedding_property} IS NOT NULL AND
-                array_size(n.{embedding_property}) = {embedding_dimension} """
+                array_size(n.{embedding_property}) = {embedding_dimension} {filter_clause} """
         )
 
         base_cosine_query = """
@@ -643,6 +573,8 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
             WITH n, 1 - inv_score AS score 
             """
 
+        filter_params: Dict[str, Any] = {}
+        filter_clause: sql.Composed = sql.SQL("")
         if query.filters:
             # Metadata filtering and hybrid doesn't work
             if self.hybrid_search:
@@ -651,10 +583,12 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
                     "a hybrid search approach"
                 )
 
-            filter_snippets, filter_params = construct_metadata_filter(query.filters)
-            index_query = base_index_query + 'AND ' + filter_snippets + base_cosine_query
+            snippet, filter_params = metadata_filters_to_cypher(
+                query.filters, alias="n"
+            )
+            filter_clause = sql.SQL("AND (") + snippet + sql.SQL(")")
+            index_query = base_index_query + base_cosine_query
         else:
-            filter_params = {}
             if self.hybrid_search:
                 index_query = (
                     """
@@ -725,6 +659,7 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
             embedding_dimension=self.embedding_dimension,
             text_property_literal=sql.Literal(self.text_node_property),
             embedding_property_literal=sql.Literal(self.embedding_node_property),
+            filter_clause=filter_clause,
         )
         return formatted_query, parameters
 
@@ -776,6 +711,127 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         """True-async counterpart of :meth:`delete`."""
         formatted_query, params = self._build_delete(ref_doc_id)
         await self.adatabase_query(formatted_query, params=params)
+
+    def _node_match_clause(
+        self,
+        node_ids: Optional[List[str]],
+        filters: Optional[MetadataFilters],
+    ) -> Tuple[sql.Composed, Dict[str, Any]]:
+        """Build a ``WHERE ...`` fragment (possibly empty) matching node_ids/filters."""
+        conds: List[sql.Composed] = []
+        params: Dict[str, Any] = {}
+        if node_ids:
+            conds.append(sql.SQL("n.id IN %(node_ids)s"))
+            params["node_ids"] = Jsonb(list(node_ids))
+        if filters:
+            snippet, fparams = metadata_filters_to_cypher(filters, alias="n")
+            conds.append(sql.SQL("(") + snippet + sql.SQL(")"))
+            params.update(fparams)
+        if conds:
+            return sql.SQL("WHERE ") + sql.SQL(" AND ").join(conds), params
+        return sql.SQL(""), params
+
+    def _build_get_nodes(
+        self,
+        node_ids: Optional[List[str]],
+        filters: Optional[MetadataFilters],
+    ) -> Tuple[sql.Composed, Dict[str, Any]]:
+        where, params = self._node_match_clause(node_ids, filters)
+        query = """
+            MATCH (n:{label})
+            {where}
+            RETURN n.{text_property} AS text,
+                   n.id AS id,
+                   n || jsonb_build_object({text_property_literal}, Null,
+                        {embedding_property_literal}, Null, 'id', Null) AS metadata
+            """
+        return (
+            sql.SQL(query).format(
+                label=sql.Identifier(self.node_label),
+                text_property=sql.Identifier(self.text_node_property),
+                text_property_literal=sql.Literal(self.text_node_property),
+                embedding_property_literal=sql.Literal(self.embedding_node_property),
+                where=where,
+            ),
+            params,
+        )
+
+    @staticmethod
+    def _records_to_nodes(results: List[Dict[str, Any]]) -> List[BaseNode]:
+        nodes: List[BaseNode] = []
+        for record in results:
+            node = metadata_dict_to_node(record["metadata"])
+            node.set_content(str(record["text"]))
+            nodes.append(node)
+        return nodes
+
+    def get_nodes(
+        self,
+        node_ids: Optional[List[str]] = None,
+        filters: Optional[MetadataFilters] = None,
+    ) -> List[BaseNode]:
+        """Get nodes by id and/or metadata filters."""
+        query, params = self._build_get_nodes(node_ids, filters)
+        return self._records_to_nodes(self.database_query(query, params=params))
+
+    async def aget_nodes(
+        self,
+        node_ids: Optional[List[str]] = None,
+        filters: Optional[MetadataFilters] = None,
+    ) -> List[BaseNode]:
+        """True-async counterpart of :meth:`get_nodes`."""
+        query, params = self._build_get_nodes(node_ids, filters)
+        return self._records_to_nodes(await self.adatabase_query(query, params=params))
+
+    def _build_delete_nodes(
+        self,
+        node_ids: Optional[List[str]],
+        filters: Optional[MetadataFilters],
+    ) -> Tuple[sql.Composed, Dict[str, Any]]:
+        where, params = self._node_match_clause(node_ids, filters)
+        query = "MATCH (n:{label}) {where} DETACH DELETE n"
+        return (
+            sql.SQL(query).format(
+                label=sql.Identifier(self.node_label), where=where
+            ),
+            params,
+        )
+
+    def delete_nodes(
+        self,
+        node_ids: Optional[List[str]] = None,
+        filters: Optional[MetadataFilters] = None,
+        **delete_kwargs: Any,
+    ) -> None:
+        """Delete nodes by id and/or metadata filters."""
+        query, params = self._build_delete_nodes(node_ids, filters)
+        self.database_query(query, params=params)
+
+    async def adelete_nodes(
+        self,
+        node_ids: Optional[List[str]] = None,
+        filters: Optional[MetadataFilters] = None,
+        **delete_kwargs: Any,
+    ) -> None:
+        """True-async counterpart of :meth:`delete_nodes`."""
+        query, params = self._build_delete_nodes(node_ids, filters)
+        await self.adatabase_query(query, params=params)
+
+    def clear(self) -> None:
+        """Delete all nodes for this store's label."""
+        self.database_query(
+            sql.SQL("MATCH (n:{label}) DETACH DELETE n").format(
+                label=sql.Identifier(self.node_label)
+            )
+        )
+
+    async def aclear(self) -> None:
+        """True-async counterpart of :meth:`clear`."""
+        await self.adatabase_query(
+            sql.SQL("MATCH (n:{label}) DETACH DELETE n").format(
+                label=sql.Identifier(self.node_label)
+            )
+        )
 
     def _get_cursor(self) -> psycopg.Cursor:
         cursor = self._connection.cursor(row_factory=psycopg.rows.namedtuple_row)

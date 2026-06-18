@@ -40,6 +40,7 @@ from llama_index.core.graph_stores.types import (
 )
 from llama_index.core.graph_stores.utils import value_sanitize
 from llama_index_agensgraph.engine import AgensEngine
+from llama_index_agensgraph.filters import metadata_filters_to_cypher
 from llama_index_agensgraph.graph_stores.agensgraph.utils import *
 from llama_index.core.prompts import PromptTemplate
 from llama_index.core.vector_stores.types import VectorStoreQuery
@@ -53,8 +54,7 @@ EXHAUSTIVE_SEARCH_LIMIT = 10000
 # Threshold for returning all available prop values in graph schema
 DISTINCT_VALUE_LIMIT = 10
 CHUNK_SIZE = 1000
-# Bounds for enhanced-schema example sampling (keeps it independent of graph size)
-ENHANCED_SAMPLE_SIZE = 1000
+# Max example values kept per property in the enhanced schema.
 ENHANCED_MAX_EXAMPLES = 5
 VECTOR_INDEX_NAME = "entity"
 LONG_TEXT_THRESHOLD = 52
@@ -440,8 +440,14 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             prop_strs = []
             for prop in props:
                 prop_str = f"{prop['property']}: {prop['type']}"
-                # Example values are only present when ``enhanced_schema`` is on.
-                if prop.get("values"):
+                # Statistics are only present when ``enhanced_schema`` is on.
+                if "min" in prop and "max" in prop:
+                    prop_str += f" (min: {prop['min']}, max: {prop['max']})"
+                elif "min_size" in prop and "max_size" in prop:
+                    prop_str += (
+                        f" (list size min: {prop['min_size']}, max: {prop['max_size']})"
+                    )
+                elif prop.get("values"):
                     examples = ", ".join(str(v) for v in prop["values"])
                     prop_str += f" (e.g. {examples})"
                 prop_strs.append(prop_str)
@@ -934,6 +940,17 @@ class AgensPropertyGraphStore(PropertyGraphStore):
     ) -> Optional[Tuple[sql.Composed, Dict[str, Any]]]:
         """Build the (query, params) for :meth:`vector_query`, or None if vector
         operations are unsupported."""
+        # Translate metadata filters into a parameterized WHERE fragment so the
+        # ANN search can be scoped (mirrors the filtered-vector-search feature of
+        # other graph integrations, but injection-safe).
+        filter_clause: sql.Composed = sql.SQL("")
+        filter_params: Dict[str, Any] = {}
+        if query.filters:
+            snippet, filter_params = metadata_filters_to_cypher(
+                query.filters, alias="n"
+            )
+            filter_clause = sql.SQL("AND (") + snippet + sql.SQL(")")
+
         if self._supports_vector_index:
             # The nearest-neighbour ORDER BY + LIMIT live INSIDE the Cypher
             # sub-query against the actual query embedding, so AgensGraph can
@@ -949,7 +966,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                     t.similarity
                 FROM (
                     MATCH (n: {BASE_NODE_LABEL})
-                    WHERE n.embedding IS NOT NULL
+                    WHERE n.embedding IS NOT NULL {filter_clause}
                     WITH n, n.labels AS labels,
                          (n.embedding::vector({dim}) <=> %(query_embedding)s::vector({dim})) AS dist
                     ORDER BY dist
@@ -974,10 +991,12 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                     BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL),
                     BASE_ENTITY_LABEL=sql.Literal(BASE_ENTITY_LABEL),
                     dim=sql.SQL(str(int(self.vector_dimension))),
+                    filter_clause=filter_clause,
                 ),
                 {
                     "query_embedding": Jsonb(query.query_embedding),
                     "top_k": query.similarity_top_k,
+                    **filter_params,
                 },
             )
         elif self._supports_vector_store:
@@ -989,6 +1008,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                             """
             vector_query += """
                             MATCH (n: {BASE_NODE_LABEL})
+                            WHERE n.embedding IS NOT NULL {filter_clause}
                             WITH n,
                                 n.labels AS labels,
                                 %(query_embedding)s::vector <=> n.embedding::vector AS cos_d
@@ -1011,11 +1031,13 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             return (
                 sql.SQL(vector_query).format(
                     BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL),
-                    BASE_ENTITY_LABEL=sql.Literal(BASE_ENTITY_LABEL)
+                    BASE_ENTITY_LABEL=sql.Literal(BASE_ENTITY_LABEL),
+                    filter_clause=filter_clause,
                 ),
                 {
                     "query_embedding": Jsonb(query.query_embedding),
                     "top_k": query.similarity_top_k,
+                    **filter_params,
                 },
             )
         else:
@@ -1241,47 +1263,139 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         triples = self._get_triples()
         return format_triples(triples)
 
+    # Property type groups for enhanced-schema statistics.
+    _NUMERIC_TYPES = {"INTEGER", "FLOAT", "NUMBER"}
+
+    def _label_count(self, label: str) -> int:
+        rows = self.structured_query(
+            sql.SQL(
+                "MATCH (a:{base_label}) WHERE %(label)s IN a.labels RETURN count(a) AS c"
+            ).format(base_label=sql.Identifier(BASE_NODE_LABEL)),
+            {"label": Jsonb(label)},
+        )
+        return int(rows[0]["c"]) if rows else 0
+
     def _enhance_schema(self) -> None:
         """
-        Attach a small sample of example values to each node-label property in
-        ``structured_schema`` (an enhanced schema), so that a
-        text-to-Cypher prompt can show concrete examples.
+        Enrich each node-label property in ``structured_schema`` with concrete
+        statistics for text-to-Cypher prompting:
 
-        The sampling is bounded — at most ``ENHANCED_SAMPLE_SIZE`` nodes are
-        scanned per label and at most ``ENHANCED_MAX_EXAMPLES`` distinct values
-        are kept per property — and the embedding property is skipped, so this
-        never materializes vectors or grows with the graph.
+        - numeric properties get ``min`` / ``max`` / ``distinct_count``,
+        - list properties get ``min_size`` / ``max_size``,
+        - everything else (strings, etc.) gets example ``values`` +
+          ``distinct_count``.
+
+        Stats are computed exhaustively when the label has at most
+        ``EXHAUSTIVE_SEARCH_LIMIT`` nodes, otherwise over a bounded sample of
+        that many nodes. The embedding/labels properties are always skipped, so
+        this never materializes vectors or grows unbounded with the graph.
         """
         node_props = self.structured_schema.get("node_props", {})
         for label, props in node_props.items():
             if label == BASE_ENTITY_LABEL:
                 continue
             try:
-                rows = self.structured_query(
-                    sql.SQL(
-                        """
-                        MATCH (a:{base_label})
-                        WHERE %(label)s IN a.labels
-                        WITH a LIMIT {sample_size}
-                        UNWIND keys(properties(a)) AS prop
-                        WITH prop, properties(a)[prop] AS value
-                        WHERE prop <> 'labels' AND prop <> 'embedding'
-                        WITH prop AS property, COLLECT(DISTINCT value) AS examples
-                        RETURN property, examples[0..{max_examples}] AS examples;
-                        """
-                    ).format(
-                        base_label=sql.Identifier(BASE_NODE_LABEL),
-                        sample_size=sql.SQL(str(ENHANCED_SAMPLE_SIZE)),
-                        max_examples=sql.SQL(str(ENHANCED_MAX_EXAMPLES)),
-                    ),
-                    {"label": Jsonb(label)},
-                )
+                count = self._label_count(label)
             except Exception as exc:  # pragma: no cover - best-effort enrichment
-                logger.warning("Enhanced schema sampling failed for %s: %s", label, exc)
+                logger.warning("Enhanced schema count failed for %s: %s", label, exc)
                 continue
+            if count == 0:
+                continue
+            # None => exhaustive (no LIMIT); else cap the scan to a sample.
+            sample = None if count <= EXHAUSTIVE_SEARCH_LIMIT else EXHAUSTIVE_SEARCH_LIMIT
 
-            examples_by_prop = {r["property"]: r.get("examples") or [] for r in rows}
             for prop in props:
-                examples = examples_by_prop.get(prop["property"])
-                if examples:
-                    prop["values"] = examples
+                name = prop["property"]
+                if name in ("embedding", "labels"):
+                    continue
+                try:
+                    if prop.get("type") in self._NUMERIC_TYPES:
+                        prop.update(self._numeric_stats(label, name, sample))
+                    elif prop.get("type") == "LIST":
+                        prop.update(self._list_stats(label, name, sample))
+                    else:
+                        prop.update(self._value_stats(label, name, sample))
+                except Exception as exc:  # pragma: no cover - best-effort enrichment
+                    logger.warning(
+                        "Enhanced schema sampling failed for %s.%s: %s",
+                        label,
+                        name,
+                        exc,
+                    )
+
+    def _stat_subquery(
+        self, prop: str, sample: Optional[int]
+    ) -> Tuple[sql.Composed, sql.Composed]:
+        """Build the shared Cypher subquery returning a property's values and a
+        LIMIT clause (empty when exhaustive)."""
+        limit = (
+            sql.SQL("LIMIT {n}").format(n=sql.SQL(str(int(sample))))
+            if sample is not None
+            else sql.SQL("")
+        )
+        subquery = sql.SQL(
+            "MATCH (a:{base_label}) WHERE %(label)s IN a.labels AND a.{prop} IS NOT NULL "
+            "RETURN a.{prop} AS v {limit}"
+        ).format(
+            base_label=sql.Identifier(BASE_NODE_LABEL),
+            prop=sql.Identifier(prop),
+            limit=limit,
+        )
+        return subquery, limit
+
+    def _numeric_stats(
+        self, label: str, prop: str, sample: Optional[int]
+    ) -> Dict[str, Any]:
+        subquery, _ = self._stat_subquery(prop, sample)
+        rows = self.structured_query(
+            sql.SQL(
+                "SELECT min((t.v #>> '{{}}')::numeric) AS min, "
+                "max((t.v #>> '{{}}')::numeric) AS max, "
+                "count(DISTINCT t.v) AS distinct_count FROM ({sub})t"
+            ).format(sub=subquery),
+            {"label": Jsonb(label)},
+        )
+        if not rows or rows[0]["min"] is None:
+            return {}
+        row = rows[0]
+        return {
+            "min": float(row["min"]),
+            "max": float(row["max"]),
+            "distinct_count": row["distinct_count"],
+        }
+
+    def _list_stats(
+        self, label: str, prop: str, sample: Optional[int]
+    ) -> Dict[str, Any]:
+        subquery, _ = self._stat_subquery(prop, sample)
+        rows = self.structured_query(
+            sql.SQL(
+                "SELECT min(jsonb_array_length(t.v)) AS min_size, "
+                "max(jsonb_array_length(t.v)) AS max_size FROM ({sub})t"
+            ).format(sub=subquery),
+            {"label": Jsonb(label)},
+        )
+        if not rows or rows[0]["min_size"] is None:
+            return {}
+        return {"min_size": rows[0]["min_size"], "max_size": rows[0]["max_size"]}
+
+    def _value_stats(
+        self, label: str, prop: str, sample: Optional[int]
+    ) -> Dict[str, Any]:
+        subquery, _ = self._stat_subquery(prop, sample)
+        rows = self.structured_query(
+            sql.SQL(
+                "SELECT (array_agg(DISTINCT t.v))[1:{max_examples}] AS examples, "
+                "count(DISTINCT t.v) AS distinct_count FROM ({sub})t"
+            ).format(
+                max_examples=sql.SQL(str(ENHANCED_MAX_EXAMPLES)),
+                sub=subquery,
+            ),
+            {"label": Jsonb(label)},
+        )
+        if not rows or not rows[0].get("examples"):
+            return {}
+        return {
+            "values": rows[0]["examples"],
+            "distinct_count": rows[0]["distinct_count"],
+        }

@@ -28,6 +28,19 @@ See the associated guides below:
   ignored the query embedding and errored at any other dimension. It now uses
   the configured `vector_dimension` consistently and ranks by the actual query
   embedding, backed by the HNSW index.
+- **Metadata-filtered vector search.** Both `AgensPropertyGraphStore.vector_query`
+  and `AgensgraphVectorStore.query` honor `MetadataFilters`, translated into a
+  fully parameterized (injection-safe) Cypher `WHERE`. All 14 `FilterOperator`
+  values are supported — `EQ`, `NE`, `GT`, `GTE`, `LT`, `LTE`, `IN`, `NIN`,
+  `CONTAINS`, `TEXT_MATCH`, `TEXT_MATCH_INSENSITIVE`, `ANY`, `ALL`, `IS_EMPTY` —
+  along with `AND`/`OR`/`NOT` conditions and nested filter groups.
+- **Modern vector-store node management.** `AgensgraphVectorStore` implements
+  `get_nodes(node_ids, filters)`, `delete_nodes(node_ids, filters)` and `clear()`
+  (plus async `aget_nodes` / `adelete_nodes` / `aclear`).
+- **Richer enhanced schema.** With `enhanced_schema=True`, numeric properties get
+  `min` / `max` / `distinct_count`, list properties get `min_size` / `max_size`,
+  and other properties get example values + `distinct_count` (computed
+  exhaustively under a row threshold, sampled above it).
 - **Performance.** The vector store now creates a btree index on its `id` MERGE
   key (ingest was O(N²) without it), bulk `add` is batched, and schema
   introspection no longer materializes every distinct property value (it would

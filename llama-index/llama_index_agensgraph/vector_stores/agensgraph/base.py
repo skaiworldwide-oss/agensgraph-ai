@@ -25,6 +25,10 @@ from llama_index.core.vector_stores.utils import (
 
 _logger = logging.getLogger(__name__)
 
+# Maximum rows per UNWIND batch when ingesting nodes, so a large ``add`` does
+# not ship one oversized parameter / build one huge server-side list.
+CHUNK_SIZE = 1000
+
 get_vector_index_info_function = r"""
     CREATE OR REPLACE FUNCTION ag_list_vector_indexes(
         index_name text DEFAULT NULL,
@@ -395,6 +399,12 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
 
         self.verify_vector_support()
 
+        # The `add` path MERGEs nodes by `id`; without a btree index on that
+        # property every MERGE falls back to a sequential scan, making ingest
+        # O(N^2). Create it unconditionally (IF NOT EXISTS) so it is present
+        # even when the HNSW index already exists.
+        self.create_id_index()
+
         index_already_exists = self.retrieve_existing_index()
         if not index_already_exists:
             self.create_new_index()
@@ -420,6 +430,24 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
     @property
     def client(self) -> psycopg.Connection:
         return self._connection
+
+    def create_id_index(self) -> None:
+        """
+        Create a btree property index on the MERGE key (`id`).
+
+        ``add`` upserts nodes with ``MERGE (c:{label} {id: row.id})``; without
+        this index each MERGE performs a sequential scan, turning bulk ingest
+        into an O(N^2) operation.
+        """
+        self.verify_label_existence()
+        self.database_query(
+            sql.SQL(
+                "CREATE PROPERTY INDEX IF NOT EXISTS {index_name} ON {node_label} (id)"
+            ).format(
+                index_name=sql.Identifier(f"{self.node_label}_id_idx"),
+                node_label=sql.Identifier(self.node_label),
+            )
+        )
 
     def create_new_index(self) -> None:
         """
@@ -541,14 +569,16 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
             SET c += row.metadata
         """
 
-        self.database_query(
-            sql.SQL(import_query).format(
-                label=sql.Identifier(self.node_label),
-                embedding_node_property=sql.Identifier(self.embedding_node_property),
-                text_node_property=sql.Identifier(self.text_node_property),
-            ),
-            params={"data": Jsonb(clean_params(nodes))},
+        formatted_query = sql.SQL(import_query).format(
+            label=sql.Identifier(self.node_label),
+            embedding_node_property=sql.Identifier(self.embedding_node_property),
+            text_node_property=sql.Identifier(self.text_node_property),
         )
+
+        rows = clean_params(nodes)
+        for start in range(0, len(rows), CHUNK_SIZE):
+            batch = rows[start : start + CHUNK_SIZE]
+            self.database_query(formatted_query, params={"data": Jsonb(batch)})
 
         return ids
 

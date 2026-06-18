@@ -41,6 +41,9 @@ EXHAUSTIVE_SEARCH_LIMIT = 10000
 # Threshold for returning all available prop values in graph schema
 DISTINCT_VALUE_LIMIT = 10
 CHUNK_SIZE = 1000
+# Bounds for enhanced-schema example sampling (keeps it independent of graph size)
+ENHANCED_SAMPLE_SIZE = 1000
+ENHANCED_MAX_EXAMPLES = 5
 VECTOR_INDEX_NAME = "entity"
 LONG_TEXT_THRESHOLD = 52
 
@@ -108,31 +111,29 @@ $$ LANGUAGE plpgsql;
 
 """
 
+# Collect the DISTINCT *types* per property rather than the DISTINCT *values*.
+# Deduplicating values forced the server to materialize (and ship) every
+# distinct value of every property on each schema refresh — including full
+# embedding vectors — which scales with the graph size for no benefit, since
+# only the property name and type are used (example values are sampled
+# separately, with a bound, when ``enhanced_schema`` is enabled).
 node_properties_query = f"""
     MATCH (a:"{BASE_NODE_LABEL}")
     UNWIND a.labels AS label
     UNWIND keys(properties(a)) AS prop
-    WITH label, prop, properties(a)[prop] AS value 
-    WHERE prop != 'labels'
-    WITH                
-        label,
-        prop AS property,
-        COLLECT(DISTINCT value) AS values,
-        COUNT(DISTINCT value) AS distinct_count
-    WHERE label != '{BASE_ENTITY_LABEL}' 
-    RETURN label, COLLECT({{'property': property, 'values':values, 'distinct_count': distinct_count, 'type': typeof(values[0])}}) as props;
+    WITH label, prop, typeof(properties(a)[prop]) AS vtype
+    WHERE prop != 'labels' AND label != '{BASE_ENTITY_LABEL}'
+    WITH label, prop AS property, COLLECT(DISTINCT vtype) AS types
+    RETURN label, COLLECT({{'property': property, 'type': types[0]}}) as props;
 """
 
 edge_properties_query = f"""
     MATCH ()-[e]->()
     WITH type(e) as label, properties(e) as properties
     UNWIND keys(properties) AS prop
-    WITH label, prop, properties[prop] AS value 
-    WITH                
-        label,
-        prop AS property,
-        COLLECT(DISTINCT value) AS values
-    RETURN label, COLLECT(DISTINCT {{'property': property, type: typeof(values[0])}}) as props;
+    WITH label, prop, typeof(properties[prop]) AS vtype
+    WITH label, prop AS property, COLLECT(DISTINCT vtype) AS types
+    RETURN label, COLLECT(DISTINCT {{'property': property, type: types[0]}}) as props;
 """
 
 rel_query = f"""
@@ -339,6 +340,9 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             "metadata": {},
         }
 
+        if self.enhanced_schema:
+            self._enhance_schema()
+
     def get_schema(self, refresh: bool = False) -> Any:
         if refresh:
             self.refresh_schema()
@@ -373,9 +377,15 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         formatted_rel_props = []
         # Format node properties
         for label, props in filtered_schema["node_props"].items():
-            props_str = ", ".join(
-                [f"{prop['property']}: {prop['type']}" for prop in props]
-            )
+            prop_strs = []
+            for prop in props:
+                prop_str = f"{prop['property']}: {prop['type']}"
+                # Example values are only present when ``enhanced_schema`` is on.
+                if prop.get("values"):
+                    examples = ", ".join(str(v) for v in prop["values"])
+                    prop_str += f" (e.g. {examples})"
+                prop_strs.append(prop_str)
+            props_str = ", ".join(prop_strs)
             formatted_node_props.append(f"{label} {{{props_str}}}")
 
         # Format relationship properties using structured_schema
@@ -1057,3 +1067,48 @@ class AgensPropertyGraphStore(PropertyGraphStore):
 
         triples = self._get_triples()
         return format_triples(triples)
+
+    def _enhance_schema(self) -> None:
+        """
+        Attach a small sample of example values to each node-label property in
+        ``structured_schema`` (parity with the Neo4j enhanced schema), so that a
+        text-to-Cypher prompt can show concrete examples.
+
+        The sampling is bounded — at most ``ENHANCED_SAMPLE_SIZE`` nodes are
+        scanned per label and at most ``ENHANCED_MAX_EXAMPLES`` distinct values
+        are kept per property — and the embedding property is skipped, so this
+        never materializes vectors or grows with the graph.
+        """
+        node_props = self.structured_schema.get("node_props", {})
+        for label, props in node_props.items():
+            if label == BASE_ENTITY_LABEL:
+                continue
+            try:
+                rows = self.structured_query(
+                    sql.SQL(
+                        """
+                        MATCH (a:{base_label})
+                        WHERE %(label)s IN a.labels
+                        WITH a LIMIT {sample_size}
+                        UNWIND keys(properties(a)) AS prop
+                        WITH prop, properties(a)[prop] AS value
+                        WHERE prop <> 'labels' AND prop <> 'embedding'
+                        WITH prop AS property, COLLECT(DISTINCT value) AS examples
+                        RETURN property, examples[0..{max_examples}] AS examples;
+                        """
+                    ).format(
+                        base_label=sql.Identifier(BASE_NODE_LABEL),
+                        sample_size=sql.SQL(str(ENHANCED_SAMPLE_SIZE)),
+                        max_examples=sql.SQL(str(ENHANCED_MAX_EXAMPLES)),
+                    ),
+                    {"label": Jsonb(label)},
+                )
+            except Exception as exc:  # pragma: no cover - best-effort enrichment
+                logger.warning("Enhanced schema sampling failed for %s: %s", label, exc)
+                continue
+
+            examples_by_prop = {r["property"]: r.get("examples") or [] for r in rows}
+            for prop in props:
+                examples = examples_by_prop.get(prop["property"])
+                if examples:
+                    prop["values"] = examples

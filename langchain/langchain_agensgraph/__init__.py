@@ -2,6 +2,7 @@
 
 from langchain_agensgraph.chat_message_histories import AgensChatMessageHistory
 from langchain_agensgraph.engine import AgensEngine
+from langchain_agensgraph.graph_transformers import LLMGraphTransformer
 from langchain_agensgraph.graphs.agensgraph import AgensGraph
 from langchain_agensgraph.graphs.graph_document import (
     GraphDocument,
@@ -18,6 +19,7 @@ __all__ = [
     "AgensGraph",
     "AgensgraphVector",
     "GraphDocument",
+    "LLMGraphTransformer",
     "Node",
     "Relationship",
     "__version__",

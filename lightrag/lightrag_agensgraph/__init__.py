@@ -27,6 +27,11 @@ _IMPLEMENTATIONS = [
         "AgensgraphDocStatusStorage",
         "lightrag_agensgraph.kg.agensgraph_docstatus_impl",
     ),
+    (
+        "VECTOR_STORAGE",
+        "AgensgraphVectorStorage",
+        "lightrag_agensgraph.kg.agensgraph_vector_impl",
+    ),
 ]
 
 _ENV_REQUIREMENTS = ["AGENSGRAPH_DB", "AGENSGRAPH_USER", "AGENSGRAPH_PASSWORD"]

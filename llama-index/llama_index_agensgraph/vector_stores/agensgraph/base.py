@@ -1,11 +1,25 @@
-from typing import Any, Dict, List, Optional, Tuple, NamedTuple, Pattern, Union
+from typing import (
+    Any,
+    AsyncIterator,
+    Dict,
+    Iterator,
+    List,
+    NamedTuple,
+    Optional,
+    Pattern,
+    Tuple,
+    Union,
+)
 import logging
 
 import json, re
+from contextlib import asynccontextmanager, contextmanager
 
 import psycopg
 from psycopg import sql
 from psycopg.types.json import Jsonb
+
+from llama_index_agensgraph.engine import AgensEngine
 
 from llama_index.core.bridge.pydantic import PrivateAttr
 from llama_index.core.schema import BaseNode, MetadataMode
@@ -337,6 +351,9 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
 
     _graph_name: Optional[str] = "vector_store"
     _support_metadata_filter: bool = PrivateAttr()
+    _engine: Optional[AgensEngine] = PrivateAttr(default=None)
+    _aconn: Optional[psycopg.AsyncConnection] = PrivateAttr(default=None)
+    _url: str = PrivateAttr()
 
     def __init__(
         self,
@@ -351,6 +368,7 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         distance_strategy: str = "cosine",
         hybrid_search: bool = False,
         retrieval_query: str = "",
+        engine: Optional[AgensEngine] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(
@@ -369,8 +387,17 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
             raise ValueError("Only cosine distance strategy is supported for now")
 
         self._graph_name = graph_name
+        # The engine (pool) is wired in only after setup completes: graph/index
+        # creation must run on the dedicated connection, before the graph exists
+        # (a pooled checkout would try to `SET graph_path` to a missing graph).
+        self._engine = None
+        self._aconn = None
+        self._url = url
 
-        # Verify connection
+        # A dedicated connection is always held for setup/introspection. When an
+        # engine is supplied, runtime queries instead check out a pooled
+        # connection (see ``_acquire``); without one, every query uses this
+        # dedicated connection -- the original single-connection behavior.
         try:
             self._connection = psycopg.connect(url)
         except psycopg.OperationalError as e:
@@ -418,6 +445,9 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
                     raise ValueError(
                         "Vector and keyword index don't index the same node label"
                     )
+
+        # Setup is done; runtime queries may now use the pool.
+        self._engine = engine
 
     def verify_label_existence(self) -> None:
         """Create label if it does not exist."""
@@ -558,14 +588,17 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
             )
         )
 
-    def add(self, nodes: List[BaseNode], **add_kwargs: Any) -> List[str]:
+    def _build_add(
+        self, nodes: List[BaseNode]
+    ) -> Tuple[List[str], sql.Composed, List[Dict[str, Any]]]:
+        """Build the ids, the formatted import query, and the cleaned rows."""
         ids = [r.node_id for r in nodes]
         import_query = """
-            UNWIND %(data)s AS row 
-            MERGE (c:{label} {{id: row.id}}) 
-            WITH c, row 
+            UNWIND %(data)s AS row
+            MERGE (c:{label} {{id: row.id}})
+            WITH c, row
             SET c.{embedding_node_property} = row.embedding,
-                c.{text_node_property} = row.text 
+                c.{text_node_property} = row.text
             SET c += row.metadata
         """
 
@@ -574,18 +607,32 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
             embedding_node_property=sql.Identifier(self.embedding_node_property),
             text_node_property=sql.Identifier(self.text_node_property),
         )
+        return ids, formatted_query, clean_params(nodes)
 
-        rows = clean_params(nodes)
+    def add(self, nodes: List[BaseNode], **add_kwargs: Any) -> List[str]:
+        ids, formatted_query, rows = self._build_add(nodes)
         for start in range(0, len(rows), CHUNK_SIZE):
             batch = rows[start : start + CHUNK_SIZE]
             self.database_query(formatted_query, params={"data": Jsonb(batch)})
 
         return ids
 
-    def query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
+    async def async_add(self, nodes: List[BaseNode], **add_kwargs: Any) -> List[str]:
+        """True-async counterpart of :meth:`add`."""
+        ids, formatted_query, rows = self._build_add(nodes)
+        for start in range(0, len(rows), CHUNK_SIZE):
+            batch = rows[start : start + CHUNK_SIZE]
+            await self.adatabase_query(formatted_query, params={"data": Jsonb(batch)})
+
+        return ids
+
+    def _build_query(
+        self, query: VectorStoreQuery
+    ) -> Tuple[sql.Composed, Dict[str, Any]]:
+        """Build the formatted query SQL and parameters for a vector query."""
         base_index_query = (
-                """MATCH (n:{label}) 
-                WHERE n.{embedding_property} IS NOT NULL AND 
+                """MATCH (n:{label})
+                WHERE n.{embedding_property} IS NOT NULL AND
                 array_size(n.{embedding_property}) = {embedding_dimension} """
         )
 
@@ -671,15 +718,20 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
             **filter_params,
         }
 
-        results = self.database_query(sql.SQL(index_query).format(
+        formatted_query = sql.SQL(index_query).format(
             label=sql.Identifier(self.node_label),
             embedding_property=sql.Identifier(self.embedding_node_property),
             text_property=sql.Identifier(self.text_node_property),
             embedding_dimension=self.embedding_dimension,
             text_property_literal=sql.Literal(self.text_node_property),
             embedding_property_literal=sql.Literal(self.embedding_node_property),
-        ), params=parameters)
+        )
+        return formatted_query, parameters
 
+    @staticmethod
+    def _results_to_query_result(
+        results: List[Dict[str, Any]]
+    ) -> VectorStoreQueryResult:
         nodes = []
         similarities = []
         ids = []
@@ -692,18 +744,38 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
 
         return VectorStoreQueryResult(nodes=nodes, similarities=similarities, ids=ids)
 
-    def delete(self, ref_doc_id: str, **delete_kwargs: Any) -> None:
+    def query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
+        formatted_query, parameters = self._build_query(query)
+        results = self.database_query(formatted_query, params=parameters)
+        return self._results_to_query_result(results)
+
+    async def aquery(
+        self, query: VectorStoreQuery, **kwargs: Any
+    ) -> VectorStoreQueryResult:
+        """True-async counterpart of :meth:`query`."""
+        formatted_query, parameters = self._build_query(query)
+        results = await self.adatabase_query(formatted_query, params=parameters)
+        return self._results_to_query_result(results)
+
+    def _build_delete(self, ref_doc_id: str) -> Tuple[sql.Composed, Dict[str, Any]]:
         query = """
             MATCH (n:{label})
             WHERE n.ref_doc_id = %(id)s
             DETACH DELETE n
             """
-        self.database_query(
-            sql.SQL(query).format(
-                label=sql.Identifier(self.node_label)
-            ),
-            params={"id": Jsonb(ref_doc_id)},
+        return (
+            sql.SQL(query).format(label=sql.Identifier(self.node_label)),
+            {"id": Jsonb(ref_doc_id)},
         )
+
+    def delete(self, ref_doc_id: str, **delete_kwargs: Any) -> None:
+        formatted_query, params = self._build_delete(ref_doc_id)
+        self.database_query(formatted_query, params=params)
+
+    async def adelete(self, ref_doc_id: str, **delete_kwargs: Any) -> None:
+        """True-async counterpart of :meth:`delete`."""
+        formatted_query, params = self._build_delete(ref_doc_id)
+        await self.adatabase_query(formatted_query, params=params)
 
     def _get_cursor(self) -> psycopg.Cursor:
         cursor = self._connection.cursor(row_factory=psycopg.rows.namedtuple_row)
@@ -792,27 +864,85 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         """
 
         # execute the query, rolling back on an error
-        with self._get_cursor() as curs:
-            try:
-                curs.execute(query, params)
-                self._connection.commit()
-            except psycopg.Error as e:
-                self._connection.rollback()
-                raise AgensQueryException(
-                    {
-                        "message": "Error executing graph query: {}".format(query),
-                        "detail": str(e),
-                    }
-                )
-            try:
-                data = curs.fetchall()
-            except psycopg.ProgrammingError:
-                data = []  # Handle queries that don’t return data
+        with self._acquire() as conn:
+            with conn.cursor(row_factory=psycopg.rows.namedtuple_row) as curs:
+                try:
+                    curs.execute(query, params)
+                    conn.commit()
+                except psycopg.Error as e:
+                    conn.rollback()
+                    raise AgensQueryException(
+                        {
+                            "message": "Error executing graph query: {}".format(query),
+                            "detail": str(e),
+                        }
+                    )
+                try:
+                    data = curs.fetchall()
+                except psycopg.ProgrammingError:
+                    data = []  # Handle queries that don’t return data
 
-            if data is None:
-                result = []
-            # convert to dictionaries
-            else:
-                result = [self._record_to_dict(d) for d in data]
+                if data is None:
+                    result = []
+                # convert to dictionaries
+                else:
+                    result = [self._record_to_dict(d) for d in data]
 
-            return result
+                return result
+
+    @contextmanager
+    def _acquire(self) -> "Iterator[psycopg.Connection]":
+        """Yield the connection ``database_query`` should run on.
+
+        Uses a pooled connection from the engine when one is configured; falls
+        back to the dedicated connection otherwise (the pre-engine behavior).
+        """
+        if self._engine is not None:
+            with self._engine.connection(graph_path=self._graph_name) as conn:
+                yield conn
+        else:
+            yield self._connection
+
+    @asynccontextmanager
+    async def _aacquire(self) -> "AsyncIterator[psycopg.AsyncConnection]":
+        """Async sibling of :meth:`_acquire`."""
+        if self._engine is not None:
+            async with self._engine.aconnection(graph_path=self._graph_name) as conn:
+                yield conn
+        else:
+            if self._aconn is None or self._aconn.closed:
+                self._aconn = await psycopg.AsyncConnection.connect(self._url)
+                async with self._aconn.cursor() as cur:
+                    await cur.execute(
+                        sql.SQL("SET graph_path = {n}").format(
+                            n=sql.Identifier(self._graph_name)
+                        )
+                    )
+                await self._aconn.commit()
+            yield self._aconn
+
+    async def adatabase_query(
+        self, query: str, params: dict = {}
+    ) -> List[Dict[str, Any]]:
+        """Async counterpart of :meth:`database_query` (true async I/O)."""
+        async with self._aacquire() as conn:
+            async with conn.cursor(row_factory=psycopg.rows.namedtuple_row) as curs:
+                try:
+                    await curs.execute(query, params)
+                    await conn.commit()
+                except psycopg.Error as e:
+                    await conn.rollback()
+                    raise AgensQueryException(
+                        {
+                            "message": "Error executing graph query: {}".format(query),
+                            "detail": str(e),
+                        }
+                    )
+                try:
+                    data = await curs.fetchall()
+                except psycopg.ProgrammingError:
+                    data = []
+
+                if data is None:
+                    return []
+                return [self._record_to_dict(d) for d in data]

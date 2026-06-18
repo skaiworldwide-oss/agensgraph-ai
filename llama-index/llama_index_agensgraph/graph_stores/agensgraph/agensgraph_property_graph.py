@@ -14,9 +14,20 @@ See the License for the specific language governing permissions and
 limitations under the License.
 '''
 
-from typing import Any, List, Dict, Optional, Tuple, NamedTuple, Pattern
+from typing import (
+    Any,
+    AsyncIterator,
+    Dict,
+    Iterator,
+    List,
+    NamedTuple,
+    Optional,
+    Pattern,
+    Tuple,
+)
 import re, json
 import logging
+from contextlib import asynccontextmanager, contextmanager
 
 from llama_index.core.graph_stores.prompts import DEFAULT_CYPHER_TEMPALTE
 from llama_index.core.graph_stores.types import (
@@ -28,6 +39,7 @@ from llama_index.core.graph_stores.types import (
     ChunkNode,
 )
 from llama_index.core.graph_stores.utils import value_sanitize
+from llama_index_agensgraph.engine import AgensEngine
 from llama_index_agensgraph.graph_stores.agensgraph.utils import *
 from llama_index.core.prompts import PromptTemplate
 from llama_index.core.vector_stores.types import VectorStoreQuery
@@ -208,7 +220,8 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         sanitize_query_output: bool = True,
         enhanced_schema: bool = False,
         create_indexes: bool = True,
-        create: bool = True
+        create: bool = True,
+        engine: Optional[AgensEngine] = None,
     ) -> None:
         """Create a new Agensgraph Graph instance."""
 
@@ -218,6 +231,12 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         self.create_indexes = create_indexes
         self.connection = psycopg.connect(**conf)
         self.vector_dimension = vector_dimension
+        # The engine (pool) is wired in only after setup completes: graph/index
+        # creation must run on the dedicated connection before the graph exists
+        # (a pooled checkout would try to `SET graph_path` to a missing graph).
+        self._conf = conf
+        self._engine = None
+        self._aconn = None
 
         with self._get_cursor() as curs:
             graphid = get_graph_id(curs, graph_name)
@@ -292,16 +311,50 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         # Also add constraint to ensure that labels property is always a jsonb array
         self.structured_query(
             constraint_wrapper.format(
-                f"""CREATE CONSTRAINT labels_array 
-                    ON "{BASE_NODE_LABEL}" 
+                f"""CREATE CONSTRAINT labels_array
+                    ON "{BASE_NODE_LABEL}"
                     ASSERT jsonb_typeof(properties->'labels') = 'array';"""
             )
         )
+
+        # Setup is done; runtime queries may now use the pool.
+        self._engine = engine
 
     @require_psycopg
     def _get_cursor(self) -> psycopg.Cursor:
         cursor = self.connection.cursor(row_factory=psycopg.rows.namedtuple_row)
         return cursor
+
+    @contextmanager
+    def _acquire(self) -> "Iterator[psycopg.Connection]":
+        """Yield the connection ``structured_query`` should run on.
+
+        Uses a pooled connection from the engine when one is configured; falls
+        back to the dedicated connection otherwise (the pre-engine behavior).
+        """
+        if self._engine is not None:
+            with self._engine.connection(graph_path=self.graph_name) as conn:
+                yield conn
+        else:
+            yield self.connection
+
+    @asynccontextmanager
+    async def _aacquire(self) -> "AsyncIterator[psycopg.AsyncConnection]":
+        """Async sibling of :meth:`_acquire`."""
+        if self._engine is not None:
+            async with self._engine.aconnection(graph_path=self.graph_name) as conn:
+                yield conn
+        else:
+            if self._aconn is None or self._aconn.closed:
+                self._aconn = await psycopg.AsyncConnection.connect(**self._conf)
+                async with self._aconn.cursor() as cur:
+                    await cur.execute(
+                        sql.SQL("SET graph_path = {n}").format(
+                            n=sql.Identifier(self.graph_name)
+                        )
+                    )
+                await self._aconn.commit()
+            yield self._aconn
 
     @property
     def client(self) -> Any:
@@ -412,7 +465,10 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             ]
         )
 
-    def upsert_nodes(self, nodes: List[LabelledNode]) -> None:
+    def _build_upsert_nodes_ops(
+        self, nodes: List[LabelledNode]
+    ) -> List[Tuple[sql.Composed, Dict[str, Any]]]:
+        """Build the ordered (query, params) operations for ``upsert_nodes``."""
         # Lists to hold separated types
         entity_dicts: List[dict] = []
         chunk_dicts: List[dict] = []
@@ -428,10 +484,12 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 # Or raise an error?
                 pass
 
+        ops: List[Tuple[sql.Composed, Dict[str, Any]]] = []
+
         if chunk_dicts:
             for index in range(0, len(chunk_dicts), CHUNK_SIZE):
                 chunked_params = chunk_dicts[index : index + CHUNK_SIZE]
-                self.structured_query(
+                ops.append((
                     sql.SQL("""
                     UNWIND %(chunked_params)s AS row
                     MERGE (c:{BASE_NODE_LABEL} {{id: row.id}})
@@ -441,13 +499,13 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                     RETURN count(*)
                     """).format(
                         BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL)
-                    ),{"chunked_params": Jsonb(chunked_params)}
-                )
+                    ), {"chunked_params": Jsonb(chunked_params)}
+                ))
 
         if entity_dicts:
             for index in range(0, len(entity_dicts), CHUNK_SIZE):
                 chunked_params = entity_dicts[index : index + CHUNK_SIZE]
-                self.structured_query(
+                ops.append((
                     sql.SQL("""
                     UNWIND %(chunked_params)s AS row
                     MERGE (e:{BASE_NODE_LABEL} {{id: row.id}})
@@ -460,8 +518,8 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                         BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL),
                         BASE_ENTITY_LABEL=sql.Literal(BASE_ENTITY_LABEL)
                     ), {"chunked_params": Jsonb(chunked_params)}
-                )
-                self.structured_query(
+                ))
+                ops.append((
                     sql.SQL("""
                     UNWIND %(chunked_params)s AS row
                     MATCH (e:{BASE_NODE_LABEL} {{id: row.id}})
@@ -474,16 +532,30 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                     """).format(
                         BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL)
                     ), {"chunked_params": Jsonb(chunked_params)}
-                )
+                ))
 
-    def upsert_relations(self, relations: List[Relation]) -> None:
-        """Add relations."""
+        return ops
+
+    def upsert_nodes(self, nodes: List[LabelledNode]) -> None:
+        for query, params in self._build_upsert_nodes_ops(nodes):
+            self.structured_query(query, params)
+
+    async def aupsert_nodes(self, nodes: List[LabelledNode]) -> None:
+        """True-async counterpart of :meth:`upsert_nodes`."""
+        for query, params in self._build_upsert_nodes_ops(nodes):
+            await self.astructured_query(query, params)
+
+    def _build_upsert_relations_ops(
+        self, relations: List[Relation]
+    ) -> List[Tuple[sql.Composed, Dict[str, Any]]]:
+        """Build the ordered (query, params) operations for ``upsert_relations``."""
         params = [r.model_dump() for r in relations]
+        ops: List[Tuple[sql.Composed, Dict[str, Any]]] = []
         for index in range(0, len(params), CHUNK_SIZE):
             chunked_params = params[index : index + CHUNK_SIZE]
             for param in chunked_params:
-                self.structured_query(
-                   sql.SQL("""
+                ops.append((
+                    sql.SQL("""
                     MERGE (source: {BASE_NODE_LABEL} {{id: %(source_id)s}})
                     ON CREATE SET source.labels = append_label(source.labels, 'Chunk')
                     MERGE (target: {BASE_NODE_LABEL} {{id: %(target_id)s}})
@@ -500,19 +572,30 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                         "target_id": Jsonb(param["target_id"]),
                         "properties": Jsonb(param["properties"])
                     }
-                )
+                ))
+        return ops
 
-    def get(
+    def upsert_relations(self, relations: List[Relation]) -> None:
+        """Add relations."""
+        for query, params in self._build_upsert_relations_ops(relations):
+            self.structured_query(query, params)
+
+    async def aupsert_relations(self, relations: List[Relation]) -> None:
+        """True-async counterpart of :meth:`upsert_relations`."""
+        for query, params in self._build_upsert_relations_ops(relations):
+            await self.astructured_query(query, params)
+
+    def _build_get(
         self,
         properties: Optional[dict] = None,
         ids: Optional[List[str]] = None,
-    ) -> List[LabelledNode]:
-        """Get nodes."""
+    ) -> Tuple[sql.Composed, Dict[str, Any]]:
+        """Build the (query, params) for :meth:`get`."""
         query = """SELECT t.name,
                             t.type,
                             (t.properties - 'labels') || '{{"embedding": null, "id": null}}'::jsonb AS properties
                      FROM ("""
-        params = {}
+        params: Dict[str, Any] = {}
         query += 'MATCH (e:{BASE_NODE_LABEL}) '
         query += "WHERE e.id IS NOT NULL "
         if ids:
@@ -542,15 +625,20 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             properties(e) AS properties
         """
         query += ")t"
-        response = self.structured_query(
+        return (
             sql.SQL(query).format(
                 BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL),
                 BASE_ENTITY_LABEL=sql.Literal(BASE_ENTITY_LABEL)
-            ),params=params
+            ),
+            params,
         )
-        response = response if response else []
 
-        nodes = []
+    @staticmethod
+    def _get_response_to_nodes(
+        response: Optional[List[Dict[str, Any]]]
+    ) -> List[LabelledNode]:
+        response = response if response else []
+        nodes: List[LabelledNode] = []
         for record in response:
             if "text" in record["properties"] or record["type"] is None:
                 text = record["properties"].pop("text", "")
@@ -571,6 +659,26 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 )
 
         return nodes
+
+    def get(
+        self,
+        properties: Optional[dict] = None,
+        ids: Optional[List[str]] = None,
+    ) -> List[LabelledNode]:
+        """Get nodes."""
+        query, params = self._build_get(properties, ids)
+        response = self.structured_query(query, params=params)
+        return self._get_response_to_nodes(response)
+
+    async def aget(
+        self,
+        properties: Optional[dict] = None,
+        ids: Optional[List[str]] = None,
+    ) -> List[LabelledNode]:
+        """True-async counterpart of :meth:`get`."""
+        query, params = self._build_get(properties, ids)
+        response = await self.astructured_query(query, params=params)
+        return self._get_response_to_nodes(response)
 
     def get_triplets(
         self,
@@ -814,10 +922,11 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             params = {f"{prop}": Jsonb(properties[prop]) for prop in properties}
             self.structured_query(cypher, params=params)
 
-    def vector_query(
-        self, query: VectorStoreQuery, **kwargs: Any
-    ) -> Tuple[List[LabelledNode], List[float]]:
-        """Query the graph store with a vector store query."""
+    def _build_vector_query(
+        self, query: VectorStoreQuery
+    ) -> Optional[Tuple[sql.Composed, Dict[str, Any]]]:
+        """Build the (query, params) for :meth:`vector_query`, or None if vector
+        operations are unsupported."""
         if self._supports_vector_index:
             # The nearest-neighbour ORDER BY + LIMIT live INSIDE the Cypher
             # sub-query against the actual query embedding, so AgensGraph can
@@ -853,14 +962,17 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 )t;
                 """
             )
-            data = self.structured_query(sql.SQL(vector_query).format(
-                BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL),
-                BASE_ENTITY_LABEL=sql.Literal(BASE_ENTITY_LABEL),
-                dim=sql.SQL(str(int(self.vector_dimension))),
-            ), {
-                "query_embedding": Jsonb(query.query_embedding),
-                "top_k": query.similarity_top_k
-            })
+            return (
+                sql.SQL(vector_query).format(
+                    BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL),
+                    BASE_ENTITY_LABEL=sql.Literal(BASE_ENTITY_LABEL),
+                    dim=sql.SQL(str(int(self.vector_dimension))),
+                ),
+                {
+                    "query_embedding": Jsonb(query.query_embedding),
+                    "top_k": query.similarity_top_k,
+                },
+            )
         elif self._supports_vector_store:
             vector_query = """SELECT t.name,
                                 t.type,
@@ -889,21 +1001,26 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                                 END AS type
                             """
             vector_query += ")t"
-            data = self.structured_query(
+            return (
                 sql.SQL(vector_query).format(
                     BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL),
                     BASE_ENTITY_LABEL=sql.Literal(BASE_ENTITY_LABEL)
-                ), {
+                ),
+                {
                     "query_embedding": Jsonb(query.query_embedding),
-                    "top_k": query.similarity_top_k
-                }
+                    "top_k": query.similarity_top_k,
+                },
             )
         else:
-            data = []
-        data = data if data else []
+            return None
 
-        nodes = []
-        scores = []
+    @staticmethod
+    def _vector_data_to_result(
+        data: Optional[List[Dict[str, Any]]]
+    ) -> Tuple[List[LabelledNode], List[float]]:
+        data = data if data else []
+        nodes: List[LabelledNode] = []
+        scores: List[float] = []
         for record in data:
             node = EntityNode(
                 name=record["name"],
@@ -914,6 +1031,22 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             scores.append(record["similarity"])
 
         return (nodes, scores)
+
+    def vector_query(
+        self, query: VectorStoreQuery, **kwargs: Any
+    ) -> Tuple[List[LabelledNode], List[float]]:
+        """Query the graph store with a vector store query."""
+        built = self._build_vector_query(query)
+        data = self.structured_query(*built) if built is not None else []
+        return self._vector_data_to_result(data)
+
+    async def avector_query(
+        self, query: VectorStoreQuery, **kwargs: Any
+    ) -> Tuple[List[LabelledNode], List[float]]:
+        """True-async counterpart of :meth:`vector_query`."""
+        built = self._build_vector_query(query)
+        data = await self.astructured_query(*built) if built is not None else []
+        return self._vector_data_to_result(data)
 
     @staticmethod
     def _record_to_dict(record: NamedTuple) -> Dict[str, Any]:
@@ -985,33 +1118,66 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         """
 
         # execute the query, rolling back on an error
-        with self._get_cursor() as curs:
-            try:
-                curs.execute(query, params)
-                self.connection.commit()
-            except psycopg.Error as e:
-                self.connection.rollback()
-                raise AgensQueryException(
-                    {
-                        "message": "Error executing graph query: {}".format(query),
-                        "detail": str(e),
-                    }
-                )
-            try:
-                data = curs.fetchall()
-            except psycopg.ProgrammingError:
-                data = []  # Handle queries that don’t return data
+        with self._acquire() as conn:
+            with conn.cursor(row_factory=psycopg.rows.namedtuple_row) as curs:
+                try:
+                    curs.execute(query, params)
+                    conn.commit()
+                except psycopg.Error as e:
+                    conn.rollback()
+                    raise AgensQueryException(
+                        {
+                            "message": "Error executing graph query: {}".format(query),
+                            "detail": str(e),
+                        }
+                    )
+                try:
+                    data = curs.fetchall()
+                except psycopg.ProgrammingError:
+                    data = []  # Handle queries that don’t return data
 
-            if data is None:
-                result = []
-            # convert to dictionaries
-            else:
-                result = [self._record_to_dict(d) for d in data]
+                if data is None:
+                    result = []
+                # convert to dictionaries
+                else:
+                    result = [self._record_to_dict(d) for d in data]
 
-            if self.sanitize_query_output:
-                result = [value_sanitize(el) for el in result]
+                if self.sanitize_query_output:
+                    result = [value_sanitize(el) for el in result]
 
-            return result
+                return result
+
+    async def astructured_query(
+        self, query: str, params: dict = {}
+    ) -> List[Dict[str, Any]]:
+        """Async counterpart of :meth:`structured_query` (true async I/O)."""
+        async with self._aacquire() as conn:
+            async with conn.cursor(row_factory=psycopg.rows.namedtuple_row) as curs:
+                try:
+                    await curs.execute(query, params)
+                    await conn.commit()
+                except psycopg.Error as e:
+                    await conn.rollback()
+                    raise AgensQueryException(
+                        {
+                            "message": "Error executing graph query: {}".format(query),
+                            "detail": str(e),
+                        }
+                    )
+                try:
+                    data = await curs.fetchall()
+                except psycopg.ProgrammingError:
+                    data = []
+
+                if data is None:
+                    result = []
+                else:
+                    result = [self._record_to_dict(d) for d in data]
+
+                if self.sanitize_query_output:
+                    result = [value_sanitize(el) for el in result]
+
+                return result
 
     @require_psycopg
     def _get_node_properties(self) -> Dict[str, Any]:

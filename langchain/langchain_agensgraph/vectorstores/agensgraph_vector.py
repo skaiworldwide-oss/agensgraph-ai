@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import enum
 import logging
 import os
@@ -241,6 +242,62 @@ class FullTextIndexAM(str, enum.Enum):
 
 DEFAULT_INDEX_TYPE = IndexType.NODE
 DEFAULT_VECTOR_INDEX_AM = VectorIndexAM.HNSW
+
+
+@dataclasses.dataclass
+class IndexConfig:
+    """Typed configuration for a pgvector index.
+
+    Replaces passing a bare ``VectorIndexAM`` enum, letting callers tune the
+    access-method build parameters that materially affect recall/latency:
+
+    * HNSW: ``m`` (max connections per layer) and ``ef_construction``
+      (candidate list size at build time).
+    * IVFFlat: ``lists`` (number of inverted lists / centroids).
+
+    Example::
+
+        store.create_new_index(
+            IndexConfig(am=VectorIndexAM.HNSW, m=16, ef_construction=64)
+        )
+    """
+
+    am: VectorIndexAM = DEFAULT_VECTOR_INDEX_AM
+    m: Optional[int] = None
+    ef_construction: Optional[int] = None
+    lists: Optional[int] = None
+
+    def with_options_clause(self) -> str:
+        """Return the trailing ``WITH (...)`` clause, or '' when no options."""
+        opts: List[str] = []
+        if self.am == VectorIndexAM.HNSW:
+            if self.m is not None:
+                opts.append(f"m = {int(self.m)}")
+            if self.ef_construction is not None:
+                opts.append(f"ef_construction = {int(self.ef_construction)}")
+        elif self.am == VectorIndexAM.IVFFLAT:
+            if self.lists is not None:
+                opts.append(f"lists = {int(self.lists)}")
+        return f" WITH ({', '.join(opts)})" if opts else ""
+
+
+@dataclasses.dataclass
+class HybridSearchConfig:
+    """Configuration for hybrid (vector + keyword) fusion.
+
+    Currently supports reciprocal rank fusion (RRF), the de-facto default. The
+    ``rank_constant`` k tempers the influence of lower-ranked hits; smaller k
+    sharpens the contribution of top ranks. ``vector_weight`` /
+    ``keyword_weight`` scale each modality's contribution.
+    """
+
+    fusion: str = "rrf"
+    rank_constant: int = 60
+    vector_weight: float = 1.0
+    keyword_weight: float = 1.0
+
+
+DEFAULT_HYBRID_CONFIG = HybridSearchConfig()
 DEFAULT_FULLTEXT_INDEX_AM = FullTextIndexAM.GIN
 
 def check_if_not_null(props: List[str], values: List[Any]) -> None:
@@ -828,30 +885,42 @@ class AgensgraphVector(VectorStore):
             )
 
 
-    def create_new_index(self, vector_index_am: VectorIndexAM = None) -> None:
+    def create_new_index(
+        self,
+        vector_index_am: VectorIndexAM = None,
+        index_config: Optional[IndexConfig] = None,
+    ) -> None:
         """
-        This method constructs a Cypher query and executes it
-        to create a new vector index in AgensGraph.
+        Construct and execute a Cypher query to create a new vector index.
+
+        Args:
+            vector_index_am: Legacy access-method selector. Ignored when
+                ``index_config`` is given.
+            index_config: Typed :class:`IndexConfig` carrying the access method
+                plus build parameters (HNSW ``m``/``ef_construction``, IVFFlat
+                ``lists``). Preferred over ``vector_index_am``.
         """
-        if vector_index_am is None:
-            vector_index_am = self._vector_index_am
+        if index_config is None:
+            am = vector_index_am if vector_index_am is not None else self._vector_index_am
+            index_config = IndexConfig(am=am)
 
         # make sure label exists
         self.verify_label_existence()
         index_query = """CREATE PROPERTY INDEX IF NOT EXISTS {index_name}
             ON {node_label} USING {vector_index_am}
-            (({embedding_node_property}::vector({embedding_dimension})) {similarity_metric})"""
+            (({embedding_node_property}::vector({embedding_dimension})) {similarity_metric}){with_options}"""
 
         self.query(
             sql.SQL(index_query).format(
                 index_name=sql.Identifier(self.index_name),
                 node_label=sql.Identifier(self.node_label),
-                vector_index_am=sql.SQL(vector_index_am.value),
+                vector_index_am=sql.SQL(index_config.am.value),
                 embedding_node_property=sql.Identifier(self.embedding_node_property),
                 embedding_dimension=self.embedding_dimension,
                 similarity_metric=sql.SQL(
                     DISTANCE_STRATEGY_OPS[self._distance_strategy]
-                )
+                ),
+                with_options=sql.SQL(index_config.with_options_clause()),
             )
         )
 
@@ -1159,6 +1228,7 @@ class AgensgraphVector(VectorStore):
         filter: Optional[Dict[str, Any]] = None,
         params: Dict[str, Any] = {},
         effective_search_ratio: float = 1.0,
+        hybrid_config: Optional[HybridSearchConfig] = None,
         **kwargs: Any,
     ) -> List[Tuple[Document, float]]:
         """
@@ -1247,8 +1317,8 @@ class AgensgraphVector(VectorStore):
                                 )
                                 SELECT
                                     COALESCE(semantic_search.n, keyword_search.n) AS n,
-                                    COALESCE(1.0 / (60 + semantic_search.rank), 0.0) +
-                                    COALESCE(1.0 / (60 + keyword_search.rank), 0.0) AS score
+                                    {vector_weight} * COALESCE(1.0 / ({rank_constant} + semantic_search.rank), 0.0) +
+                                    {keyword_weight} * COALESCE(1.0 / ({rank_constant} + keyword_search.rank), 0.0) AS score
                                 FROM semantic_search
                                 FULL OUTER JOIN keyword_search ON semantic_search.n->'__id__' = keyword_search.n->'__id__'
                                 ORDER BY score DESC
@@ -1296,6 +1366,8 @@ class AgensgraphVector(VectorStore):
         ratio = max(1.0, float(effective_search_ratio))
         fetch_k = max(k, int(k * ratio))
 
+        hcfg = hybrid_config or DEFAULT_HYBRID_CONFIG
+
         parameters = {
             "k": fetch_k,
             "embedding": embedding,
@@ -1315,6 +1387,10 @@ class AgensgraphVector(VectorStore):
                 embedding_dimension=self.embedding_dimension,
                 text_property_literal=sql.Literal(self.text_node_property),
                 embedding_property_literal=sql.Literal(self.embedding_node_property),
+                # Hybrid RRF fusion knobs (only referenced by the HYBRID query).
+                rank_constant=sql.Literal(int(hcfg.rank_constant)),
+                vector_weight=sql.Literal(float(hcfg.vector_weight)),
+                keyword_weight=sql.Literal(float(hcfg.keyword_weight)),
             ), params=parameters)
 
         if any(result["text"] is None for result in results):

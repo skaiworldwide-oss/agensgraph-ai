@@ -18,11 +18,17 @@ import os
 
 import pytest
 
-from llama_index.core.graph_stores.types import EntityNode
-from llama_index.core.vector_stores.types import VectorStoreQuery
+from llama_index.core.graph_stores.types import EntityNode, Relation
+from llama_index.core.vector_stores.types import (
+    FilterOperator,
+    MetadataFilter,
+    MetadataFilters,
+    VectorStoreQuery,
+)
 
 from llama_index_agensgraph.engine import AgensEngine
 from llama_index_agensgraph.graph_stores.agensgraph import AgensPropertyGraphStore
+from llama_index_agensgraph.vector_stores.agensgraph import AgensgraphVectorStore
 
 agens_db = os.environ.get("AGENS_DB")
 agens_user = os.environ.get("AGENS_USER")
@@ -192,3 +198,104 @@ def test_engine_pooling_roundtrip():
         assert [n.name for n in store.get()] == ["pooled"]
     finally:
         engine.close()
+
+
+# --------------------------------------------------------------------------- #
+# Performance-audit regression guards (index usage, batching)
+# --------------------------------------------------------------------------- #
+
+
+def _url() -> str:
+    return (
+        f"postgresql://{agens_user}:{agens_password}"
+        f"@{agens_host}:{agens_port}/{agens_db}"
+    )
+
+
+def _plan_noseqscan(conn, query, params):
+    """EXPLAIN plan text with sequential scans disabled, so the assertion
+    reflects whether an index is *usable* regardless of table size."""
+    from psycopg import sql
+
+    with conn.cursor() as cur:
+        cur.execute("SET LOCAL enable_seqscan = off")
+        cur.execute(sql.SQL("EXPLAIN ") + query, params)
+        plan = " ".join(r[0] for r in cur.fetchall())
+    conn.rollback()
+    return plan
+
+
+def test_pg_get_ids_uses_index(vec_store: AgensPropertyGraphStore):
+    """get(ids=...) must be index-backed (OR-of-equalities, not `id <@ list`)."""
+    vec_store.upsert_nodes([EntityNode(name=f"e{i}", label="PERSON") for i in range(20)])
+    query, params = vec_store._build_get(ids=["e1", "e2", "e3"])
+    plan = _plan_noseqscan(vec_store.connection, query, params)
+    assert "Seq Scan" not in plan
+    assert "Index Scan" in plan or "Bitmap" in plan
+
+
+def test_vector_get_nodes_ids_uses_index():
+    """get_nodes(node_ids=...) must be index-backed (OR-of-equalities)."""
+    vs = AgensgraphVectorStore(
+        url=_url(), embedding_dimension=4, graph_name="test_perf_vec", node_label="Chunk"
+    )
+    vs.clear()
+    query, params = vs._build_get_nodes(node_ids=["a", "b", "c"], filters=None)
+    plan = _plan_noseqscan(vs._connection, query, params)
+    assert "Seq Scan" not in plan
+    assert "Index Scan" in plan or "Bitmap" in plan
+
+
+def test_vector_ref_doc_id_index_present():
+    """The vector store indexes ref_doc_id so delete(ref_doc_id) is not a seq scan."""
+    vs = AgensgraphVectorStore(
+        url=_url(), embedding_dimension=4, graph_name="test_perf_vec2", node_label="Chunk"
+    )
+    rows = vs.database_query(
+        "SELECT indexname FROM pg_indexes "
+        "WHERE schemaname = 'test_perf_vec2' AND tablename = 'Chunk'"
+    )
+    names = {r["indexname"] for r in rows}
+    assert "Chunk_ref_doc_id_idx" in names
+    assert "Chunk_id_idx" in names
+
+
+def test_relation_batching_one_query_per_label(vec_store: AgensPropertyGraphStore):
+    """upsert_relations batches per label (was one query per relation)."""
+    rels = (
+        [Relation(source_id=f"e{i}", target_id=f"e{i + 1}", label="KNOWS") for i in range(5)]
+        + [Relation(source_id=f"e{i}", target_id=f"e{i + 1}", label="LIKES") for i in range(5)]
+    )
+    ops = vec_store._build_upsert_relations_ops(rels)
+    assert len(ops) == 2  # one batched UNWIND per distinct label, not 10
+
+
+def test_create_property_index_enables_filtered_index_scan(vec_store: AgensPropertyGraphStore):
+    """After create_property_index, a metadata-filtered vector_query can use it."""
+    vec_store.upsert_nodes(
+        [
+            EntityNode(
+                name=f"p{i}",
+                label="PERSON",
+                properties={
+                    "embedding": [float(i), 0.0, 0.0, 0.0],
+                    "country": "FR" if i % 2 else "US",
+                },
+            )
+            for i in range(20)
+        ]
+    )
+    vec_store.create_property_index("country")
+    built = vec_store._build_vector_query(
+        VectorStoreQuery(
+            query_embedding=[1.0, 0.0, 0.0, 0.0],
+            similarity_top_k=3,
+            filters=MetadataFilters(
+                filters=[MetadataFilter(key="country", value="FR", operator=FilterOperator.EQ)]
+            ),
+        )
+    )
+    assert built is not None
+    query, params = built
+    plan = _plan_noseqscan(vec_store.connection, query, params)
+    assert "country_idx" in plan and "Index Scan" in plan

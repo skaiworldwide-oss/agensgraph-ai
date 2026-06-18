@@ -391,23 +391,41 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
     def client(self) -> psycopg.Connection:
         return self._connection
 
-    def create_id_index(self) -> None:
+    def create_property_index(
+        self, property_name: str, label: Optional[str] = None
+    ) -> None:
         """
-        Create a btree property index on the MERGE key (`id`).
+        Create a btree property index on ``property_name`` for ``label``
+        (defaults to this store's node label).
 
-        ``add`` upserts nodes with ``MERGE (c:{label} {id: row.id})``; without
-        this index each MERGE performs a sequential scan, turning bulk ingest
-        into an O(N^2) operation.
+        Useful for metadata keys you filter on: a metadata-filtered vector
+        search cannot use the HNSW index for the filter, so without a property
+        index the filter degrades to a sequential scan. Indexing the filter key
+        lets the planner pre-select matching rows via an index/bitmap scan.
         """
+        target_label = label or self.node_label
         self.verify_label_existence()
         self.database_query(
             sql.SQL(
-                "CREATE PROPERTY INDEX IF NOT EXISTS {index_name} ON {node_label} (id)"
+                "CREATE PROPERTY INDEX IF NOT EXISTS {index_name} ON {node_label} ({prop})"
             ).format(
-                index_name=sql.Identifier(f"{self.node_label}_id_idx"),
-                node_label=sql.Identifier(self.node_label),
+                index_name=sql.Identifier(f"{target_label}_{property_name}_idx"),
+                node_label=sql.Identifier(target_label),
+                prop=sql.Identifier(property_name),
             )
         )
+
+    def create_id_index(self) -> None:
+        """
+        Create btree property indexes on the MERGE key (`id`) and the delete
+        key (`ref_doc_id`).
+
+        ``add`` upserts nodes with ``MERGE (c:{label} {id: row.id})`` and
+        ``delete`` matches on ``ref_doc_id``; without these indexes each such
+        lookup performs a sequential scan (bulk ingest becomes O(N^2)).
+        """
+        self.create_property_index("id")
+        self.create_property_index("ref_doc_id")
 
     def create_new_index(self) -> None:
         """
@@ -721,8 +739,16 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         conds: List[sql.Composed] = []
         params: Dict[str, Any] = {}
         if node_ids:
-            conds.append(sql.SQL("n.id IN %(node_ids)s"))
-            params["node_ids"] = Jsonb(list(node_ids))
+            # OR-of-equalities rather than ``id IN [...]``: only the equality
+            # form matches the ``id`` btree index (the planner serves it via a
+            # BitmapOr index scan), whereas ``IN`` over a jsonb array always
+            # falls back to a sequential scan.
+            id_terms = []
+            for i, nid in enumerate(node_ids):
+                pname = f"node_id_{i}"
+                params[pname] = Jsonb(nid)
+                id_terms.append(sql.SQL("n.id = %({p})s").format(p=sql.SQL(pname)))
+            conds.append(sql.SQL("(") + sql.SQL(" OR ").join(id_terms) + sql.SQL(")"))
         if filters:
             snippet, fparams = metadata_filters_to_cypher(filters, alias="n")
             conds.append(sql.SQL("(") + snippet + sql.SQL(")"))

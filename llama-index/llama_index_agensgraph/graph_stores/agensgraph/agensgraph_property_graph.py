@@ -380,6 +380,26 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 logger.log(logging.WARNING, """Vector extension not supported\nUnable to install pg_vector extension""")
                 pass
 
+    def create_property_index(self, property_name: str) -> None:
+        """
+        Create a btree property index on ``property_name`` of the base node
+        label.
+
+        A metadata-filtered ``vector_query`` cannot use the HNSW index for the
+        filter, so without a property index the filter degrades to a sequential
+        scan over all embedded nodes. Indexing the keys you filter on lets the
+        planner pre-select matching rows via an index/bitmap scan.
+        """
+        self.structured_query(
+            sql.SQL(
+                "CREATE PROPERTY INDEX IF NOT EXISTS {index_name} ON {label} ({prop})"
+            ).format(
+                index_name=sql.Identifier(f"{BASE_NODE_LABEL}_{property_name}_idx"),
+                label=sql.Identifier(BASE_NODE_LABEL),
+                prop=sql.Identifier(property_name),
+            )
+        )
+
     def refresh_schema(self) -> None:
         """
         Refresh the graph schema information by updating the available
@@ -561,30 +581,46 @@ class AgensPropertyGraphStore(PropertyGraphStore):
     def _build_upsert_relations_ops(
         self, relations: List[Relation]
     ) -> List[Tuple[sql.Composed, Dict[str, Any]]]:
-        """Build the ordered (query, params) operations for ``upsert_relations``."""
-        params = [r.model_dump() for r in relations]
+        """Build the ordered (query, params) operations for ``upsert_relations``.
+
+        Relations are grouped by label and each group is UNWIND-batched in
+        CHUNK_SIZE rows (the relationship type must be a literal in MERGE, so a
+        batch can only span one label). This replaces the previous
+        one-query-per-relation behavior; the batched ``MERGE (n {id: row.id})``
+        is still index-backed.
+        """
+        by_label: Dict[str, List[dict]] = {}
+        for r in relations:
+            d = r.model_dump()
+            by_label.setdefault(d["label"], []).append(d)
+
         ops: List[Tuple[sql.Composed, Dict[str, Any]]] = []
-        for index in range(0, len(params), CHUNK_SIZE):
-            chunked_params = params[index : index + CHUNK_SIZE]
-            for param in chunked_params:
+        for label, rels in by_label.items():
+            for index in range(0, len(rels), CHUNK_SIZE):
+                chunk = rels[index : index + CHUNK_SIZE]
+                rows = [
+                    {
+                        "source_id": p["source_id"],
+                        "target_id": p["target_id"],
+                        "properties": p["properties"],
+                    }
+                    for p in chunk
+                ]
                 ops.append((
                     sql.SQL("""
-                    MERGE (source: {BASE_NODE_LABEL} {{id: %(source_id)s}})
+                    UNWIND %(rows)s AS row
+                    MERGE (source: {BASE_NODE_LABEL} {{id: row.source_id}})
                     ON CREATE SET source.labels = append_label(source.labels, 'Chunk')
-                    MERGE (target: {BASE_NODE_LABEL} {{id: %(target_id)s}})
+                    MERGE (target: {BASE_NODE_LABEL} {{id: row.target_id}})
                     ON CREATE SET target.labels = append_label(target.labels, 'Chunk')
-                    WITH source, target
+                    WITH source, target, row
                     MERGE (source)-[r:{label}]->(target)
-                    SET r += %(properties)s
+                    SET r += row.properties
                     RETURN count(*)
                     """).format(
                         BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL),
-                        label=sql.Identifier(param["label"])
-                    ), {
-                        "source_id": Jsonb(param["source_id"]),
-                        "target_id": Jsonb(param["target_id"]),
-                        "properties": Jsonb(param["properties"])
-                    }
+                        label=sql.Identifier(label),
+                    ), {"rows": Jsonb(rows)}
                 ))
         return ops
 
@@ -612,8 +648,15 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         query += 'MATCH (e:{BASE_NODE_LABEL}) '
         query += "WHERE e.id IS NOT NULL "
         if ids:
-            query += "AND e.id <@ %(ids)s "
-            params["ids"] = Jsonb(ids)
+            # OR-of-equalities rather than ``e.id <@ [...]``: only the equality
+            # form matches the ``unique_id`` btree index (served as a BitmapOr
+            # index scan); the ``<@`` containment operator always seq-scans.
+            id_terms = []
+            for i, _id in enumerate(ids):
+                pname = f"get_id_{i}"
+                params[pname] = Jsonb(_id)
+                id_terms.append(f"e.id = %({pname})s")
+            query += "AND (" + " OR ".join(id_terms) + ") "
 
         if properties:
             prop_params = [f'e."{prop}" = %({prop})s' for prop in properties]

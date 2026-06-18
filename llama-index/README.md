@@ -201,3 +201,31 @@ The stores also provide true-async hot paths backed by `psycopg.AsyncConnection`
 
 These work with or without an `AgensEngine`; with one, they draw from the async
 pool.
+
+## Performance & indexing
+
+The stores are indexed for their hot paths out of the box:
+
+- **Ingest** (`MERGE`-by-`id`) is backed by a btree index on `id`, so bulk
+  `upsert`/`add` stays near-linear rather than O(N²).
+- **Vector search** uses the HNSW index on the embedding.
+- **Lookups by id** (`get` / `get_nodes` / `delete_nodes`) and the vector
+  store's **`delete(ref_doc_id)`** are index-backed.
+- **Relation upserts** are UNWIND-batched per relationship type (not one query
+  per relation).
+
+**Metadata-filtered vector search.** A metadata filter cannot use the HNSW index
+for the filter itself, so a filter on an *un-indexed* property degrades to a
+sequential scan over the embedded nodes. Index the keys you filter on to keep it
+fast:
+
+```python
+# Property graph store
+graph_store.create_property_index("country")
+
+# Vector store
+vector_store.create_property_index("topic")
+```
+
+With the index present, the planner pre-selects matching rows via an index/bitmap
+scan and then ranks them — instead of scanning every node.

@@ -232,6 +232,7 @@ class AgensGraph(GraphStore):
         timeout: Optional[float] = None,
         sanitize: bool = False,
         engine: Optional["AgensEngine"] = None,
+        enhanced_schema: bool = False,
     ) -> None:
         """Create a new Agensgraph Graph instance.
 
@@ -253,6 +254,9 @@ class AgensGraph(GraphStore):
                 connection is still kept for init, schema introspection, and
                 transactional ``add_graph_documents``. When ``None`` the behavior
                 is identical to a single dedicated connection.
+            enhanced_schema: When True, ``refresh_schema`` samples example
+                values per property and includes them in the schema, improving
+                Text2Cypher prompting. Off by default.
         """
 
         self.graph_name = graph_name
@@ -264,6 +268,7 @@ class AgensGraph(GraphStore):
         self.schema_cache_ttl = schema_cache_ttl
         self.timeout = timeout
         self.sanitize = sanitize
+        self.enhanced_schema = enhanced_schema
         self._schema_refreshed_at: float = 0.0
         self._server_version: Optional[Tuple[int, int, int]] = None
         self._has_meta_extension: bool = False
@@ -536,6 +541,9 @@ class AgensGraph(GraphStore):
         edge_properties = self._get_edge_properties()
         triple_schema = self._get_triples()
 
+        if self.enhanced_schema:
+            self._augment_with_examples(node_properties)
+
         # update the formatted string representation
         self.schema = f"""
         Node properties are the following:
@@ -557,6 +565,43 @@ class AgensGraph(GraphStore):
             },
         }
         self._schema_refreshed_at = time.monotonic()
+
+    @require_psycopg
+    def _augment_with_examples(
+        self, node_properties: List[Dict[str, Any]], sample: int = 25, limit: int = 3
+    ) -> None:
+        """Attach example values to each property entry (enhanced schema mode).
+
+        Samples up to ``sample`` nodes per label and records up to ``limit``
+        distinct example values per property for better Text2Cypher prompting.
+        Mutates ``node_properties`` in place.
+        """
+        for entry in node_properties:
+            label = entry.get("labels")
+            props = entry.get("properties") or []
+            if not label or not props:
+                continue
+            try:
+                rows = self.query(
+                    sql.SQL("MATCH (n:{l}) RETURN properties(n) AS p LIMIT %(s)s").format(
+                        l=sql.Identifier(label)
+                    ),
+                    {"s": sample},
+                )
+            except AgensQueryException:
+                continue
+            examples: Dict[str, list] = {}
+            for r in rows:
+                for k, v in (r.get("p") or {}).items():
+                    if v is None:
+                        continue
+                    bucket = examples.setdefault(k, [])
+                    if v not in bucket and len(bucket) < limit:
+                        bucket.append(v)
+            for prop in props:
+                name = prop.get("property")
+                if name in examples:
+                    prop["examples"] = examples[name]
 
     @property
     def get_schema(self) -> str:

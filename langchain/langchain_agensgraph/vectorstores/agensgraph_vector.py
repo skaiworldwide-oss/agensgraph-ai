@@ -7,9 +7,11 @@ from hashlib import md5
 import re, json
 from typing import (
     Any,
+    AsyncIterator,
     Callable,
     Dict,
     Iterable,
+    Iterator,
     List,
     Optional,
     Tuple,
@@ -29,7 +31,13 @@ from langchain_core.embeddings import Embeddings
 from langchain_core.utils import get_from_dict_or_env
 from langchain_core.vectorstores import VectorStore
 
+from contextlib import asynccontextmanager, contextmanager
+from typing import TYPE_CHECKING
+
 from langchain_agensgraph.graphs.agensgraph import AgensGraph, _package_version
+
+if TYPE_CHECKING:
+    from langchain_agensgraph.engine import AgensEngine
 from langchain_agensgraph.vectorstores.utils import (
     DistanceStrategy,
     maximal_marginal_relevance,
@@ -633,6 +641,7 @@ class AgensgraphVector(VectorStore):
         vector_index_am: VectorIndexAM = DEFAULT_VECTOR_INDEX_AM,
         fulltext_index_am: FullTextIndexAM = DEFAULT_FULLTEXT_INDEX_AM,
         graph: Optional[AgensGraph] = None,
+        engine: Optional["AgensEngine"] = None,
     ) -> None:
         # Allow only cosine and euclidean distance strategies
         if distance_strategy not in [
@@ -643,13 +652,23 @@ class AgensgraphVector(VectorStore):
                 "distance_strategy must be either 'EUCLIDEAN_DISTANCE' or 'COSINE'"
             )
 
-        # Graph object takes precedent over env or input params
+        # Resolution order: explicit graph object > engine > url/env.
         if graph:
             self.connection = graph.connection
             self.graph_name = graph.graph_name
             self._graph = graph  # share its async connection too
+            self._engine = graph._engine
             self._url = None
             self._owns_connection = False
+        elif engine is not None:
+            # Dedicated connection for setup/introspection; the pool backs the
+            # concurrent query path.
+            self.graph_name = graph_name
+            self.connection = engine.open_connection(graph_path=graph_name)
+            self._graph = None
+            self._engine = engine
+            self._url = engine.conninfo
+            self._owns_connection = True
         else:
             url = get_from_dict_or_env({"url": url}, "url", "AGENSGRAPH_URL")
 
@@ -660,6 +679,7 @@ class AgensgraphVector(VectorStore):
             )
             self.graph_name = graph_name
             self._graph = None
+            self._engine = None
             self._url = url
             self._owns_connection = True
         self._aconn: Optional[psycopg.AsyncConnection] = None
@@ -1833,6 +1853,24 @@ class AgensgraphVector(VectorStore):
         cursor = self.connection.cursor(row_factory=psycopg.rows.namedtuple_row)
         return cursor
 
+    @contextmanager
+    def _acquire(self) -> "Iterator[psycopg.Connection]":
+        """Yield the connection ``query`` should run on (pooled or dedicated)."""
+        if self._engine is not None and not getattr(self, "_in_transaction", False):
+            with self._engine.connection(graph_path=self.graph_name) as conn:
+                yield conn
+        else:
+            yield self.connection
+
+    @asynccontextmanager
+    async def _aacquire(self) -> "AsyncIterator[psycopg.AsyncConnection]":
+        """Async sibling of :meth:`_acquire`."""
+        if self._engine is not None:
+            async with self._engine.aconnection(graph_path=self.graph_name) as conn:
+                yield conn
+        else:
+            yield await self._aconn_get()
+
     def verify_vector_support(self) -> None:
         """Make sure the pgvector extension is installed in the database.
 
@@ -1926,32 +1964,33 @@ class AgensgraphVector(VectorStore):
 
         # execute the query, rolling back on an error
         in_txn = getattr(self, "_in_transaction", False)
-        with self._get_cursor() as curs:
-            try:
-                curs.execute(query, params)
-                if not in_txn:
-                    self.connection.commit()
-            except psycopg.Error as e:
-                if not in_txn:
-                    self.connection.rollback()
-                raise AgensQueryException(
-                    {
-                        "message": "Error executing graph query: {}".format(query),
-                        "detail": str(e),
-                    }
-                )
-            try:
-                data = curs.fetchall()
-            except psycopg.ProgrammingError:
-                data = []  # Handle queries that don’t return data
+        with self._acquire() as conn:
+            with conn.cursor(row_factory=psycopg.rows.namedtuple_row) as curs:
+                try:
+                    curs.execute(query, params)
+                    if not in_txn:
+                        conn.commit()
+                except psycopg.Error as e:
+                    if not in_txn:
+                        conn.rollback()
+                    raise AgensQueryException(
+                        {
+                            "message": "Error executing graph query: {}".format(query),
+                            "detail": str(e),
+                        }
+                    )
+                try:
+                    data = curs.fetchall()
+                except psycopg.ProgrammingError:
+                    data = []  # Handle queries that don’t return data
 
-            if data is None:
-                result = []
-            # convert to dictionaries
-            else:
-                result = [self._record_to_dict(d) for d in data]
+                if data is None:
+                    result = []
+                # convert to dictionaries
+                else:
+                    result = [self._record_to_dict(d) for d in data]
 
-            return result
+                return result
 
     # ----- v0.2.0: VectorStore parity (delete / get_by_ids / etc.) -----
 
@@ -2028,25 +2067,25 @@ class AgensgraphVector(VectorStore):
     async def aquery(
         self, query: Any, params: dict = {}
     ) -> List[Dict[str, Any]]:
-        """Async sibling of :meth:`query`."""
-        conn = await self._aconn_get()
-        async with conn.cursor(row_factory=psycopg.rows.namedtuple_row) as cur:
-            try:
-                await cur.execute(query, params)
-                await conn.commit()
-            except psycopg.Error as e:
-                await conn.rollback()
-                raise AgensQueryException(
-                    {
-                        "message": "Error executing graph query: {}".format(query),
-                        "detail": str(e),
-                    }
-                )
-            try:
-                data = await cur.fetchall()
-            except psycopg.ProgrammingError:
-                data = []
-            return [self._record_to_dict(d) for d in (data or [])]
+        """Async sibling of :meth:`query` (pooled when an engine is configured)."""
+        async with self._aacquire() as conn:
+            async with conn.cursor(row_factory=psycopg.rows.namedtuple_row) as cur:
+                try:
+                    await cur.execute(query, params)
+                    await conn.commit()
+                except psycopg.Error as e:
+                    await conn.rollback()
+                    raise AgensQueryException(
+                        {
+                            "message": "Error executing graph query: {}".format(query),
+                            "detail": str(e),
+                        }
+                    )
+                try:
+                    data = await cur.fetchall()
+                except psycopg.ProgrammingError:
+                    data = []
+                return [self._record_to_dict(d) for d in (data or [])]
 
     async def aadd_embeddings(
         self,

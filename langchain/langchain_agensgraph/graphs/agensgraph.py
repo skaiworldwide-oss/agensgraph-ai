@@ -19,8 +19,24 @@ from __future__ import annotations
 import json
 import re
 import time
+from contextlib import asynccontextmanager, contextmanager
 from hashlib import md5
-from typing import Any, Dict, List, NamedTuple, Optional, Pattern, Tuple, Union
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    AsyncIterator,
+    Dict,
+    Iterator,
+    List,
+    NamedTuple,
+    Optional,
+    Pattern,
+    Tuple,
+    Union,
+)
+
+if TYPE_CHECKING:
+    from langchain_agensgraph.engine import AgensEngine
 
 from langchain_agensgraph.graphs.graph_document import GraphDocument
 from langchain_agensgraph.graphs.graph_store import GraphStore
@@ -215,6 +231,7 @@ class AgensGraph(GraphStore):
         schema_cache_ttl: float = 0.0,
         timeout: Optional[float] = None,
         sanitize: bool = False,
+        engine: Optional["AgensEngine"] = None,
     ) -> None:
         """Create a new Agensgraph Graph instance.
 
@@ -230,9 +247,16 @@ class AgensGraph(GraphStore):
             sanitize: When True, list-valued result properties longer than
                 ``LIST_LIMIT`` (128) are stripped from query results so large
                 arrays (e.g. embeddings) do not flood an LLM context.
+            engine: Optional :class:`~langchain_agensgraph.engine.AgensEngine`.
+                When provided, ``query``/``aquery`` borrow pooled connections so
+                concurrent callers don't serialize on one connection. A dedicated
+                connection is still kept for init, schema introspection, and
+                transactional ``add_graph_documents``. When ``None`` the behavior
+                is identical to a single dedicated connection.
         """
 
         self.graph_name = graph_name
+        self._engine = engine
         # Keep the conf for lazy async-connection creation (see ``_aconn_get``).
         # Tag the connection so it is identifiable in pg_stat_activity.
         self._conf = _with_application_name(conf)
@@ -354,6 +378,30 @@ class AgensGraph(GraphStore):
     def _get_cursor(self) -> psycopg.Cursor:
         cursor = self.connection.cursor(row_factory=psycopg.rows.namedtuple_row)
         return cursor
+
+    @contextmanager
+    def _acquire(self) -> "Iterator[psycopg.Connection]":
+        """Yield the connection ``query`` should run on.
+
+        Uses a pooled connection from the engine when one is configured and we
+        are not inside a wrapping transaction (``add_graph_documents``); falls
+        back to the dedicated connection otherwise. The fallback path is
+        byte-for-byte the pre-engine behavior.
+        """
+        if self._engine is not None and not getattr(self, "_in_transaction", False):
+            with self._engine.connection(graph_path=self.graph_name) as conn:
+                yield conn
+        else:
+            yield self.connection
+
+    @asynccontextmanager
+    async def _aacquire(self) -> "AsyncIterator[psycopg.AsyncConnection]":
+        """Async sibling of :meth:`_acquire`."""
+        if self._engine is not None:
+            async with self._engine.aconnection(graph_path=self.graph_name) as conn:
+                yield conn
+        else:
+            yield await self._aconn_get()
 
     @require_psycopg
     def _get_triples(self) -> List[Dict[str, str]]:
@@ -605,42 +653,43 @@ class AgensGraph(GraphStore):
         # execute the query, rolling back on an error
         in_txn = getattr(self, "_in_transaction", False)
         effective_timeout = timeout if timeout is not None else self.timeout
-        with self._get_cursor() as curs:
-            try:
-                if effective_timeout is not None:
-                    # SET LOCAL is scoped to the current (implicit) transaction
-                    # and auto-resets on commit/rollback.
-                    curs.execute(
-                        "SET LOCAL statement_timeout = %s",
-                        (int(effective_timeout * 1000),),
+        with self._acquire() as conn:
+            with conn.cursor(row_factory=psycopg.rows.namedtuple_row) as curs:
+                try:
+                    if effective_timeout is not None:
+                        # SET LOCAL is scoped to the current (implicit) transaction
+                        # and auto-resets on commit/rollback.
+                        curs.execute(
+                            "SET LOCAL statement_timeout = %s",
+                            (int(effective_timeout * 1000),),
+                        )
+                    curs.execute(query, params)
+                    if not in_txn:
+                        conn.commit()
+                except psycopg.Error as e:
+                    if not in_txn:
+                        conn.rollback()
+                    raise AgensQueryException(
+                        {
+                            "message": "Error executing graph query: {}".format(query),
+                            "detail": str(e),
+                        }
                     )
-                curs.execute(query, params)
-                if not in_txn:
-                    self.connection.commit()
-            except psycopg.Error as e:
-                if not in_txn:
-                    self.connection.rollback()
-                raise AgensQueryException(
-                    {
-                        "message": "Error executing graph query: {}".format(query),
-                        "detail": str(e),
-                    }
-                )
-            try:
-                data = curs.fetchall()
-            except psycopg.ProgrammingError:
-                data = []  # Handle queries that don’t return data
+                try:
+                    data = curs.fetchall()
+                except psycopg.ProgrammingError:
+                    data = []  # Handle queries that don’t return data
 
-            if data is None:
-                result = []
-            # convert to dictionaries
-            else:
-                result = [self._record_to_dict(d) for d in data]
+                if data is None:
+                    result = []
+                # convert to dictionaries
+                else:
+                    result = [self._record_to_dict(d) for d in data]
 
-            if self.sanitize:
-                result = [_sanitize_value(row) for row in result]
+                if self.sanitize:
+                    result = [_sanitize_value(row) for row in result]
 
-            return result
+                return result
 
     # ---------- v0.2.0: async surface ----------
 
@@ -662,27 +711,40 @@ class AgensGraph(GraphStore):
         return self._aconn
 
     async def aquery(
-        self, query: str, params: dict = {}
+        self, query: str, params: dict = {}, timeout: Optional[float] = None
     ) -> List[Dict[str, Any]]:
-        """Async sibling of :meth:`query` using a dedicated ``AsyncConnection``."""
-        conn = await self._aconn_get()
-        async with conn.cursor(row_factory=psycopg.rows.namedtuple_row) as cur:
-            try:
-                await cur.execute(query, params)
-                await conn.commit()
-            except psycopg.Error as e:
-                await conn.rollback()
-                raise AgensQueryException(
-                    {
-                        "message": "Error executing graph query: {}".format(query),
-                        "detail": str(e),
-                    }
-                )
-            try:
-                data = await cur.fetchall()
-            except psycopg.ProgrammingError:
-                data = []
-            return [self._record_to_dict(d) for d in (data or [])]
+        """Async sibling of :meth:`query`.
+
+        Uses a pooled connection when an engine is configured, otherwise a
+        dedicated lazily-opened ``AsyncConnection``.
+        """
+        effective_timeout = timeout if timeout is not None else self.timeout
+        async with self._aacquire() as conn:
+            async with conn.cursor(row_factory=psycopg.rows.namedtuple_row) as cur:
+                try:
+                    if effective_timeout is not None:
+                        await cur.execute(
+                            "SET LOCAL statement_timeout = %s",
+                            (int(effective_timeout * 1000),),
+                        )
+                    await cur.execute(query, params)
+                    await conn.commit()
+                except psycopg.Error as e:
+                    await conn.rollback()
+                    raise AgensQueryException(
+                        {
+                            "message": "Error executing graph query: {}".format(query),
+                            "detail": str(e),
+                        }
+                    )
+                try:
+                    data = await cur.fetchall()
+                except psycopg.ProgrammingError:
+                    data = []
+                result = [self._record_to_dict(d) for d in (data or [])]
+                if self.sanitize:
+                    result = [_sanitize_value(row) for row in result]
+                return result
 
     async def aclose(self) -> None:
         """Close the async connection (if any). Safe to call multiple times."""

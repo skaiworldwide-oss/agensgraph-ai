@@ -1,15 +1,28 @@
-import asyncio
-import inspect
-import re, json
-import os
-import sys
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
-from typing import Any, Dict, List, NamedTuple, Optional, Union, final
-import pipmaster as pm
-from lightrag.types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
-from typing import Any, List, Dict, Optional, Tuple, NamedTuple, Pattern
+"""
+Copyright (c) 2025, SKAI Worldwide Co., Ltd.
 
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+"""
+
+import inspect
+import os
+import re
+import sys
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple, final
+
+from psycopg import sql
+from psycopg.types.json import Jsonb
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -17,119 +30,76 @@ from tenacity import (
     wait_exponential,
 )
 
-from lightrag.utils import logger
 from lightrag.base import BaseGraphStorage
+from lightrag.types import KnowledgeGraph, KnowledgeGraphEdge, KnowledgeGraphNode
+from lightrag.utils import logger
+
 try:
     from lightrag.constants import GRAPH_FIELD_SEP
 except ImportError:
     from lightrag.prompt import GRAPH_FIELD_SEP
 
+from lightrag_agensgraph.kg._base import AgensgraphQueryException, _AgensStorageBase
+
 if sys.platform.startswith("win"):
-    import asyncio.windows_events
+    import asyncio
 
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-import psycopg
-from psycopg import sql
-from psycopg.types.json import Jsonb
-from psycopg.rows import namedtuple_row
-from psycopg_pool import AsyncConnectionPool, PoolTimeout
+# Max rows per UNWIND / OR-of-equalities batch.
+CHUNK_SIZE = 1000
 
-class AgensgraphQueryException(Exception):
-    """Exception for the Agensgraph queries."""
 
-    def __init__(self, exception: Union[str, Dict]) -> None:
-        if isinstance(exception, dict):
-            self.message = exception["message"] if "message" in exception else "unknown"
-            self.details = exception["details"] if "details" in exception else "unknown"
-        else:
-            self.message = exception
-            self.details = "unknown"
+def _or_equalities(
+    field: str, values: List[str], prefix: str
+) -> Tuple[str, Dict[str, Any]]:
+    """Build an index-friendly ``(field = v0 OR field = v1 ...)`` fragment.
 
-    def get_message(self) -> str:
-        return self.message
-
-    def get_details(self) -> Any:
-        return self.details
+    Only OR-of-equalities uses the ``entity_id`` btree index; ``IN`` / ``<@`` /
+    UNWIND-variable lookups fall back to a sequential scan.
+    """
+    terms = []
+    params: Dict[str, Any] = {}
+    for i, value in enumerate(values):
+        pname = f"{prefix}_{i}"
+        params[pname] = Jsonb(value)
+        terms.append(f"{field} = %({pname})s")
+    return "(" + " OR ".join(terms) + ")", params
 
 
 @final
 @dataclass
-class AgensgraphStorage(BaseGraphStorage):
-    vertex_regex: Pattern = re.compile(r"(\w+)\[(\d+\.\d+)\](\{.*\})")
-    edge_regex: Pattern = re.compile(r"(\w+)\[(\d+\.\d+)\]\[(\d+\.\d+),\s*(\d+\.\d+)\](\{.*\})")
-
+class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
     @staticmethod
     def load_nx_graph(file_name):
         print("no preloading of graph with Agensgraph in production")
 
-    def __init__(self, namespace, global_config, embedding_func):
-        super().__init__(
-            namespace=namespace,
-            global_config=global_config,
-            embedding_func=embedding_func,
+    def __post_init__(self):
+        # Preserve the original semantics: the graph name comes from the
+        # storage namespace, falling back to AGENSGRAPH_GRAPHNAME. (Relational
+        # stores isolate tenants by `workspace`; the graph store by graph name.)
+        self.graph_name = self.namespace or os.environ.get(
+            "AGENSGRAPH_GRAPHNAME", "lightrag"
         )
-        self._driver = None
-        self._driver_lock = asyncio.Lock()
-        DB = os.environ["AGENSGRAPH_DB"]
-        USER = os.environ["AGENSGRAPH_USER"]
-        PASSWORD = os.environ["AGENSGRAPH_PASSWORD"]
-        HOST = os.environ.get("AGENSGRAPH_HOST", "localhost")
-        PORT = os.environ.get("AGENSGRAPH_PORT", "5432")
-        self.graph_name = namespace or os.environ.get("AGENSGRAPH_GRAPHNAME", "lightrag")
-
-        connection_string = f"dbname='{DB}' user='{USER}' password='{PASSWORD}' host='{HOST}' port={PORT}"
-
-        self._driver = AsyncConnectionPool(connection_string, open=False)
-
-        return None
+        self._graph_path = self.graph_name
+        self._engine = None
 
     async def initialize(self):
-        """
-        Initialize the Agensgraph storage by creating a connection pool.
-        """
-        if self._driver is None:
-            raise AgensgraphQueryException("Agensgraph driver is not initialized")
+        """Acquire the shared engine and bootstrap the graph (once)."""
+        await self._acquire_engine()
 
-        # create graph and set graph_path
-        async with self._driver_lock:
-            try:
-                await self._driver.open()
-            except psycopg.errors.InvalidSchemaName as e:
-                raise AgensgraphQueryException(
-                    f"Failed to open connection to Agensgraph: {str(e)}"
-                ) from e
+        async def _ddl(cur):
+            await cur.execute("CREATE VLABEL IF NOT EXISTS base")
+            await cur.execute('CREATE ELABEL IF NOT EXISTS "DIRECTED"')
+            await cur.execute(
+                "CREATE PROPERTY INDEX IF NOT EXISTS base_entity_idx ON base (entity_id)"
+            )
 
-        async with self._get_pool_connection() as conn:
-            async with conn.cursor() as curs:
-                try:
-                    await curs.execute(sql.SQL("CREATE GRAPH IF NOT EXISTS {}").format(sql.Identifier(self.graph_name)))
-                    await curs.execute(sql.SQL("SET graph_path = {}").format(sql.Identifier(self.graph_name)))
-                    await curs.execute('CREATE VLABEL IF NOT EXISTS base')
-                    await curs.execute('CREATE ELABEL IF NOT EXISTS "DIRECTED"')
-                    await curs.execute('CREATE PROPERTY INDEX IF NOT EXISTS base_entity_idx ON base (entity_id)')
-                    await conn.commit()
-                except (
-                    psycopg.errors.InvalidSchemaName,
-                    psycopg.errors.UniqueViolation,
-                ):
-                    await conn.rollback()
-                    logger.warning(
-                        f"Graph {self.graph_name} already exists or could not be created."
-                    )
-                except psycopg.Error as e:
-                    await conn.rollback()
-                    raise AgensgraphQueryException(
-                        f"Error initializing graph {self.graph_name}: {str(e)}"
-                    ) from e
-            
-        logger.info(f"Agensgraph storage initialized for graph: {self.graph_name}")
+        await self._engine.ensure_graph(self.graph_name, _ddl)
+        logger.info(f"AgensGraph storage initialized for graph: {self.graph_name}")
 
     async def finalize(self):
-        """Close the Agensgraph driver and release all resources"""
-        if self._driver:
-            await self._driver.close()
-            self._driver = None
+        await self._release_engine()
 
     async def __aexit__(self, exc_type, exc, tb):
         await self.finalize()
@@ -155,15 +125,9 @@ class AgensgraphStorage(BaseGraphStorage):
                 MATCH (n:base {entity_id: %(node_id)s})
                 RETURN true AS node_exists LIMIT 1
                 """
-        single_result = (await self._query(query, {"node_id": Jsonb(node_id)}))[0]
-        logger.debug(
-            "{%s}:query:{%s}:result:{%s}",
-            inspect.currentframe().f_code.co_name,
-            query,
-            single_result["node_exists"],
-        )
-
-        return single_result["node_exists"]
+        records = await self._query(query, {"node_id": Jsonb(node_id)})
+        # No row is returned when the node does not exist.
+        return bool(records and records[0]["node_exists"])
 
     async def has_edge(self, source_node_id: str, target_node_id: str) -> bool:
         """
@@ -183,17 +147,12 @@ class AgensgraphStorage(BaseGraphStorage):
                 MATCH (a:base {entity_id: %(source_node_id)s})-[r]-(b:base {entity_id: %(target_node_id)s})
                 RETURN true AS "edgeExists" LIMIT 1
                 """
-        single_result = (await self._query(query, {
+        records = await self._query(query, {
             "source_node_id": Jsonb(source_node_id),
             "target_node_id": Jsonb(target_node_id),
-        }))[0]
-        logger.debug(
-            "{%s}:query:{%s}:result:{%s}",
-            inspect.currentframe().f_code.co_name,
-            query,
-            single_result["edgeExists"],
-        )
-        return single_result["edgeExists"]
+        })
+        # No row is returned when the edge does not exist.
+        return bool(records and records[0]["edgeExists"])
 
     async def get_node(self, node_id: str) -> dict[str, str] | None:
         """Get node by its label identifier, return only node properties
@@ -744,113 +703,113 @@ class AgensgraphStorage(BaseGraphStorage):
         self, node_label: str, max_depth: int = 3, max_nodes: int = 1000
     ) -> KnowledgeGraph:
         """
-        Retrieve a connected subgraph of nodes where the label includes the specified `node_label`.
+        Retrieve a connected subgraph as a KnowledgeGraph.
+
+        For ``*`` the densest ``max_nodes`` nodes (by degree) and the edges among
+        them are fetched in two queries. For a specific label a bounded BFS
+        expands one frontier per depth (one query per level, via OR-of-equalities)
+        instead of one query per node.
 
         Args:
-            node_label: Label of the starting node, * means all nodes
-            max_depth: Maximum depth of the subgraph, Defaults to 3
-            max_nodes: Maximum nodes to return by BFS, Defaults to 1000
+            node_label: Label of the starting node, ``*`` means all nodes
+            max_depth: Maximum BFS depth (Defaults to 3)
+            max_nodes: Maximum nodes to return (Defaults to 1000)
 
         Returns:
-            KnowledgeGraph object containing nodes and edges, with an is_truncated flag
-            indicating whether the graph was truncated due to max_nodes limit
+            KnowledgeGraph with an ``is_truncated`` flag set when the node limit
+            was hit.
         """
-        from collections import deque
-
         result = KnowledgeGraph()
-        visited_nodes = set()
-        visited_edges = set()
-        visited_edge_pairs = set()
-        queue = deque()
+        nodes_by_id: Dict[str, KnowledgeGraphNode] = {}
+        edges_by_id: Dict[str, KnowledgeGraphEdge] = {}
 
-        # Step 1: Get starting nodes
-        if node_label == "*":
-            query = """
-                    MATCH (n:base)
-                    RETURN DISTINCT id(n) AS node_id, n
-                    LIMIT %(max_nodes)s
-                    """
-            node_results = await self._query(query, {"max_nodes": max_nodes})
-        else:
-            query = """
-                    MATCH (n:base {entity_id: %(node_label)s})
-                    RETURN id(n) AS node_id, n
-                    """
-            node_results = await self._query(query, {"node_label": Jsonb(node_label)})
+        def _add_node(props) -> Tuple[Optional[str], bool]:
+            eid = props.get("entity_id") if props else None
+            if eid is None:
+                return None, False
+            kid = str(eid)
+            is_new = kid not in nodes_by_id
+            if is_new:
+                nodes_by_id[kid] = KnowledgeGraphNode(
+                    id=kid, labels=[eid], properties=props
+                )
+            return kid, is_new
 
-        for record in node_results:
-            node_data = record["n"]
-            if not node_data.get("entity_id"):
-                continue
-            start_node = KnowledgeGraphNode(
-                id=str(node_data["entity_id"]),
-                labels=[node_data["entity_id"]],
-                properties=node_data,
+        def _add_edge(eid, rel_type, source, target, props) -> None:
+            key = str(eid)
+            s, t = str(source), str(target)
+            if key in edges_by_id or s not in nodes_by_id or t not in nodes_by_id:
+                return
+            edges_by_id[key] = KnowledgeGraphEdge(
+                id=key, type=rel_type, source=s, target=t, properties=props or {}
             )
-            queue.append((start_node, None, 0))
 
-        # Step 2: BFS traversal
-        while queue and len(visited_nodes) < max_nodes:
-            current_node, current_edge, current_depth = queue.popleft()
-
-            if current_node.id in visited_nodes or current_depth > max_depth:
-                continue
-
-            result.nodes.append(current_node)
-            visited_nodes.add(current_node.id)
-
-            if current_edge and current_edge.id not in visited_edges:
-                result.edges.append(current_edge)
-                visited_edges.add(current_edge.id)
-
-            if len(visited_nodes) >= max_nodes:
-                result.is_truncated = True
-                break
-
-            # Step 3: Query neighbors
-            query = """
-            MATCH (a:base {entity_id: %(current_node_id)s})-[r]-(b:base)
-            RETURN type(r) as rel_type, properties(r) as r, b, id(r) AS edge_id, id(b) AS target_id
-            """
-            records = await self._query(query, {"current_node_id": Jsonb(current_node.id)})
-
-            for record in records:
-                rel_type = record["rel_type"]
-                rel = record["r"]
-                b_node = record["b"]
-                edge_id = str(record["edge_id"])
-                target_id = b_node.get("entity_id")
-
-                if not target_id:
-                    continue
-
-                target_node = KnowledgeGraphNode(
-                    id=str(target_id),
-                    labels=[target_id],
-                    properties=b_node,
+        if node_label == "*":
+            total = (
+                await self._query(
+                    "MATCH (n:base) WHERE n.entity_id IS NOT NULL RETURN count(n) AS c"
                 )
-
-                target_edge = KnowledgeGraphEdge(
-                    id=edge_id,
-                    type=rel_type,
-                    source=current_node.id,
-                    target=target_id,
-                    properties=rel,
+            )[0]["c"]
+            rows = await self._query(
+                """
+                MATCH (n:base) WHERE n.entity_id IS NOT NULL
+                OPTIONAL MATCH (n)-[r]-()
+                WITH n, count(r) AS deg
+                ORDER BY deg DESC
+                LIMIT %(limit)s
+                RETURN n
+                """,
+                {"limit": max_nodes},
+            )
+            for r in rows:
+                _add_node(r["n"])
+            result.is_truncated = int(total) > max_nodes
+            if nodes_by_id:
+                erows = await self._query(
+                    """
+                    MATCH (a:base)-[r]-(b:base)
+                    WHERE a.entity_id IS NOT NULL AND b.entity_id IS NOT NULL
+                    RETURN id(r) AS eid, type(r) AS rt, a.entity_id AS s,
+                           b.entity_id AS t, properties(r) AS props
+                    """
                 )
+                for er in erows:
+                    _add_edge(er["eid"], er["rt"], er["s"], er["t"], er["props"])
+        else:
+            seed = await self._query(
+                "MATCH (n:base {entity_id: %(label)s}) RETURN n",
+                {"label": Jsonb(node_label)},
+            )
+            for r in seed:
+                _add_node(r["n"])
+            frontier = list(nodes_by_id.keys())
+            depth = 0
+            while frontier and depth < max_depth and len(nodes_by_id) < max_nodes:
+                frag, params = _or_equalities("a.entity_id", frontier, "kg")
+                rows = await self._query(
+                    f"""
+                    MATCH (a:base)-[r]-(b:base)
+                    WHERE {frag} AND b.entity_id IS NOT NULL
+                    RETURN id(r) AS eid, type(r) AS rt, a.entity_id AS s,
+                           b.entity_id AS t, b, properties(r) AS props
+                    """,
+                    params,
+                )
+                next_frontier: List[str] = []
+                for r in rows:
+                    if len(nodes_by_id) >= max_nodes:
+                        result.is_truncated = True
+                        break
+                    bid, is_new = _add_node(r["b"])
+                    if bid is not None and is_new:
+                        next_frontier.append(bid)
+                for r in rows:
+                    _add_edge(r["eid"], r["rt"], r["s"], r["t"], r["props"])
+                frontier = next_frontier
+                depth += 1
 
-                sorted_pair = tuple(sorted([current_node.id, target_id]))
-                if sorted_pair not in visited_edge_pairs:
-                    if (
-                        target_id in visited_nodes or
-                        (target_id not in visited_nodes and current_depth < max_depth)
-                    ):
-                        result.edges.append(target_edge)
-                        visited_edges.add(edge_id)
-                        visited_edge_pairs.add(sorted_pair)
-
-                if target_id not in visited_nodes and current_depth < max_depth:
-                    queue.append((target_node, None, current_depth + 1))
-
+        result.nodes = list(nodes_by_id.values())
+        result.edges = list(edges_by_id.values())
         return result
 
     async def get_all_labels(self) -> list[str]:
@@ -904,13 +863,19 @@ class AgensgraphStorage(BaseGraphStorage):
         retry=retry_if_exception_type((AgensgraphQueryException,)),
     )
     async def remove_nodes(self, nodes: list[str]):
-        """Delete multiple nodes
+        """Delete multiple nodes in chunked, index-backed batches.
 
         Args:
-            nodes: List of node labels to be deleted
+            nodes: List of node entity_ids to delete
         """
-        for node in nodes:
-            await self.delete_node(node)
+        if not nodes:
+            return
+        for start in range(0, len(nodes), CHUNK_SIZE):
+            chunk = nodes[start : start + CHUNK_SIZE]
+            frag, params = _or_equalities("n.entity_id", chunk, "rm")
+            await self._query(
+                f"MATCH (n:base) WHERE {frag} DETACH DELETE n", params
+            )
 
     @retry(
         stop=stop_after_attempt(3),
@@ -918,27 +883,25 @@ class AgensgraphStorage(BaseGraphStorage):
         retry=retry_if_exception_type((AgensgraphQueryException,)),
     )
     async def remove_edges(self, edges: list[tuple[str, str]]):
-        """Delete multiple edges
+        """Delete multiple edges in chunked, index-backed batches.
 
         Args:
             edges: List of edges to be deleted, each edge is a (source, target) tuple
         """
-        for source, target in edges:
-            query = """
-                    MATCH (source:base {entity_id: %(source)s})-[r]-(target:base {entity_id: %(target)s})
-                    DELETE r
-                    """
-            try:
-                await self._query(query, {
-                    "source": Jsonb(source),
-                    "target": Jsonb(target),
-                })
-                logger.debug(
-                    f"Deleted edge from '{self.escape_str(source)}' to '{self.escape_str(target)}'"
-                )
-            except Exception as e:
-                logger.error(f"Error during edge deletion: {str(e)}")
-                raise
+        if not edges:
+            return
+        for start in range(0, len(edges), CHUNK_SIZE):
+            chunk = edges[start : start + CHUNK_SIZE]
+            terms = []
+            params: Dict[str, Any] = {}
+            for i, (source, target) in enumerate(chunk):
+                params[f"s_{i}"] = Jsonb(source)
+                params[f"t_{i}"] = Jsonb(target)
+                terms.append(f"(a.entity_id = %(s_{i})s AND b.entity_id = %(t_{i})s)")
+            where = " OR ".join(terms)
+            await self._query(
+                f"MATCH (a:base)-[r]-(b:base) WHERE {where} DELETE r", params
+            )
 
     async def drop(self) -> dict[str, str]:
         """Drop the storage by removing all nodes and relationships in the graph.
@@ -959,117 +922,118 @@ class AgensgraphStorage(BaseGraphStorage):
             return {"status": "error", "message": str(e)}
 
     @staticmethod
-    def _record_to_dict(record: NamedTuple) -> Dict[str, Any]:
-        """
-        Convert a record returned from an agensgraph query to a dictionary
-
-        Args:
-            record (): a record from an agensgraph query result
-
-        Returns:
-            Dict[str, Any]: a dictionary representation of the record where
-                the dictionary key is the field name and the value is the
-                value converted to a python type
-        """
-        # result holder
-        d = {}
-
-        # prebuild a mapping of vertex_id to vertex mappings to be used
-        # later to build edges
-        vertices = {}
-        for k in record._fields:
-            v = getattr(record, k)
-
-            # records comes back label[id]{properties} which must be parsed
-            if isinstance(v, str):
-                vertex = AgensgraphStorage.vertex_regex.match(v)
-                if vertex:
-                    label, vertex_id, properties = vertex.groups()
-                    properties = json.loads(properties)
-                    vertices[str(vertex_id)] = properties
-
-        # iterate returned fields and parse appropriately
-        for k in record._fields:
-            v = getattr(record, k)
-
-            if isinstance(v, str):
-                vertex = AgensgraphStorage.vertex_regex.match(v)
-                edge = AgensgraphStorage.edge_regex.match(v)
-
-                if vertex:
-                    d[k] = json.loads(vertex.group(3))
-                elif edge:
-                    elabel, edge_id, start_id, end_id, properties = edge.groups()
-                    d[k] = (
-                        vertices.get(start_id, {}),
-                        elabel,
-                        vertices.get(end_id, {}),
-                    )
-                else:
-                    d[k] = v
-
-            else:
-                d[k] = v
-
-        return d
-
-    @staticmethod
     def escape_str(val: str) -> str:
         return val.replace("'", "''").replace("\\", "\\\\").replace('"', '\\"')
 
-    async def _query(self, query: str, params: Dict = {}) -> List[Dict[str, Any]]:
-        """
-        Query the graph by taking a cypher query, converting it to an
-        age compatible query, executing it and converting the result
+    async def get_all_nodes(self) -> list[dict]:
+        """Return the property dict of every node."""
+        rows = await self._query(
+            "MATCH (n:base) WHERE n.entity_id IS NOT NULL RETURN n"
+        )
+        return [r["n"] for r in rows]
 
-        Args:
-            query (str): a cypher query to be executed
-            params (dict): parameters for the query
+    async def get_all_edges(self) -> list[dict]:
+        """Return every edge once as {source, target, **properties}."""
+        rows = await self._query(
+            """
+            MATCH (a:base)-[r]-(b:base)
+            WHERE a.entity_id IS NOT NULL AND b.entity_id IS NOT NULL
+            RETURN id(r) AS eid, a.entity_id AS source, b.entity_id AS target,
+                   properties(r) AS properties
+            """
+        )
+        edges: list[dict] = []
+        seen: set = set()
+        for r in rows:
+            # Undirected traversal yields each physical edge twice; dedupe by id.
+            if r["eid"] in seen:
+                continue
+            seen.add(r["eid"])
+            props = dict(r["properties"] or {})
+            props["source"] = r["source"]
+            props["target"] = r["target"]
+            edges.append(props)
+        return edges
 
-        Returns:
-            List[Dict[str, Any]]: a list of dictionaries containing the result set
-        """
-        await self._driver.open()
+    async def get_popular_labels(self, limit: int = 300) -> list[str]:
+        """Return entity labels ordered by degree (most-connected first)."""
+        rows = await self._query(
+            """
+            MATCH (n:base) WHERE n.entity_id IS NOT NULL
+            OPTIONAL MATCH (n)-[r]-()
+            WITH n.entity_id AS label, count(r) AS deg
+            ORDER BY deg DESC, label ASC
+            LIMIT %(limit)s
+            RETURN collect(label) AS labels
+            """,
+            {"limit": limit},
+        )
+        return rows[0]["labels"] if rows else []
 
-        # execute the query, rolling back on an error
-        async with self._get_pool_connection() as conn:
-            async with conn.cursor(row_factory=namedtuple_row) as curs:
-                try:
-                    await curs.execute(sql.SQL("SET graph_path = {}").format(sql.Identifier(self.graph_name)))
-                    await curs.execute(query, params)
-                    await conn.commit()
-                except psycopg.Error as e:
-                    await conn.rollback()
-                    raise AgensgraphQueryException(
-                        {
-                            "message": f"Error executing graph query: {query}",
-                            "detail": str(e),
-                        }
-                    ) from e
-                try:
-                    data = await curs.fetchall()
-                except psycopg.ProgrammingError:
-                    data = []  # Handle queries that don’t return data
-                if data is None:
-                    result = []
-                # decode records
-                else:
-                    result = [AgensgraphStorage._record_to_dict(d) for d in data]
+    async def search_labels(self, query: str, limit: int = 50) -> list[str]:
+        """Case-insensitive substring search over entity labels."""
+        pattern = "(?i).*" + re.escape(query) + ".*"
+        rows = await self._query(
+            """
+            MATCH (n:base) WHERE n.entity_id IS NOT NULL AND n.entity_id =~ %(pattern)s
+            WITH n.entity_id AS label
+            ORDER BY label ASC
+            LIMIT %(limit)s
+            RETURN collect(label) AS labels
+            """,
+            {"pattern": Jsonb(pattern), "limit": limit},
+        )
+        return rows[0]["labels"] if rows else []
 
-                return result
+    async def has_nodes_batch(self, node_ids: list[str]) -> set[str]:
+        """Return the subset of node_ids that exist."""
+        if not node_ids:
+            return set()
+        rows = await self._query(
+            """
+            UNWIND %(node_ids)s AS id
+            MATCH (n:base {entity_id: id})
+            RETURN n.entity_id AS entity_id
+            """,
+            {"node_ids": Jsonb(node_ids)},
+        )
+        return {r["entity_id"] for r in rows}
 
-    @asynccontextmanager
-    async def _get_pool_connection(self, timeout: Optional[float] = None):
-        """Workaround for a psycopg_pool bug"""
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type((AgensgraphQueryException,)),
+    )
+    async def upsert_nodes_batch(self, nodes: list[tuple[str, dict[str, str]]]) -> None:
+        """Upsert many nodes in UNWIND-batched MERGEs (index-backed)."""
+        rows = [{"id": node_id, "props": data} for node_id, data in nodes]
+        query = """
+            UNWIND %(rows)s AS row
+            MERGE (n:base {entity_id: row.id})
+            SET n += row.props
+            """
+        for start in range(0, len(rows), CHUNK_SIZE):
+            await self._query(query, {"rows": Jsonb(rows[start : start + CHUNK_SIZE])})
 
-        try:
-            connection = await self._driver.getconn(timeout=timeout)
-        except PoolTimeout:
-            await self._driver._add_connection(None)  # workaround...
-            connection = await self._driver.getconn(timeout=timeout)
-
-        try:
-            async with connection:
-                yield connection
-        finally:
-            await self._driver.putconn(connection)
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=4, max=10),
+        retry=retry_if_exception_type((AgensgraphQueryException,)),
+    )
+    async def upsert_edges_batch(
+        self, edges: list[tuple[str, str, dict[str, str]]]
+    ) -> None:
+        """Upsert many edges in one UNWIND-batched MERGE per chunk."""
+        rows = [
+            {"source_id": src, "target_id": tgt, "props": data}
+            for src, tgt, data in edges
+        ]
+        query = """
+            UNWIND %(rows)s AS row
+            MATCH (source:base {entity_id: row.source_id})
+            MATCH (target:base {entity_id: row.target_id})
+            MERGE (source)-[r:"DIRECTED"]-(target)
+            SET r += row.props
+            """
+        for start in range(0, len(rows), CHUNK_SIZE):
+            await self._query(query, {"rows": Jsonb(rows[start : start + CHUNK_SIZE])})

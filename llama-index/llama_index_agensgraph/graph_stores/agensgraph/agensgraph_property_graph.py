@@ -393,6 +393,13 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             "metadata": {},
         }
 
+        # The schema-introspection helpers run SELECTs on the dedicated
+        # connection without committing, which would otherwise leave it
+        # idle-in-transaction holding an AccessShareLock on the label tables --
+        # enough to block a second store's CREATE CONSTRAINT (AccessExclusiveLock)
+        # on the same graph. Commit to release those locks.
+        self.connection.commit()
+
         if self.enhanced_schema:
             self._enhance_schema()
 

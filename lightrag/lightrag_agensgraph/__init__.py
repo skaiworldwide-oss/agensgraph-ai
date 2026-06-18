@@ -22,6 +22,11 @@ import lightrag.kg
 _IMPLEMENTATIONS = [
     ("GRAPH_STORAGE", "AgensgraphStorage", "lightrag_agensgraph.kg.agensgraph_impl"),
     ("KV_STORAGE", "AgensgraphKVStorage", "lightrag_agensgraph.kg.agensgraph_kv_impl"),
+    (
+        "DOC_STATUS_STORAGE",
+        "AgensgraphDocStatusStorage",
+        "lightrag_agensgraph.kg.agensgraph_docstatus_impl",
+    ),
 ]
 
 _ENV_REQUIREMENTS = ["AGENSGRAPH_DB", "AGENSGRAPH_USER", "AGENSGRAPH_PASSWORD"]

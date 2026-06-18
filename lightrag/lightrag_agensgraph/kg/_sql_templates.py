@@ -31,3 +31,29 @@ CREATE TABLE IF NOT EXISTS LIGHTRAG_KV (
     CONSTRAINT LIGHTRAG_KV_PK PRIMARY KEY (workspace, namespace, id)
 )
 """
+
+# Doc-status is queried/sorted by status, file_path, content_hash, track_id, so
+# those are promoted to indexed columns; the full DocProcessingStatus record is
+# kept in `value` JSONB for faithful round-tripping (created_at/updated_at are
+# ISO strings, so sorting on value->>field is chronological).
+DOC_STATUS_TABLE = "LIGHTRAG_DOC_STATUS"
+DOC_STATUS_TABLE_DDL = """
+CREATE TABLE IF NOT EXISTS LIGHTRAG_DOC_STATUS (
+    workspace    VARCHAR(255) NOT NULL DEFAULT '',
+    id           TEXT         NOT NULL,
+    status       VARCHAR(64),
+    file_path    TEXT,
+    content_hash TEXT,
+    track_id     VARCHAR(255),
+    value        JSONB        NOT NULL DEFAULT '{}'::jsonb,
+    create_time  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+    update_time  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+    CONSTRAINT LIGHTRAG_DOC_STATUS_PK PRIMARY KEY (workspace, id)
+)
+"""
+DOC_STATUS_INDEX_DDL = [
+    "CREATE INDEX IF NOT EXISTS lightrag_doc_status_ws_status_idx ON LIGHTRAG_DOC_STATUS (workspace, status)",
+    "CREATE INDEX IF NOT EXISTS lightrag_doc_status_ws_track_idx ON LIGHTRAG_DOC_STATUS (workspace, track_id)",
+    "CREATE INDEX IF NOT EXISTS lightrag_doc_status_ws_path_idx ON LIGHTRAG_DOC_STATUS (workspace, file_path)",
+    "CREATE INDEX IF NOT EXISTS lightrag_doc_status_ws_hash_idx ON LIGHTRAG_DOC_STATUS (workspace, content_hash)",
+]

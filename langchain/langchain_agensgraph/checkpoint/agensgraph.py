@@ -75,6 +75,23 @@ class AgensSaver(BaseCheckpointSaver):
                     l=sql.Identifier(label)
                 )
             )
+        # All reads filter by thread (and namespace); without these composite
+        # indexes every get/list/put is a seq scan over the whole label.
+        for label, props in (
+            (_CHECKPOINT_LABEL, ("thread_id", "checkpoint_ns", "checkpoint_id")),
+            (_BLOB_LABEL, ("thread_id", "checkpoint_ns")),
+            (_WRITE_LABEL, ("thread_id", "checkpoint_ns", "checkpoint_id")),
+        ):
+            cols = sql.SQL(", ").join(sql.Identifier(p) for p in props)
+            self._graph.query(
+                sql.SQL(
+                    "CREATE PROPERTY INDEX IF NOT EXISTS {name} ON {l} ({cols})"
+                ).format(
+                    name=sql.Identifier(f"{label}_thread_idx"),
+                    l=sql.Identifier(label),
+                    cols=cols,
+                )
+            )
 
     # ---- key extraction ----
 
@@ -177,6 +194,23 @@ class AgensSaver(BaseCheckpointSaver):
             "RETURN x.task_id AS task_id, x.idx AS idx, x.channel AS channel, "
             "x.type AS type, x.value AS value ORDER BY x.idx"
         ).format(wl=sql.Identifier(_WRITE_LABEL))
+
+    def _select_all_writes_cypher(self):
+        # All writes for a thread/ns in one shot (avoids an N+1 per checkpoint
+        # in ``list``); grouped by checkpoint_id in Python.
+        return sql.SQL(
+            "MATCH (x:{wl}) WHERE x.thread_id = %(tid)s AND x.checkpoint_ns = %(ns)s "
+            "RETURN x.checkpoint_id AS checkpoint_id, x.task_id AS task_id, "
+            "x.idx AS idx, x.channel AS channel, x.type AS type, x.value AS value "
+            "ORDER BY x.idx"
+        ).format(wl=sql.Identifier(_WRITE_LABEL))
+
+    @staticmethod
+    def _group_writes(rows: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for w in rows:
+            grouped.setdefault(w["checkpoint_id"], []).append(w)
+        return grouped
 
     def _delete_label_cypher(self, label: str):
         return sql.SQL(
@@ -374,11 +408,15 @@ class AgensSaver(BaseCheckpointSaver):
         blob_rows = self._graph.query(
             self._select_blobs_cypher(), self._params(thread_id, checkpoint_ns)
         )
-        for row in rows:
-            write_rows = self._graph.query(
-                self._select_writes_cypher(),
-                self._params(thread_id, checkpoint_ns, cid=row["checkpoint_id"]),
+        # One query for all writes in the thread, grouped in Python (no N+1).
+        writes_by_ckpt = self._group_writes(
+            self._graph.query(
+                self._select_all_writes_cypher(),
+                self._params(thread_id, checkpoint_ns),
             )
+        )
+        for row in rows:
+            write_rows = writes_by_ckpt.get(row["checkpoint_id"], [])
             tup = self._row_to_tuple(row, blob_rows, write_rows)
             if self._matches_filter(tup.metadata, filter):
                 yield tup
@@ -484,11 +522,14 @@ class AgensSaver(BaseCheckpointSaver):
         blob_rows = await self._graph.aquery(
             self._select_blobs_cypher(), self._params(thread_id, checkpoint_ns)
         )
-        for row in rows:
-            write_rows = await self._graph.aquery(
-                self._select_writes_cypher(),
-                self._params(thread_id, checkpoint_ns, cid=row["checkpoint_id"]),
+        writes_by_ckpt = self._group_writes(
+            await self._graph.aquery(
+                self._select_all_writes_cypher(),
+                self._params(thread_id, checkpoint_ns),
             )
+        )
+        for row in rows:
+            write_rows = writes_by_ckpt.get(row["checkpoint_id"], [])
             tup = self._row_to_tuple(row, blob_rows, write_rows)
             if self._matches_filter(tup.metadata, filter):
                 yield tup

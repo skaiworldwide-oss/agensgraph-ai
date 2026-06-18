@@ -904,6 +904,12 @@ class AgensGraph(GraphStore):
             MERGE ("to":{t_label} %(t_properties)s)
             MERGE ("from")-[:{r_label} %(r_properties)s]->("to")
         """
+        # Create every needed label (and an id index per vertex label) once,
+        # up front, instead of re-issuing CREATE ... IF NOT EXISTS for every
+        # node/edge. The id index makes each MERGE an index lookup rather than
+        # a seq scan (otherwise large documents ingest in O(n^2)).
+        self._ensure_graph_doc_labels(graph_documents, include_source)
+
         # iterate docs and insert them — wrapped in a single transaction so a
         # failure halfway through can never leave orphan nodes behind.
         self._in_transaction = True
@@ -916,6 +922,41 @@ class AgensGraph(GraphStore):
         finally:
             self._in_transaction = False
         return
+
+    def _ensure_graph_doc_labels(
+        self, graph_documents: List[GraphDocument], include_source: bool
+    ) -> None:
+        """Create the distinct vertex/edge labels (+ id index) needed by a batch."""
+        vlabels = set()
+        elabels = set()
+        for doc in graph_documents:
+            for node in doc.nodes:
+                vlabels.add(AgensGraph.clean_graph_labels(node.type))
+            for edge in doc.relationships:
+                vlabels.add(AgensGraph.clean_graph_labels(edge.source.type))
+                vlabels.add(AgensGraph.clean_graph_labels(edge.target.type))
+                elabels.add(AgensGraph.clean_graph_labels(edge.type).upper())
+            if include_source:
+                vlabels.add(AgensGraph.clean_graph_labels(doc.source.type))
+                elabels.add("MENTIONS")
+
+        for label in vlabels:
+            self.query(
+                sql.SQL("CREATE VLABEL IF NOT EXISTS {l}").format(
+                    l=sql.Identifier(label)
+                )
+            )
+            self.query(
+                sql.SQL(
+                    "CREATE PROPERTY INDEX IF NOT EXISTS {name} ON {l} (id)"
+                ).format(name=sql.Identifier(f"{label}_id_idx"), l=sql.Identifier(label))
+            )
+        for label in elabels:
+            self.query(
+                sql.SQL("CREATE ELABEL IF NOT EXISTS {l}").format(
+                    l=sql.Identifier(label)
+                )
+            )
 
     def _add_graph_documents_inner(
         self,
@@ -932,20 +973,8 @@ class AgensGraph(GraphStore):
                         doc.source.page_content.encode("utf-8")
                     ).hexdigest()
 
-            # insert entity nodes
+            # insert entity nodes (labels + id indexes were created up front)
             for node in doc.nodes:
-                # Ensure that the label used in merge exists (due to bug in agensgraph)
-                self.query(sql.SQL('CREATE VLABEL IF NOT EXISTS {label}').format(
-                    label=sql.Identifier(AgensGraph.clean_graph_labels(node.type))
-                ))
-                if include_source:
-                    self.query(sql.SQL('CREATE VLABEL IF NOT EXISTS {label}').format(
-                        label=sql.Identifier(AgensGraph.clean_graph_labels(doc.source.type))
-                    ))
-                    self.query(sql.SQL('CREATE ELABEL IF NOT EXISTS {label}').format(
-                        label=sql.Identifier("MENTIONS")
-                    ))
-
                 node.properties["id"] = node.id
                 if include_source:
                     query = sql.SQL(node_insert_query).format(
@@ -980,17 +1009,6 @@ class AgensGraph(GraphStore):
                     "r_label": AgensGraph.clean_graph_labels(edge.type).upper(),
                     "r_properties": json.dumps(edge.properties),
                 }
-
-                # Ensure that the label used in merge exists (due to bug in agensgraph)
-                self.query(sql.SQL('CREATE VLABEL IF NOT EXISTS {f_label}').format(
-                    f_label=sql.Identifier(inputs["f_label"])
-                ))
-                self.query(sql.SQL('CREATE VLABEL IF NOT EXISTS {t_label}').format(
-                    t_label=sql.Identifier(inputs["t_label"])
-                ))
-                self.query(sql.SQL('CREATE ELABEL IF NOT EXISTS {r_label}').format(
-                    r_label=sql.Identifier(inputs["r_label"])
-                ))
 
                 query = sql.SQL(edge_insert_query).format(
                     f_label=sql.Identifier(inputs["f_label"]),

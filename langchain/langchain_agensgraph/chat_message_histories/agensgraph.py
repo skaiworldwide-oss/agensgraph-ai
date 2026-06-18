@@ -85,6 +85,14 @@ class AgensChatMessageHistory(BaseChatMessageHistory):
                 l=sql.Identifier(self.relationship)
             )
         )
+        # Index the session id so per-session lookups/appends are index scans
+        # rather than a seq scan over every session.
+        self._graph.query(
+            sql.SQL("CREATE PROPERTY INDEX IF NOT EXISTS {name} ON {l} (id)").format(
+                name=sql.Identifier(f"{self.session_node_label}_id_idx"),
+                l=sql.Identifier(self.session_node_label),
+            )
+        )
 
     # ---- query builders (shared by sync + async) ----
 

@@ -740,6 +740,11 @@ class AgensgraphVector(VectorStore):
             self._url = url
             self._owns_connection = True
         self._aconn: Optional[psycopg.AsyncConnection] = None
+        # A unique btree index on the system id (__id__) is what makes MERGE
+        # (ingest), delete, and get_by_ids index-backed instead of seq scans.
+        # Created lazily on first write (see ``_ensure_id_index``).
+        self._create_id_index = True
+        self._id_index_ready = False
 
         self.schema = ""
 
@@ -884,6 +889,48 @@ class AgensgraphVector(VectorStore):
                 )
             )
 
+    def _id_index_ddl(self):
+        """DDL for the unique index on the system id (``__id__``).
+
+        This is the index that turns the per-row ``MERGE (c {{__id__: ...}})``
+        during ingest — and ``delete``/``get_by_ids`` — from a sequential scan
+        into an index lookup. Relationship indexes are stored on edges, which
+        AgensGraph already key-indexes, so we only create it for node stores.
+        """
+        return sql.SQL(
+            "CREATE UNIQUE PROPERTY INDEX IF NOT EXISTS {name} "
+            "ON {label} (__id__)"
+        ).format(
+            name=sql.Identifier(f"{self.node_label}_id_index"),
+            label=sql.Identifier(self.node_label),
+        )
+
+    def _ensure_id_index(self) -> None:
+        if (
+            not self._create_id_index
+            or self._id_index_ready
+            or self._index_type == IndexType.RELATIONSHIP
+        ):
+            return
+        self.verify_label_existence()
+        self.query(self._id_index_ddl())
+        self._id_index_ready = True
+
+    async def _aensure_id_index(self) -> None:
+        if (
+            not self._create_id_index
+            or self._id_index_ready
+            or self._index_type == IndexType.RELATIONSHIP
+        ):
+            return
+        await self.aquery(
+            sql.SQL("CREATE VLABEL IF NOT EXISTS {}").format(
+                sql.Identifier(self.node_label)
+            )
+        )
+        await self.aquery(self._id_index_ddl())
+        self._id_index_ready = True
+
 
     def create_new_index(
         self,
@@ -1010,17 +1057,10 @@ class AgensgraphVector(VectorStore):
                         "Vector and keyword index don't index the same node label"
                     )
 
-        # Create unique constraint for faster import
-        if create_id_index:
-            query = """CREATE UNIQUE PROPERTY INDEX IF NOT EXISTS {index_name}
-                       ON {node_label} ({id_property})"""
-            store.query(
-                sql.SQL(query).format(
-                    index_name=sql.Identifier(f"{store.node_label}_id_index"),
-                    node_label=sql.Identifier(store.node_label),
-                    id_property=sql.Identifier("id")
-            )
-        )
+        # The unique index that makes ingest fast is created lazily by
+        # ``add_embeddings`` on the actual MERGE key (``__id__``); honor the
+        # caller's opt-out here.
+        store._create_id_index = create_id_index
 
         store.add_embeddings(
             texts=texts, embeddings=embeddings, metadatas=metadatas, ids=ids, **kwargs
@@ -1069,6 +1109,10 @@ class AgensgraphVector(VectorStore):
                 "add_embeddings: texts, embeddings, metadatas, ids must have "
                 "the same length"
             )
+
+        # Index __id__ before the MERGE loop so each MERGE is an index lookup
+        # rather than a seq scan (otherwise ingest is O(n^2)).
+        self._ensure_id_index()
 
         import_query = sql.SQL(
              """UNWIND %(data)s AS row
@@ -2189,6 +2233,7 @@ class AgensgraphVector(VectorStore):
                 "aadd_embeddings: texts, embeddings, metadatas, ids must have "
                 "the same length"
             )
+        await self._aensure_id_index()
         import_query = sql.SQL(
             """UNWIND %(data)s AS row
                MERGE (c:{label} {{__id__: row.id}})

@@ -89,6 +89,53 @@ triple_query = f"""
     RETURN DISTINCT {{start: start_label, type: relationship_type, end: end_label}} AS output;
 """
 
+LIST_LIMIT = 128
+"""List-valued result properties longer than this are dropped when sanitize=True."""
+
+
+def _package_version() -> str:
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+
+        try:
+            return version("langchain-agensgraph")
+        except PackageNotFoundError:
+            return "dev"
+    except Exception:
+        return "dev"
+
+
+def _with_application_name(conf: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a copy of ``conf`` with ``application_name`` set if not provided."""
+    out = dict(conf)
+    if not out.get("application_name"):
+        out["application_name"] = f"langchain-agensgraph/{_package_version()}"
+    return out
+
+
+def _sanitize_value(value: Any, *, list_limit: int = LIST_LIMIT) -> Any:
+    """Recursively drop oversized lists from a result value.
+
+    A list with more than
+    ``list_limit`` elements is removed entirely (returned as ``None`` at the
+    leaf, or omitted from a dict), so embeddings and other large arrays don't
+    end up serialized into an LLM prompt.
+    """
+    if isinstance(value, dict):
+        out: Dict[str, Any] = {}
+        for k, v in value.items():
+            sv = _sanitize_value(v, list_limit=list_limit)
+            if sv is not None or v is None:
+                out[k] = sv
+        return out
+    if isinstance(value, list):
+        if len(value) > list_limit:
+            return None
+        cleaned = [_sanitize_value(v, list_limit=list_limit) for v in value]
+        return cleaned
+    return value
+
+
 def require_psycopg(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
@@ -166,6 +213,8 @@ class AgensGraph(GraphStore):
         conf: Dict[str, Any],
         create: bool = False,
         schema_cache_ttl: float = 0.0,
+        timeout: Optional[float] = None,
+        sanitize: bool = False,
     ) -> None:
         """Create a new Agensgraph Graph instance.
 
@@ -176,13 +225,21 @@ class AgensGraph(GraphStore):
             schema_cache_ttl: When > 0, ``refresh_schema`` short-circuits if it
                 ran within the last ``schema_cache_ttl`` seconds. Set to 0
                 (default) to disable caching.
+            timeout: Default per-query statement timeout in seconds. ``None``
+                disables it. Can be overridden per call via ``query(..., timeout=)``.
+            sanitize: When True, list-valued result properties longer than
+                ``LIST_LIMIT`` (128) are stripped from query results so large
+                arrays (e.g. embeddings) do not flood an LLM context.
         """
 
         self.graph_name = graph_name
         # Keep the conf for lazy async-connection creation (see ``_aconn_get``).
-        self._conf = dict(conf)
-        self.connection = psycopg.connect(**conf)
+        # Tag the connection so it is identifiable in pg_stat_activity.
+        self._conf = _with_application_name(conf)
+        self.connection = psycopg.connect(**self._conf)
         self.schema_cache_ttl = schema_cache_ttl
+        self.timeout = timeout
+        self.sanitize = sanitize
         self._schema_refreshed_at: float = 0.0
         self._server_version: Optional[Tuple[int, int, int]] = None
         self._has_meta_extension: bool = False
@@ -526,22 +583,37 @@ class AgensGraph(GraphStore):
         return d
 
     @require_psycopg
-    def query(self, query: str, params: dict = {}) -> List[Dict[str, Any]]:
+    def query(
+        self,
+        query: str,
+        params: dict = {},
+        timeout: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
         """
         Query the graph by taking a cypher query, executing it and
         converting the result
 
         Args:
             query (str): a cypher query to be executed
-            params (dict): parameters for the query (not used in this implementation)
+            params (dict): parameters for the query
+            timeout (Optional[float]): statement timeout in seconds for this
+                call. Falls back to the instance ``timeout``. ``None`` disables.
 
         Returns:
             List[Dict[str, Any]]: a list of dictionaries containing the result set
         """
         # execute the query, rolling back on an error
         in_txn = getattr(self, "_in_transaction", False)
+        effective_timeout = timeout if timeout is not None else self.timeout
         with self._get_cursor() as curs:
             try:
+                if effective_timeout is not None:
+                    # SET LOCAL is scoped to the current (implicit) transaction
+                    # and auto-resets on commit/rollback.
+                    curs.execute(
+                        "SET LOCAL statement_timeout = %s",
+                        (int(effective_timeout * 1000),),
+                    )
                 curs.execute(query, params)
                 if not in_txn:
                     self.connection.commit()
@@ -564,6 +636,9 @@ class AgensGraph(GraphStore):
             # convert to dictionaries
             else:
                 result = [self._record_to_dict(d) for d in data]
+
+            if self.sanitize:
+                result = [_sanitize_value(row) for row in result]
 
             return result
 
@@ -614,6 +689,29 @@ class AgensGraph(GraphStore):
         if self._aconn is not None and not self._aconn.closed:
             await self._aconn.close()
             self._aconn = None
+
+    def close(self) -> None:
+        """Close the sync connection. Idempotent.
+
+        Note: if an async connection was opened it should be closed with
+        :meth:`aclose` from within an event loop; ``close`` only closes the
+        synchronous connection.
+        """
+        if getattr(self, "connection", None) is not None and not self.connection.closed:
+            self.connection.close()
+
+    def __enter__(self) -> "AgensGraph":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    async def __aenter__(self) -> "AgensGraph":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.aclose()
+        self.close()
 
     @staticmethod
     def _format_properties(

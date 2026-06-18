@@ -29,7 +29,7 @@ from langchain_core.embeddings import Embeddings
 from langchain_core.utils import get_from_dict_or_env
 from langchain_core.vectorstores import VectorStore
 
-from langchain_agensgraph.graphs.agensgraph import AgensGraph
+from langchain_agensgraph.graphs.agensgraph import AgensGraph, _package_version
 from langchain_agensgraph.vectorstores.utils import (
     DistanceStrategy,
     maximal_marginal_relevance,
@@ -649,14 +649,19 @@ class AgensgraphVector(VectorStore):
             self.graph_name = graph.graph_name
             self._graph = graph  # share its async connection too
             self._url = None
+            self._owns_connection = False
         else:
             url = get_from_dict_or_env({"url": url}, "url", "AGENSGRAPH_URL")
 
-            # If graph is not provided, create a new one
-            self.connection = psycopg.connect(url)
+            # If graph is not provided, create a new one. Tag the connection
+            # so it is identifiable in pg_stat_activity.
+            self.connection = psycopg.connect(
+                url, application_name=f"langchain-agensgraph/{_package_version()}"
+            )
             self.graph_name = graph_name
             self._graph = None
             self._url = url
+            self._owns_connection = True
         self._aconn: Optional[psycopg.AsyncConnection] = None
 
         self.schema = ""
@@ -2254,3 +2259,29 @@ class AgensgraphVector(VectorStore):
         if self._aconn is not None and not self._aconn.closed:
             await self._aconn.close()
             self._aconn = None
+
+    def close(self) -> None:
+        """Close the sync connection if this store owns it. Idempotent.
+
+        When the store was built from a shared ``AgensGraph`` (``graph=``) the
+        connection belongs to that graph and is left open.
+        """
+        if (
+            getattr(self, "_owns_connection", False)
+            and getattr(self, "connection", None) is not None
+            and not self.connection.closed
+        ):
+            self.connection.close()
+
+    def __enter__(self) -> "AgensgraphVector":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
+
+    async def __aenter__(self) -> "AgensgraphVector":
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self.aclose()
+        self.close()

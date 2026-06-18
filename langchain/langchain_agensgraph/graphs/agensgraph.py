@@ -665,10 +665,13 @@ class AgensGraph(GraphStore):
                         vertices.get(end_id, {}),
                     )
                 else:
-                    try:
-                        d[k] = json.loads(v)
-                    except json.JSONDecodeError:
-                        d[k] = v
+                    # psycopg already decodes scalars/maps/lists to native
+                    # Python types; only the vertex/edge agtype strings handled
+                    # above need parsing. Leave other strings intact so that
+                    # numeric-looking values (graphids like "3.52714", arXiv
+                    # ids like "2301.12345", zip codes, ...) are NOT corrupted
+                    # into numbers by a stray json.loads.
+                    d[k] = v
 
             else:
                 d[k] = v

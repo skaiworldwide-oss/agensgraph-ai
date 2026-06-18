@@ -69,17 +69,25 @@ class TestAgensGraph(unittest.TestCase):
 
         self.assertEqual(result, expected)
 
-        Record2 = namedtuple("Record2", ["string", "int", "float", "bool", "null"])
-        r2 = Record2('"test"', "1", "1.5", "true", None)
+        # psycopg already decodes scalars/maps/lists to native Python types,
+        # so _record_to_dict must pass non-vertex/edge values through
+        # unchanged. In particular numeric-looking *string* ids (graphids,
+        # arXiv ids, zip codes) must NOT be coerced into numbers.
+        Record2 = namedtuple(
+            "Record2", ["pid", "graphid", "year", "score", "flag", "none", "title"]
+        )
+        r2 = Record2("2301.12345", "3.52714", 2023, 1.5, True, None, "Deep Learning")
 
         result = AgensGraph._record_to_dict(r2)
 
         expected2 = {
-            "string": "test",
-            "int": 1,
-            "float": 1.5,
-            "bool": True,
-            "null": None,
+            "pid": "2301.12345",   # preserved as string (was corrupted to float)
+            "graphid": "3.52714",  # preserved as string
+            "year": 2023,
+            "score": 1.5,
+            "flag": True,
+            "none": None,
+            "title": "Deep Learning",
         }
 
         self.assertEqual(result, expected2)

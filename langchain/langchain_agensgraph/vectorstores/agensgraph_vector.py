@@ -1870,10 +1870,10 @@ class AgensgraphVector(VectorStore):
             }
 
             store.query(sql.SQL(
-                 """UNWIND %(data)s AS row 
-                    MATCH (n:{node_label}) 
-                    WHERE toString(Id(n)) = row.id 
-                    SET n.{embedding_node_property} = row.embedding 
+                 """UNWIND %(data)s AS row
+                    MATCH (n:{node_label})
+                    WHERE id(n) = (row.id)::graphid
+                    SET n.{embedding_node_property} = row.embedding
                     RETURN count(*)"""
                 ).format(
                     node_label=sql.Identifier(store.node_label),

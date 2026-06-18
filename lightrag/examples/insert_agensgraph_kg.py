@@ -35,7 +35,11 @@ rag = LightRAG(
             texts, embed_model="nomic-embed-text", host="http://localhost:11434"
         ),
     ),
+    # AgensGraph serves all four storage types from one database.
     graph_storage="AgensgraphStorage",
+    vector_storage="AgensgraphVectorStorage",
+    kv_storage="AgensgraphKVStorage",
+    doc_status_storage="AgensgraphDocStatusStorage",
 )
 
 custom_kg = {

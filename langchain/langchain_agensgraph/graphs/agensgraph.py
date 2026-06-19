@@ -716,10 +716,12 @@ class AgensGraph(GraphStore):
                 try:
                     if effective_timeout is not None:
                         # SET LOCAL is scoped to the current (implicit) transaction
-                        # and auto-resets on commit/rollback.
+                        # and auto-resets on commit/rollback. SET does not accept a
+                        # bind parameter ("SET ... = $1" is a syntax error), so the
+                        # (already int-cast, injection-safe) value is inlined.
                         curs.execute(
-                            "SET LOCAL statement_timeout = %s",
-                            (int(effective_timeout * 1000),),
+                            "SET LOCAL statement_timeout = %d"
+                            % int(effective_timeout * 1000)
                         )
                     curs.execute(query, params)
                     if not in_txn:
@@ -781,9 +783,11 @@ class AgensGraph(GraphStore):
             async with conn.cursor(row_factory=psycopg.rows.namedtuple_row) as cur:
                 try:
                     if effective_timeout is not None:
+                        # SET does not accept a bind parameter; inline the
+                        # (int-cast, injection-safe) millisecond value.
                         await cur.execute(
-                            "SET LOCAL statement_timeout = %s",
-                            (int(effective_timeout * 1000),),
+                            "SET LOCAL statement_timeout = %d"
+                            % int(effective_timeout * 1000)
                         )
                     await cur.execute(query, params)
                     await conn.commit()

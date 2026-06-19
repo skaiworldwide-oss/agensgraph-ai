@@ -39,15 +39,16 @@ def test_sync_context_manager_closes():
 def test_timeout_raises_on_slow_query():
     g = AgensGraph("lifecycle", _conf(), create=True, timeout=0.001)
     with pytest.raises(AgensQueryException):
-        # pg_sleep(2s) under a 1ms statement_timeout must abort
-        g.query("MATCH (n) WHERE pg_sleep(2) IS NULL RETURN n")
+        # pg_sleep(2s) under a 1ms statement_timeout must abort. RETURN pg_sleep
+        # always evaluates (no dependence on the graph having any nodes).
+        g.query("RETURN pg_sleep(2)")
     g.close()
 
 
 def test_per_call_timeout_overrides_instance():
     g = AgensGraph("lifecycle", _conf(), create=True)  # no instance timeout
     with pytest.raises(AgensQueryException):
-        g.query("MATCH (n) WHERE pg_sleep(2) IS NULL RETURN n", timeout=0.001)
+        g.query("RETURN pg_sleep(2)", timeout=0.001)
     g.close()
 
 

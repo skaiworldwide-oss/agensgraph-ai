@@ -9,6 +9,7 @@ ready for ``AgensGraph.add_graph_documents``.
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Any, List, Optional, Sequence
 
 from langchain_core.documents import Document
@@ -21,6 +22,8 @@ from langchain_agensgraph.graphs.graph_document import (
     Node,
     Relationship,
 )
+
+logger = logging.getLogger(__name__)
 
 
 class _Property(BaseModel):
@@ -196,9 +199,28 @@ class LLMGraphTransformer:
     async def aconvert_to_graph_documents(
         self, documents: Sequence[Document]
     ) -> List[GraphDocument]:
-        return await asyncio.gather(
-            *(self.aprocess_response(d) for d in documents)
+        """Convert documents concurrently, isolating per-document failures.
+
+        Extractions run with ``return_exceptions=True`` so a single document that
+        errors (e.g. an LLM response that hits the output-token limit) is logged
+        and skipped rather than aborting the whole batch. Returns the
+        successfully-extracted documents (possibly fewer than ``documents``).
+        """
+        results = await asyncio.gather(
+            *(self.aprocess_response(d) for d in documents),
+            return_exceptions=True,
         )
+        out: List[GraphDocument] = []
+        for result in results:
+            if isinstance(result, Exception):
+                logger.warning(
+                    "LLMGraphTransformer: skipping a document after extraction "
+                    "error: %s",
+                    result,
+                )
+            else:
+                out.append(result)
+        return out
 
 
 __all__ = ["LLMGraphTransformer"]

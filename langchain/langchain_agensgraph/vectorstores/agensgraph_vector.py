@@ -719,9 +719,22 @@ class AgensgraphVector(VectorStore):
             self._owns_connection = False
         elif engine is not None:
             # Dedicated connection for setup/introspection; the pool backs the
-            # concurrent query path.
+            # concurrent query path. Open WITHOUT graph_path and create the graph
+            # on this connection first: a pooled "SET graph_path" on a not-yet-
+            # existing graph errors, so the graph must exist before any pooled
+            # checkout (the url path likewise creates it before binding the path).
             self.graph_name = graph_name
-            self.connection = engine.open_connection(graph_path=graph_name)
+            self.connection = engine.open_connection()
+            with self.connection.cursor() as cur:
+                cur.execute(
+                    sql.SQL("CREATE GRAPH IF NOT EXISTS {}").format(
+                        sql.Identifier(graph_name)
+                    )
+                )
+                cur.execute(
+                    sql.SQL("SET graph_path = {}").format(sql.Identifier(graph_name))
+                )
+            self.connection.commit()
             self._graph = None
             self._engine = engine
             self._url = engine.conninfo

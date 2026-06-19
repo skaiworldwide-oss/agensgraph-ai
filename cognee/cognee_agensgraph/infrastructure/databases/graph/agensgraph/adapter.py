@@ -17,10 +17,13 @@ import psycopg
 from psycopg import sql
 from psycopg.types.json import Jsonb
 from psycopg.rows import namedtuple_row
-from psycopg_pool import AsyncConnectionPool, PoolTimeout
+
+from ._engine import AgensEngine
 
 logger = get_logger("AgensgraphAdapter", level=ERROR)
 BASE_LABEL = "__Node__"
+# Max rows per UNWIND / OR-of-equalities batch.
+CHUNK_SIZE = 1000
 
 # Since we do not support multiple labels, we will maintain the extra labels as a list
 # This function will be used in queries to append new labels to the existing list
@@ -196,78 +199,53 @@ class AgensgraphAdapter(GraphDBInterface):
         graph_database_password: Optional[str] = None,
         driver: Optional[Any] = None,
     ):
-        self.driver = None
-        self.driver_lock = asyncio.Lock()
-        self.driver = AsyncConnectionPool(graph_database_url, open=False)
+        # The pool is shared/opened lazily by the engine in initialize().
+        self.conninfo = graph_database_url
         self.graph_name = "cognee"
         self.graph_id = None
+        self._engine: Optional[AgensEngine] = None
 
-        return None
-    
     async def initialize(self):
-        """
-        Initialize the Agensgraph storage
-        """
-        if self.driver is None:
-            raise AgensgraphQueryException("Agensgraph driver is not initialized")
+        """Acquire the shared engine and bootstrap the graph (once)."""
+        self._engine = await AgensEngine.acquire(self.conninfo)
 
-        # create graph and set graph_path
-        async with self.driver_lock:
-            try:
-                await self.driver.open()
-            except psycopg.errors.InvalidSchemaName as e:
-                raise AgensgraphQueryException(
-                    f"Failed to open connection to Agensgraph: {str(e)}"
-                ) from e
+        async def _ddl(cur):
+            # graph_path is already set by ensure_graph; create the label,
+            # the edge label, and the lookup index on the ACTUAL key (id).
+            await cur.execute(
+                "SELECT oid from ag_graph WHERE graphname = %s", (self.graph_name,)
+            )
+            graph_id = (await cur.fetchone())[0]
+            await cur.execute(f'CREATE VLABEL IF NOT EXISTS "{BASE_LABEL}"')
+            await cur.execute('CREATE ELABEL IF NOT EXISTS "DIRECTED"')
+            await cur.execute(
+                f'CREATE PROPERTY INDEX IF NOT EXISTS base_id_idx ON "{BASE_LABEL}" (id)'
+            )
+            await cur.execute(append_label_function)
+            await cur.execute(get_labels_function)
+            await cur.execute(track_labels.format(graph_id))
+            await cur.execute(label_catalog.format(self.graph_name, BASE_LABEL))
+            await cur.execute(get_label_name_function)
 
-        async with self.get_pool_connection() as conn:
+        await self._engine.ensure_graph(self.graph_name, _ddl)
+
+        # graph_id is used by label-catalog lookups; fetch it every init (the
+        # DDL above runs only once, so don't rely on it for this).
+        async with self._engine.aconnection(graph_path=self.graph_name) as conn:
             async with conn.cursor() as curs:
-                try:
-                    await curs.execute(f'CREATE GRAPH IF NOT EXISTS "{self.graph_name}"')
-                    await curs.execute(f"SELECT oid from ag_graph WHERE graphname = '{self.graph_name}'")
-                    self.graph_id = (await curs.fetchone())[0]
-                    await curs.execute(f'SET graph_path = "{self.graph_name}"')
-                    await curs.execute(f'CREATE VLABEL IF NOT EXISTS base')
-                    await curs.execute(f'CREATE ELABEL IF NOT EXISTS "DIRECTED"')
-                    await curs.execute(f'CREATE PROPERTY INDEX IF NOT EXISTS base_entity_idx ON base (entity_id)')
-                    await curs.execute(append_label_function)
-                    await curs.execute(get_labels_function)
-                    await curs.execute(track_labels.format(self.graph_id))
-                    await curs.execute(label_catalog.format(self.graph_name, BASE_LABEL))
-                    await curs.execute(get_label_name_function)
-                    await conn.commit()
-                except (
-                    psycopg.errors.InvalidSchemaName,
-                    psycopg.errors.UniqueViolation,
-                ):
-                    await conn.rollback()
-                    logger.warning(
-                        f"Graph {self.graph_name} already exists or could not be created."
-                    )
-                except psycopg.Error as e:
-                    await conn.rollback()
-                    raise AgensgraphQueryException(
-                        f"Error initializing graph {self.graph_name}: {str(e)}"
-                    ) from e
-            
+                await curs.execute(
+                    "SELECT oid from ag_graph WHERE graphname = %s", (self.graph_name,)
+                )
+                self.graph_id = (await curs.fetchone())[0]
+            await conn.commit()
+
         logger.info(f"Agensgraph storage initialized for graph: {self.graph_name}")
 
-
-    @asynccontextmanager
-    async def get_pool_connection(self, timeout: Optional[float] = None):
-        """Workaround for a psycopg_pool bug"""
-
-        try:
-            connection = await self.driver.getconn(timeout=timeout)
-        except PoolTimeout:
-            await self.driver._add_connection(None)  # workaround...
-            connection = await self.driver.getconn(timeout=timeout)
-
-        try:
-            async with connection:
-                yield connection
-        finally:
-            await self.driver.putconn(connection)
+    async def finalize(self):
+        """Release the shared engine (closes the pool when last to release)."""
+        if self._engine is not None:
+            await self._engine.release()
+            self._engine = None
 
     async def query(
         self,
@@ -276,27 +254,10 @@ class AgensgraphAdapter(GraphDBInterface):
     ) -> List[Dict[str, Any]]:
         """
         Execute a provided query on the Agensgraph database and return the results.
-
-        Parameters:
-        -----------
-
-            - query (str): The Cypher query to be executed against the database.
-            - params (Optional[Dict[str, Any]]): Optional parameters to be used in the query.
-              (default None)
-
-        Returns:
-        --------
-
-            - List[Dict[str, Any]]: A list of dictionaries representing the result set of the
-              query.
         """
-        await self.driver.open()
-
-        # execute the query, rolling back on an error
-        async with self.get_pool_connection() as conn:
+        async with self._engine.aconnection(graph_path=self.graph_name) as conn:
             async with conn.cursor(row_factory=namedtuple_row) as curs:
                 try:
-                    await curs.execute(f'SET graph_path = {self.graph_name}')
                     await curs.execute(query, params)
                     await conn.commit()
                 except psycopg.Error as e:
@@ -312,12 +273,8 @@ class AgensgraphAdapter(GraphDBInterface):
                 except psycopg.ProgrammingError:
                     data = []  # Handle queries that don’t return data
                 if data is None:
-                    result = []
-                # decode records
-                else:
-                    result = [self._record_to_dict(d) for d in data]
-
-                return result
+                    return []
+                return [self._record_to_dict(d) for d in data]
 
     async def has_node(self, node_id: str) -> bool:
         """
@@ -333,7 +290,7 @@ class AgensgraphAdapter(GraphDBInterface):
 
             - bool: True if the node exists, otherwise False.
         """
-        results = self.query(sql.SQL(
+        results = await self.query(sql.SQL(
             """
                 MATCH (n:{BASE_LABEL})
                 WHERE n.id = %(node_id)s
@@ -358,23 +315,11 @@ class AgensgraphAdapter(GraphDBInterface):
 
             The result of the query execution, typically the ID of the added node.
         """
-        query = """
-            MERGE (node: {label} {{id: %(node_id)s}})
-            ON CREATE SET node += %(properties)s, node.updated_at = now(), node.labels = append_label(node.labels, node_label)
-            ON MATCH SET node += %(properties)s, node.updated_at = now(), node.labels = append_label(node.labels, node_label)
-            RETURN ID(node) AS internal_id, node.id AS nodeId
-            """
-
-        params = {
-            "node_id": str(node.id),
-            "node_label": type(node).__name__,
-            "properties": Jsonb(self.serialize_properties(node.model_dump()))
-        }
-
-        return await self.query(
-            sql.SQL(query).format(label=sql.Identifier(BASE_LABEL)),
-            params,
-        )
+        # Delegate to the batched path: it Jsonb-wraps the row (so the id and
+        # label bind as agtype) and MERGEs on the indexed id. The previous
+        # single-node query bound node_id as a bare string (invalid agtype) and
+        # referenced an undefined `node_label` Cypher variable — both broken.
+        return await self.add_nodes([node])
 
     @record_graph_changes
     async def add_nodes(self, nodes: list[DataPoint]) -> None:
@@ -529,24 +474,24 @@ class AgensgraphAdapter(GraphDBInterface):
             - bool: True if the edge exists, otherwise False.
         """
         query = """
-            MATCH (from_node: {BASE_LABEL})-[:{edge_label}]->(to_node: {BASE_LABEL})
+            MATCH (from_node: {BASE_LABEL})-[r:{edge_label}]->(to_node: {BASE_LABEL})
             WHERE from_node.id = %(from_node)s AND to_node.id = %(to_node)s
-            WITH COUNT(relationship) AS relationships
+            WITH COUNT(r) AS relationships
             RETURN relationships > 0 AS edge_exists
         """
 
         params = {
-            "from_node_id": str(from_node),
-            "to_node_id": str(to_node),
+            "from_node": Jsonb(str(from_node)),
+            "to_node": Jsonb(str(to_node)),
         }
 
-        edge_exists = await self.query(
+        results = await self.query(
             sql.SQL(query).format(
                 BASE_LABEL=sql.Identifier(BASE_LABEL),
                 edge_label=sql.Identifier(edge_label)
             ), params
         )
-        return edge_exists
+        return results[0]["edge_exists"] if results else False
 
     async def has_edges(self, edges):
         """
@@ -644,14 +589,43 @@ class AgensgraphAdapter(GraphDBInterface):
 
             - None: None
         """
-        # TODO: Optimize this
-        for edge in edges:
-            await self.add_edge(edge[0], 
-                                edge[1],
-                                edge[2],
-                                {**(edge[3] if edge[3] else {}),
-                                 "source_node_id": str(edge[0]),
-                                 "target_node_id": str(edge[1])})
+        if not edges:
+            return
+        # The relationship type must be a literal in MERGE, so batch per type;
+        # each batch is one UNWIND query (endpoints matched via the indexed id).
+        by_rel: dict[str, list[dict]] = {}
+        for source, target, relationship_name, props in edges:
+            by_rel.setdefault(relationship_name, []).append(
+                {
+                    "from_node": str(source),
+                    "to_node": str(target),
+                    "properties": self.serialize_properties(
+                        {
+                            **(props if props else {}),
+                            "source_node_id": str(source),
+                            "target_node_id": str(target),
+                        }
+                    ),
+                }
+            )
+
+        query = """
+            UNWIND %(rows)s AS row
+            MATCH (from_node :{BASE_LABEL} {{id: row.from_node}}),
+                  (to_node :{BASE_LABEL} {{id: row.to_node}})
+            MERGE (from_node)-[r:{relationship_name}]->(to_node)
+            ON CREATE SET r += row.properties, r.updated_at = now()
+            ON MATCH SET r += row.properties, r.updated_at = now()
+            """
+        for relationship_name, rows in by_rel.items():
+            formatted = sql.SQL(query).format(
+                BASE_LABEL=sql.Identifier(BASE_LABEL),
+                relationship_name=sql.Identifier(relationship_name),
+            )
+            for start in range(0, len(rows), CHUNK_SIZE):
+                await self.query(
+                    formatted, {"rows": Jsonb(rows[start : start + CHUNK_SIZE])}
+                )
 
     async def get_edges(self, node_id: str):
         """
@@ -828,7 +802,15 @@ class AgensgraphAdapter(GraphDBInterface):
 
             - List[Dict[str, Any]]: A list of neighboring nodes represented as dictionaries.
         """
-        return await self.get_neighbours(node_id)
+        query = """
+            MATCH (n: {BASE_LABEL} {{id: %(node_id)s}})-[r]-(m: {BASE_LABEL})
+            RETURN DISTINCT m
+        """
+        results = await self.query(
+            sql.SQL(query).format(BASE_LABEL=sql.Identifier(BASE_LABEL)),
+            {"node_id": Jsonb(node_id)},
+        )
+        return [result["m"] for result in results]
 
     async def get_node(self, node_id: str) -> Optional[Dict[str, Any]]:
         """
@@ -1528,13 +1510,10 @@ class AgensgraphAdapter(GraphDBInterface):
         Returns:
             List[Dict[str, Any]]: a list of dictionaries containing the result set
         """
-        await self.driver.open()
-
         # execute the query, rolling back on an error
-        async with self.get_pool_connection() as conn:
+        async with self._engine.aconnection(graph_path=self.graph_name) as conn:
             async with conn.cursor(row_factory=namedtuple_row) as curs:
                 try:
-                    await curs.execute(f'SET graph_path = {self.graph_name}')
                     await curs.execute(query)
                     await conn.commit()
                 except psycopg.Error as e:
@@ -1550,9 +1529,5 @@ class AgensgraphAdapter(GraphDBInterface):
                 except psycopg.ProgrammingError:
                     data = []  # Handle queries that don’t return data
                 if data is None:
-                    result = []
-                # decode records
-                else:
-                    result = [self._record_to_dict(d) for d in data]
-
-                return result
+                    return []
+                return [self._record_to_dict(d) for d in data]

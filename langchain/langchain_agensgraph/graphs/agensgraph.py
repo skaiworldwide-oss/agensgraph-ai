@@ -75,26 +75,20 @@ typeof_function = r"""
 node_properties_query = f"""
     MATCH (a)
     UNWIND keys(properties(a)) AS prop
-    WITH label(a) as label, prop, properties(a)[prop] AS value
+    WITH label(a) AS label, prop AS property, properties(a)[prop] AS value
     WHERE value IS NOT NULL
-    WITH
-        label,
-        prop AS property,
-        COLLECT(DISTINCT value) AS values
-    RETURN label, COLLECT(DISTINCT {{'property': property, type: typeof(values[0])}}) as props;
+    WITH DISTINCT label, property, typeof(value) AS dtype
+    RETURN label, COLLECT(DISTINCT {{'property': property, type: dtype}}) as props;
 """
 
 edge_properties_query = f"""
     MATCH ()-[e]->()
-    WITH type(e) as label, properties(e) as properties
+    WITH type(e) AS label, properties(e) AS properties
     UNWIND keys(properties) AS prop
-    WITH label, prop, properties[prop] AS value
+    WITH label, prop AS property, properties[prop] AS value
     WHERE value IS NOT NULL
-    WITH
-        label,
-        prop AS property,
-        COLLECT(DISTINCT value) AS values
-    RETURN label, COLLECT(DISTINCT {{'property': property, type: typeof(values[0])}}) as props;
+    WITH DISTINCT label, property, typeof(value) AS dtype
+    RETURN label, COLLECT(DISTINCT {{'property': property, type: dtype}}) as props;
 """
 
 triple_query = f"""
@@ -233,6 +227,7 @@ class AgensGraph(GraphStore):
         sanitize: bool = False,
         engine: Optional["AgensEngine"] = None,
         enhanced_schema: bool = False,
+        refresh_schema: bool = True,
     ) -> None:
         """Create a new Agensgraph Graph instance.
 
@@ -257,6 +252,12 @@ class AgensGraph(GraphStore):
             enhanced_schema: When True, ``refresh_schema`` samples example
                 values per property and includes them in the schema, improving
                 Text2Cypher prompting. Off by default.
+            refresh_schema: When True (default), introspect the schema eagerly in
+                ``__init__``. Set False to skip it — useful for large graphs where
+                the introspection scan is expensive and the caller only runs
+                explicit Cypher. The schema is then computed lazily on first
+                ``get_schema``/``get_structured_schema`` access (or an explicit
+                ``refresh_schema()`` call).
         """
 
         self.graph_name = graph_name
@@ -273,6 +274,10 @@ class AgensGraph(GraphStore):
         self._server_version: Optional[Tuple[int, int, int]] = None
         self._has_meta_extension: bool = False
         self._aconn: Optional[psycopg.AsyncConnection] = None
+        # Populated by refresh_schema(); initialized so attribute access is safe
+        # even when the eager refresh is skipped (refresh_schema=False).
+        self.schema: str = ""
+        self.structured_schema: Dict[str, Any] = {}
 
         with self._get_cursor() as curs:
             # check if graph with name graph_name exists
@@ -310,7 +315,8 @@ class AgensGraph(GraphStore):
             self.connection.commit()
 
         self._detect_capabilities()
-        self.refresh_schema()
+        if refresh_schema:
+            self.refresh_schema()
 
     @require_psycopg
     def _detect_capabilities(self) -> None:
@@ -605,12 +611,16 @@ class AgensGraph(GraphStore):
 
     @property
     def get_schema(self) -> str:
-        """Returns the schema of the Graph"""
+        """Returns the schema of the Graph (computed lazily if never refreshed)."""
+        if not self.schema:
+            self.refresh_schema()
         return self.schema
 
     @property
     def get_structured_schema(self) -> Dict[str, Any]:
-        """Returns the structured schema of the Graph"""
+        """Returns the structured schema of the Graph (computed lazily if never refreshed)."""
+        if not self.structured_schema:
+            self.refresh_schema()
         return self.structured_schema
 
     @staticmethod

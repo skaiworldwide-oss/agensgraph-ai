@@ -57,28 +57,18 @@ def _docs(limit: int, chars: int):
 
 
 async def _extract(transformer, docs, concurrency):
-    """Bounded-concurrency extraction with per-document error isolation.
+    """Bounded-concurrency extraction.
 
-    Uses aprocess_response per doc under gather(return_exceptions=True) instead
-    of aconvert_to_graph_documents, so a single article that errors (e.g. an
-    entity-dense one that exceeds the LLM output-token limit -> OpenAI
-    LengthFinishReasonError) is skipped rather than aborting the whole batch.
-    See FINDINGS F-007.
+    aconvert_to_graph_documents isolates per-document errors (logs + skips them),
+    so a single article that errors (e.g. an entity-dense one that exceeds the
+    LLM output-token limit) won't abort the batch.
     """
-    out, failed, done = [], 0, 0
+    out, done = [], 0
     for chunk in batched(docs, concurrency):
-        results = await asyncio.gather(
-            *(transformer.aprocess_response(d) for d in chunk),
-            return_exceptions=True,
-        )
-        for r in results:
-            if isinstance(r, Exception):
-                failed += 1
-            else:
-                out.append(r)
+        out.extend(await transformer.aconvert_to_graph_documents(chunk))
         done += len(chunk)
-        print(f"    ... processed {done} articles ({failed} skipped)")
-    return out, failed
+        print(f"    ... processed {done} articles ({done - len(out)} skipped)")
+    return out, done - len(out)
 
 
 def _reset(conf) -> None:

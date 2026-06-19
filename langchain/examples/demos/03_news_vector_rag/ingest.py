@@ -68,9 +68,7 @@ def main() -> None:
         with psycopg.connect(**config.conf(), autocommit=True) as c:
             c.execute('DROP GRAPH IF EXISTS "%s" CASCADE' % GRAPH)
         print(f"[reset] dropped graph {GRAPH!r}")
-    # The vector store (engine-backed) expects the graph to already exist before
-    # it sets graph_path, so create it up front.
-    agens.make_graph(GRAPH, create=True, refresh_schema=False)
+    # from_texts(engine=...) now creates the graph itself (no pre-creation needed).
     console.sub("streaming CC-News + chunking + embedding into AgensgraphVector (HYBRID)")
 
     store = None

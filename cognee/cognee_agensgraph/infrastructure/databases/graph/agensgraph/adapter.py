@@ -221,6 +221,10 @@ class AgensgraphAdapter(GraphDBInterface):
             await cur.execute(
                 f'CREATE PROPERTY INDEX IF NOT EXISTS base_id_idx ON "{BASE_LABEL}" (id)'
             )
+            # name is the lookup key for nodeset / document subgraph queries.
+            await cur.execute(
+                f'CREATE PROPERTY INDEX IF NOT EXISTS base_name_idx ON "{BASE_LABEL}" (name)'
+            )
             await cur.execute(append_label_function)
             await cur.execute(get_labels_function)
             await cur.execute(track_labels.format(graph_id))
@@ -1103,8 +1107,8 @@ class AgensgraphAdapter(GraphDBInterface):
         """
         query = """
         UNWIND %(names)s AS wantedName
-        MATCH (n)
-        WHERE n.name = wantedName AND n.labels @> %(label)s
+        MATCH (n:"__Node__" {name: wantedName})
+        WHERE n.labels @> %(label)s
         WITH DISTINCT n
         OPTIONAL MATCH (n)-[]-(nbr)
         WITH collect(DISTINCT properties(n)) AS prim, collect(DISTINCT properties(nbr)) AS nbrs

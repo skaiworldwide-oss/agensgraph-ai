@@ -1,0 +1,14 @@
+# Extra dependencies for the demos, on top of the langchain-agensgraph package.
+#
+#   uv venv langchain/.venv --python 3.13
+#   uv pip install --python langchain/.venv/bin/python -e ./langchain \
+#       -r langchain/examples/demos/requirements-demos.txt
+#
+# Everything below is for streaming public datasets and calling OpenAI. No
+# local embedding/LLM runtimes (no fastembed / onnxruntime / torch).
+
+langchain-openai>=0.2
+datasets>=2.19
+huggingface-hub>=0.23
+python-dotenv>=1.0
+tqdm>=4.66

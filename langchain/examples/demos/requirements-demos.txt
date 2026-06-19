@@ -8,6 +8,7 @@
 # local embedding/LLM runtimes (no fastembed / onnxruntime / torch).
 
 langchain-openai>=0.2
+langchain>=1.0          # demo 04: langchain.agents.create_agent
 datasets>=2.19
 huggingface-hub>=0.23
 python-dotenv>=1.0

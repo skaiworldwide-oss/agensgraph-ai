@@ -5,6 +5,28 @@ Because AgensGraph is PostgreSQL + Cypher + pgvector, a single AgensGraph
 database can serve as both cognee's graph store and its vector store — or you
 can use just the graph adapter and keep vectors elsewhere.
 
+## What's new in 0.2.0
+
+- **Fixed an O(N²) ingest bug.** Every node lookup and MERGE keys on the `id`
+  property, but the only index was on a different label (`base`) and a different
+  property (`entity_id`) — so ingest was quadratic and every lookup did a
+  sequential scan. Node ingest, edge ingest, and id lookups are now backed by a
+  `base_id_idx ON "__Node__" (id)` index (e.g. 5000 nodes + 5000 edges ingest in
+  ~1.2s).
+- **New dedicated vector adapter.** `AgensgraphVectorAdapter` implements cognee's
+  `VectorDBInterface` over pgvector (HNSW cosine), selectable with
+  `VECTOR_DB_PROVIDER=agensgraph`, so AgensGraph can be cognee's vector store too.
+- **Batched `add_edges`.** Edges are UNWIND-batched per relationship type instead
+  of one query per edge.
+- **`name` is indexed** and nodeset retrieval uses it (was a sequential scan).
+- **Shared async connection pool.** One refcounted pool is opened once per
+  process and reused by both adapters; `graph_path` is reapplied per checkout
+  instead of on every query.
+- **Correctness fixes.** `add_node`, `has_node`, `has_edge`, and `get_neighbors`
+  were broken (bad parameter binding / never awaited / undefined variables / a
+  call to a non-existent method) and now work.
+- **Modernized packaging.** Poetry → hatchling, Python ≥3.10, version 0.2.0.
+
 ## Installation
 
 ```bash

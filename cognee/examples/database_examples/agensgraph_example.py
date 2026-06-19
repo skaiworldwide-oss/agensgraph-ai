@@ -2,6 +2,7 @@ import os
 import pathlib
 import asyncio
 import cognee
+import cognee_agensgraph  # noqa: F401  (registers the AgensGraph adapters)
 from cognee.modules.search.types import SearchType
 
 
@@ -25,6 +26,15 @@ async def main():
         {
             "graph_database_url": agensgraph_url,  # agensgraph connection DSN
             "graph_database_provider": "agensgraph",  # Specify agensgraph as provider
+        }
+    )
+
+    # Optional: use the same AgensGraph database as the vector store too
+    # (pgvector HNSW). Comment out to keep vectors on cognee's default backend.
+    cognee.config.set_vector_db_config(
+        {
+            "vector_db_url": agensgraph_url,
+            "vector_db_provider": "agensgraph",
         }
     )
 

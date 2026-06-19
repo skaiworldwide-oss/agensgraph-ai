@@ -1,6 +1,9 @@
-# Cognee Community Graph Adapter - AgensGraph
+# Cognee AgensGraph adapters
 
-This package provides an AgensGraph graph database adapter for the Cognee framework.
+AgensGraph **graph** and **vector** database adapters for the Cognee framework.
+Because AgensGraph is PostgreSQL + Cypher + pgvector, a single AgensGraph
+database can serve as both cognee's graph store and its vector store — or you
+can use just the graph adapter and keep vectors elsewhere.
 
 ## Installation
 
@@ -107,12 +110,26 @@ cognee.config.set_graph_db_config({
 })
 ```
 
+To use AgensGraph as the **vector store** as well (pgvector HNSW), point the
+vector config at the same database:
+
+```python
+cognee.config.set_vector_db_config({
+    "vector_db_url": "postgresql://username:password@host:port/dbname",
+    "vector_db_provider": "agensgraph",
+})
+```
+
 ### Environment Variables
 
 Set the following environment variables or pass them directly in the config:
 
 ```bash
 export GRAPH_DATABASE_URL="postgresql://username:password@host:port/dbname"
+export GRAPH_DATABASE_PROVIDER="agensgraph"
+# Optional: AgensGraph as the vector store too
+export VECTOR_DB_URL="postgresql://username:password@host:port/dbname"
+export VECTOR_DB_PROVIDER="agensgraph"
 ```
 
 **Alternative:** You can also use the [`.env.template`](https://github.com/topoteretes/cognee/blob/main/.env.template) file from the main cognee repository. Copy it to your project directory, rename it to `.env`, and fill in your AgensGraph configuration values.
@@ -128,17 +145,28 @@ cognee.config.data_root_directory("/path/to/data")
 
 ## Features
 
-- Full support for AgensGraph's property graph model
-- Optimized queries for graph operations
-- Async/await support
-- Transaction support
-- Comprehensive error handling
-- Advanced search functionality:
-  - Graph completion search
-  - Chain of Thought (COT) reasoning
-- Direct graph data access via `get_graph_engine()`
-- HTML graph visualization with `cognee.visualize_graph()`
-- Custom directory configuration
+- **Graph adapter** (`GRAPH_DATABASE_PROVIDER=agensgraph`): full GraphDBInterface
+  support over AgensGraph's Cypher, async, with graph-completion and
+  Chain-of-Thought search, direct `get_graph_engine()` access, and HTML
+  visualization.
+- **Vector adapter** (`VECTOR_DB_PROVIDER=agensgraph`): cognee VectorDBInterface
+  over pgvector with an HNSW cosine index.
+
+## Performance & indexing
+
+- A **single async connection pool** is shared (refcounted) across the graph and
+  vector adapters and opened once per process; `graph_path` is reapplied per
+  checkout, not per query.
+- **Graph ingest and lookups are index-backed**: nodes MERGE/lookup on an
+  indexed `id` (the previous build indexed the wrong property, making ingest
+  O(N²) and every lookup a sequential scan); `add_edges` is UNWIND-batched per
+  relationship type.
+- **Vector search** uses an HNSW (`vector_cosine_ops`) index; the column is typed
+  `vector(dim)` so the query's `<=>` cast matches the index and it is used at
+  scale.
+
+> The vector embedding dimension is fixed when a collection's table is first
+> created; to change embedding models, drop the affected collection tables.
 
 ## Example
 

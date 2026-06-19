@@ -95,9 +95,12 @@ The backend is indexed and pooled for its hot paths out of the box:
   on AgensGraph).
 - **Vector search** uses an HNSW (`vector_cosine_ops`) index; the column is typed
   `vector(dim)` so the query's `<=>` cast matches the index expression and the
-  index is used at scale.
+  index is used at scale. Entity/relation deletes are index-backed too
+  (`entity_name`, `source_id`, `target_id`), so purging an entity's vectors does
+  not scan the table.
 - **Doc-status** filtering, counting, and pagination are served by indexes on
-  `status` / `file_path` / `content_hash` / `track_id`.
+  `status` / `file_path` / `content_hash` / `track_id` and on the
+  `created_at` / `updated_at` sort keys.
 
 > The vector embedding dimension is fixed when the vector tables are first
 > created. To change embedding models (different dimension), drop the

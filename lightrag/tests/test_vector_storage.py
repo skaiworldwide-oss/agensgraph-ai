@@ -122,3 +122,34 @@ async def test_query_uses_hnsw_index(entities, embedding_func):
             plan = "\n".join(r[0] for r in await cur.fetchall())
         await conn.rollback()
     assert "hnsw" in plan.lower() and "Seq Scan" not in plan
+
+
+async def test_delete_entity_relation_uses_index(embedding_func):
+    # delete_entity_relation runs on every entity removal; it must use the
+    # source_id/target_id indexes, not a sequential scan of the relation table.
+    rel = _vec("relationships", embedding_func)
+    await rel.initialize()
+    await rel.drop()
+    try:
+        await rel.upsert(
+            {
+                f"r{i}": {
+                    "src_id": f"e{i}", "tgt_id": f"e{i + 1}",
+                    "content": "c", "source_id": "s",
+                }
+                for i in range(20)
+            }
+        )
+        async with rel._engine.aconnection(graph_path=None) as conn:
+            async with conn.cursor() as cur:
+                await cur.execute("SET LOCAL enable_seqscan = off")
+                await cur.execute(
+                    "EXPLAIN DELETE FROM LIGHTRAG_VDB_RELATION "
+                    "WHERE workspace = '' AND (source_id = 'e1' OR target_id = 'e1')"
+                )
+                plan = "\n".join(r[0] for r in await cur.fetchall())
+            await conn.rollback()
+        assert "Index" in plan and "Seq Scan" not in plan
+    finally:
+        await rel.drop()
+        await rel.finalize()

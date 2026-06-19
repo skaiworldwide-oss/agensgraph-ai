@@ -56,6 +56,10 @@ DOC_STATUS_INDEX_DDL = [
     "CREATE INDEX IF NOT EXISTS lightrag_doc_status_ws_track_idx ON LIGHTRAG_DOC_STATUS (workspace, track_id)",
     "CREATE INDEX IF NOT EXISTS lightrag_doc_status_ws_path_idx ON LIGHTRAG_DOC_STATUS (workspace, file_path)",
     "CREATE INDEX IF NOT EXISTS lightrag_doc_status_ws_hash_idx ON LIGHTRAG_DOC_STATUS (workspace, content_hash)",
+    # Pagination sorts on created_at/updated_at, which live in the JSONB value;
+    # expression indexes let the sort be index-ordered instead of a full sort.
+    "CREATE INDEX IF NOT EXISTS lightrag_doc_status_ws_updated_idx ON LIGHTRAG_DOC_STATUS (workspace, (value->>'updated_at'))",
+    "CREATE INDEX IF NOT EXISTS lightrag_doc_status_ws_created_idx ON LIGHTRAG_DOC_STATUS (workspace, (value->>'created_at'))",
 ]
 
 # Vector tables (one per LightRAG vector namespace). ``content_vector`` is typed
@@ -116,4 +120,10 @@ VECTOR_INDEX_DDL = [
     "CREATE INDEX IF NOT EXISTS lightrag_vdb_entity_hnsw ON LIGHTRAG_VDB_ENTITY USING hnsw (content_vector vector_cosine_ops)",
     "CREATE INDEX IF NOT EXISTS lightrag_vdb_relation_hnsw ON LIGHTRAG_VDB_RELATION USING hnsw (content_vector vector_cosine_ops)",
     "CREATE INDEX IF NOT EXISTS lightrag_vdb_chunks_hnsw ON LIGHTRAG_VDB_CHUNKS USING hnsw (content_vector vector_cosine_ops)",
+    # delete_entity matches on entity_name; delete_entity_relation matches on
+    # source_id / target_id. Index them so those deletes (run on every entity
+    # edit/removal) use a BitmapOr index scan instead of a sequential scan.
+    "CREATE INDEX IF NOT EXISTS lightrag_vdb_entity_name_idx ON LIGHTRAG_VDB_ENTITY (workspace, entity_name)",
+    "CREATE INDEX IF NOT EXISTS lightrag_vdb_relation_src_idx ON LIGHTRAG_VDB_RELATION (workspace, source_id)",
+    "CREATE INDEX IF NOT EXISTS lightrag_vdb_relation_tgt_idx ON LIGHTRAG_VDB_RELATION (workspace, target_id)",
 ]

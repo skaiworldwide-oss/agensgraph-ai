@@ -1,21 +1,67 @@
 [build-system]
-build-backend = "poetry.core.masonry.api"
-requires = ["poetry-core>=2.0.0,<3.0.0"]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
-[tool.poetry]
+[project]
 name = "cognee-agensgraph"
-version = "0.1.0"
-description = "Cognee graph store implementation for agensgraph"
-authors = ["Muhammad Taha Naveed <skaisw@skaiworldwide.com>"]
+version = "0.2.0"
+description = "AgensGraph graph + vector adapters for Cognee."
 readme = "README.md"
-homepage = "https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/cognee"
-repository = "https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/cognee"
-keywords = ["cognee", "agensgraph", "graph store", "integration"]
+license = { text = "Apache-2.0" }
+requires-python = ">=3.10,<3.14"
+authors = [
+    { name = "Muhammad Taha Naveed", email = "taha.n@skaiworldwide.co.kr" },
+]
+keywords = [
+    "cognee",
+    "agensgraph",
+    "graph store",
+    "vector store",
+    "rag",
+    "knowledge graph",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "cognee>=0.2.1,<1.0.0",
+    "psycopg[binary,pool]>=3.1.0",
+    "pgvector>=0.2.5",
+    "numpy>=1.24",
+]
 
-[tool.poetry.dependencies]
-python = ">=3.10,<=3.13"
-psycopg = { version = ">=3.1.0", extras = ["binary", "pool"] }
-cognee = ">=0.2.1, <1.0.0"
+[project.urls]
+Homepage = "https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/cognee"
+Repository = "https://github.com/skaiworldwide-oss/agensgraph-ai"
+Issues = "https://github.com/skaiworldwide-oss/agensgraph-ai/issues"
 
-[[tool.poetry.packages]]
-include = "cognee_agensgraph"
+[dependency-groups]
+test = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.25",
+]
+lint = ["ruff>=0.9"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["cognee_agensgraph"]
+
+[tool.hatch.build.targets.sdist]
+include = ["/cognee_agensgraph", "/examples", "/README.md", "/LICENSE"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+"**/tests/**" = ["E501"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"

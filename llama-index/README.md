@@ -9,10 +9,26 @@ so you can store and query property graphs and embeddings in one database.
 - Vector Store: `AgensgraphVectorStore`
 - Connection pool: `AgensEngine` (optional, shared across stores)
 
-See the associated guides below:
+## Demos & guides
 
-- [Agens Property Graph Store](./examples//property_graph/property_graph_agensgraph.ipynb)
-- [Agensgraph Vector Store](./examples/vector_stores/AgensgraphVectorDemo.ipynb)
+**Start here:** the [**`examples/demos/`**](./examples/demos) suite — runnable,
+end-to-end demos on real datasets (arXiv, Wikipedia, CC-News) that show how to
+build with this integration at realistic scale. Its
+[README](./examples/demos/README.md) has a quickstart and copy-paste building
+blocks.
+
+| Demo | What you build |
+|------|----------------|
+| [01 · arXiv](./examples/demos/01_arxiv_pg) | a property graph + vector search + GraphRAG in one store |
+| [02 · Wikipedia](./examples/demos/02_wikipedia_pgindex) | an LLM-built knowledge graph + natural-language (Text2Cypher) Q&A |
+| [03 · News](./examples/demos/03_news_vector_rag) | vector RAG: semantic, metadata-filtered, hybrid, and cited |
+| [04 · Router](./examples/demos/04_router) | one `AgensEngine` routing questions to the graph or the vector store |
+
+Short, single-feature notebooks:
+
+- [Property graph store](./examples/property_graph/property_graph_agensgraph.ipynb)
+- [Vector store](./examples/vector_stores/AgensgraphVectorDemo.ipynb)
+- [Vector store — metadata filters](./examples/vector_stores/agensgraph_metadata_filter.ipynb)
 
 ## Requirements
 

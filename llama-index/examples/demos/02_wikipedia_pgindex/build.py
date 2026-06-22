@@ -111,9 +111,9 @@ def main() -> None:
 
         # report what got built (entities live on __Node__ with the type in labels)
         n_entities = store.structured_query(
-            "MATCH (n:\"__Node__\") WHERE '__Entity__' IN n.labels RETURN count(n) AS c")[0]["c"]
+            "MATCH (n:\"__Node__\") WHERE '__Entity__' IN n.labels RETURN count(*) AS c")[0]["c"]
         n_rels = store.structured_query(
-            "MATCH (:\"__Node__\")-[r]->(:\"__Node__\") RETURN count(r) AS c")[0]["c"]
+            "MATCH (:\"__Node__\")-[r]->(:\"__Node__\") RETURN count(*) AS c")[0]["c"]
         console.section("done")
         console.kv("entities", f"{n_entities:,}")
         console.kv("relationships", f"{n_rels:,}")

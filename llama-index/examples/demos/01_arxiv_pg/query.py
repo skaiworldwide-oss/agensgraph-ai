@@ -32,21 +32,25 @@ from _common.models import EMBED_DIM, get_embed_model, get_llm
 GRAPH = "arxiv"
 DEFAULT_QUESTION = "What are recent approaches to graph neural networks for molecular property prediction?"
 
-# Cypher analytics. Drive these off the RELATIONSHIPS, not a `'Author' IN n.labels`
-# predicate: every node lives on one "__Node__" label with its type in a jsonb
-# `labels` list, so a label filter is a full scan + a jsonb membership test per
-# node (slow at scale). The edge already implies the endpoint's type (AUTHORED_BY
-# always points at an Author), so walking edges is much cheaper.
+# Cypher analytics — two rules that keep these fast at scale on this store:
+#  1. Use count(*), not count(p)/count(n): counting a node variable materializes
+#     each node's full properties (including its embedding), which is much slower.
+#  2. Drive aggregations off the EDGES (top authors / categories): the edge implies
+#     the endpoint type, so no node-type filter is needed and the endpoints carry
+#     no embedding to read.
+# A type-scoped node filter `WHERE n.__type__ = 'X'` (indexed) beats
+# `'X' IN n.labels` (a jsonb scan); papers-per-year reads `year` from each Paper,
+# so it filters on `year` directly.
 ANALYTICS = [
     ("most prolific authors", """
         MATCH (p:"__Node__")-[:"AUTHORED_BY"]->(a:"__Node__")
-        RETURN a.name AS author, count(p) AS papers ORDER BY papers DESC LIMIT 10"""),
+        RETURN a.name AS author, count(*) AS papers ORDER BY papers DESC LIMIT 10"""),
     ("largest categories", """
         MATCH (p:"__Node__")-[:"IN_CATEGORY"]->(c:"__Node__")
-        RETURN c.name AS category, count(p) AS papers ORDER BY papers DESC LIMIT 10"""),
+        RETURN c.name AS category, count(*) AS papers ORDER BY papers DESC LIMIT 10"""),
     ("papers per year", """
         MATCH (p:"__Node__") WHERE p.year IS NOT NULL
-        RETURN p.year AS year, count(p) AS papers ORDER BY year DESC LIMIT 10"""),
+        RETURN p.year AS year, count(*) AS papers ORDER BY year DESC LIMIT 10"""),
 ]
 
 

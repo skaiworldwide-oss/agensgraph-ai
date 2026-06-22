@@ -552,14 +552,30 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                         BASE_ENTITY_LABEL=sql.Literal(BASE_ENTITY_LABEL)
                     ), {"chunked_params": Jsonb(chunked_params)}
                 ))
+                # Write embeddings for every entity that carries one. This is a
+                # SEPARATE statement from the MENTIONS link below on purpose:
+                # AgensGraph does not persist an earlier SET when a subsequent
+                # `WITH ... WHERE` filters out every row ahead of a MERGE, so folding
+                # the embedding write into the triplet_source_id branch silently
+                # dropped embeddings for any entity that has no source chunk (e.g. a
+                # structured / non-LLM-extracted graph).
                 ops.append((
                     sql.SQL("""
                     UNWIND %(chunked_params)s AS row
                     MATCH (e:{BASE_NODE_LABEL} {{id: row.id}})
                     WHERE row.embedding IS NOT NULL
                     SET e.embedding = row.embedding
-                    WITH e, row
-                    WHERE row.properties.triplet_source_id IS NOT NULL
+                    """).format(
+                        BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL)
+                    ), {"chunked_params": Jsonb(chunked_params)}
+                ))
+                # Link each entity to its source chunk via MENTIONS, for the rows
+                # that carry a triplet_source_id.
+                ops.append((
+                    sql.SQL("""
+                    UNWIND %(chunked_params)s AS row
+                    WITH row WHERE row.properties.triplet_source_id IS NOT NULL
+                    MATCH (e:{BASE_NODE_LABEL} {{id: row.id}})
                     MERGE (c:{BASE_NODE_LABEL} {{id: row.properties.triplet_source_id}})
                     MERGE (e)<-[:"MENTIONS"]-(c)
                     """).format(

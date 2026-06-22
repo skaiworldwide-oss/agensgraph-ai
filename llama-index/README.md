@@ -50,6 +50,25 @@ Short, single-feature notebooks:
   values are supported — `EQ`, `NE`, `GT`, `GTE`, `LT`, `LTE`, `IN`, `NIN`,
   `CONTAINS`, `TEXT_MATCH`, `TEXT_MATCH_INSENSITIVE`, `ANY`, `ALL`, `IS_EMPTY` —
   along with `AND`/`OR`/`NOT` conditions and nested filter groups.
+- **Hybrid search.** `AgensgraphVectorStore(hybrid_search=True)` fuses HNSW
+  semantic search with full-text keyword search by reciprocal rank fusion — each
+  modality is queried against its own index (so both stay index-backed) and the
+  two rankings are merged.
+- **AgensGraph-dialect Text2Cypher.** The property graph store sets a default
+  `text_to_cypher_template` that knows the storage model (every node on a single
+  `"__Node__"` label, entity type held in a `labels` list) and avoids Neo4j-only
+  syntax, so `TextToCypherRetriever` generates runnable Cypher out of the box.
+- **Lazy schema introspection.** `AgensPropertyGraphStore(refresh_schema=False)`
+  defers the (O(N)) schema scan to the first `get_schema()`/`get_schema_str()`
+  call, so opening a large existing graph is instant.
+- **Indexed type filter.** Each node also stores its primary type in a
+  btree-indexed `__type__` scalar, so a type-scoped query
+  (`WHERE n.__type__ = 'X'`) is an index scan rather than a `'X' IN n.labels`
+  jsonb membership scan.
+- **Correctness fixes.** Entity embeddings are persisted on `upsert_nodes` even
+  when the entity has no source chunk; `get(ids=[])` returns nothing (instead of
+  the whole graph); and depth-1 `get_rel_map` uses a fixed pattern (AgensGraph's
+  variable-length edges are far slower).
 - **Modern vector-store node management.** `AgensgraphVectorStore` implements
   `get_nodes(node_ids, filters)`, `delete_nodes(node_ids, filters)` and `clear()`
   (plus async `aget_nodes` / `adelete_nodes` / `aclear`).
@@ -118,11 +137,11 @@ conf = {
     "user": "",
     "password": "",
     "host": "",
-    "port": "",
+    "port": 5432,
 }
 
 # Pass vector_dimension to enable the HNSW vector index (match your embedding
-# model's dimension, e.g. 1536 for text-embedding-ada-002). Without it, vector
+# model's dimension, e.g. 1536 for text-embedding-3-small). Without it, vector
 # search still works but is unindexed.
 graph_store = AgensPropertyGraphStore(
     graph_name="graph",
@@ -132,10 +151,12 @@ graph_store = AgensPropertyGraphStore(
 
 index = PropertyGraphIndex.from_documents(
     documents,
-    embed_model=OpenAIEmbedding(model_name="text-embedding-ada-002"),
+    embed_model=OpenAIEmbedding(model_name="text-embedding-3-small"),
     kg_extractors=[
         SchemaLLMPathExtractor(
-            llm=OpenAI(model="gpt-3.5-turbo", temperature=0.0),
+            llm=OpenAI(model="gpt-4o-mini", temperature=0.0),
+            # strict=True can yield zero triplets with some models; strict=False is more forgiving
+            strict=False,
         )
     ],
     property_graph_store=graph_store,
@@ -147,6 +168,21 @@ query_engine = index.as_query_engine(include_text=True)
 response = query_engine.query("What happened at Interleaf and Viaweb?")
 print("\nDetailed Query Response:")
 print(str(response))
+```
+
+### Natural-language queries (Text2Cypher)
+
+`TextToCypherRetriever` turns a question into AgensGraph Cypher using the store's
+built-in dialect prompt — no custom prompt needed:
+
+```python
+from llama_index.core.indices.property_graph import TextToCypherRetriever
+
+retriever = TextToCypherRetriever(
+    graph_store=graph_store, llm=OpenAI(model="gpt-4o-mini")
+)
+nodes = retriever.retrieve("How many entities of each type are there?")
+print(nodes[0].node.text)  # the generated Cypher and its result
 ```
 
 ### Vector Store
@@ -184,6 +220,19 @@ query_engine = index.as_query_engine()
 response = query_engine.query("What happened at Interleaf?")
 print("\nQuery Response:")
 print(str(response))
+```
+
+For hybrid (vector + keyword) search, build the store with `hybrid_search=True`
+and query with a `query_str`:
+
+```python
+hybrid_store = AgensgraphVectorStore(
+    url=url, embedding_dimension=embed_dim, hybrid_search=True
+)
+index = VectorStoreIndex.from_vector_store(hybrid_store)
+index.as_retriever(vector_store_query_mode="hybrid").retrieve(
+    "What happened at Interleaf?"
+)
 ```
 
 ## Async & connection pooling
@@ -249,3 +298,8 @@ vector_store.create_property_index("topic")
 
 With the index present, the planner pre-selects matching rows via an index/bitmap
 scan and then ranks them — instead of scanning every node.
+
+**Counting and type filters.** Prefer `count(*)` over `count(n)` in aggregations:
+`count(n)` materializes each matched node (including its embedding), so it is much
+slower on a graph that stores embeddings. For "all nodes of type X", filter on the
+indexed `n.__type__` scalar rather than `'X' IN n.labels`.

@@ -695,7 +695,13 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         params: Dict[str, Any] = {}
         query += 'MATCH (e:{BASE_NODE_LABEL}) '
         query += "WHERE e.id IS NOT NULL "
-        if ids:
+        if ids is not None and len(ids) == 0:
+            # An explicit empty id list means "no nodes". Without this guard the
+            # `if ids:` below would skip the filter entirely and the query would
+            # match the ENTIRE graph — e.g. get_llama_nodes([]) (no source docs)
+            # fetched all 130k+ nodes, making include_text retrieval take ~29s.
+            query += "AND false "
+        elif ids:
             frag, id_params = self._or_equalities("e.id", ids, "get_id")
             query += "AND " + frag + " "
             params.update(id_params)
@@ -912,13 +918,32 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         # previous `UNWIND idx ... WHERE e.id = ids[idx]` dynamic subscript
         # forced a sequential scan of the whole node set per call.
         seed_frag, seed_params = self._or_equalities("e.id", ids, "rmid")
-        query += """
+        # AgensGraph's variable-length-edge engine is pathologically slow even at
+        # depth 1 -- a plain 1-hop match returns the same rows ~1000x faster
+        # (~12 ms vs ~17 s for depth-1 over a few seeds on a 50k-node graph). Use a
+        # fixed pattern for the common depth<=1 case; only fall back to the
+        # *1..depth path for genuine multi-hop maps.
+        if depth <= 1:
+            traversal = (
+                """
+            MATCH (e:{BASE_NODE_LABEL})
+            WHERE """ + seed_frag + """
+            MATCH (e)-[rel]-(other)
+            WHERE type(rel) <> 'MENTIONS'
+                """
+            )
+        else:
+            traversal = (
+                """
             MATCH (e:{BASE_NODE_LABEL})
             WHERE """ + seed_frag + """
             MATCH p=(e)-[r*1..{depth}]-(other)
             UNWIND relationships(p) AS rel
             WITH DISTINCT rel, collect(type(rel)) AS types
             WHERE all(x IN types WHERE x <> 'MENTIONS')
+                """
+            )
+        query += traversal + """
             WITH startNode(rel) AS source,
                 type(rel) AS type,
                 rel AS rel_properties,

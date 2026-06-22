@@ -578,10 +578,16 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         self, query: VectorStoreQuery
     ) -> Tuple[sql.Composed, Dict[str, Any]]:
         """Build the formatted query SQL and parameters for a vector query."""
+        # NOTE: do NOT add an `array_size(n.embedding) = dim` guard here. That
+        # predicate is computed per row, so the planner can't use the HNSW index
+        # and the search degrades to a full sequential scan that also parses every
+        # stored embedding — ~25 ms vs >90 s on a 100k-node graph. It is also
+        # redundant: `IS NOT NULL` plus the `::vector(N)` cast below already
+        # enforce a correctly-dimensioned embedding (a wrong-size value can't be
+        # in the vector index in the first place).
         base_index_query = (
                 """MATCH (n:{label})
-                WHERE n.{embedding_property} IS NOT NULL AND
-                array_size(n.{embedding_property}) = {embedding_dimension} {filter_clause} """
+                WHERE n.{embedding_property} IS NOT NULL {filter_clause} """
         )
 
         base_cosine_query = """

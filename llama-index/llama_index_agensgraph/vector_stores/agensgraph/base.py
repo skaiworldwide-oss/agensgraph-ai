@@ -610,50 +610,9 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
             filter_clause = sql.SQL("AND (") + snippet + sql.SQL(")")
             index_query = base_index_query + base_cosine_query
         else:
-            if self.hybrid_search:
-                index_query = (
-                    """
-                        UNWIND [1] as a
-                        WITH (
-                            SELECT jsonb_agg(jsonb_build_object('n', n, 'score', score))
-                            FROM (
-                                WITH semantic_search AS (
-                                    SELECT n, RANK () OVER (ORDER BY inv_score) AS rank
-                                    FROM (""" +
-                                        base_index_query +
-                                     """RETURN properties(n) as n,
-                                               n.{embedding_property}::vector({embedding_dimension}) <=> %(embedding)s::vector({embedding_dimension}) AS inv_score
-                                        ORDER BY inv_score
-                                        LIMIT %(k)s
-                                    )t
-                                ),
-                                keyword_search AS (
-                                    SELECT n, RANK () OVER (ORDER BY score DESC) AS rank
-                                    FROM (
-                                        MATCH (n:{label})
-                                        WHERE n.{text_property} IS NOT NULL AND
-                                              to_tsvector('english', n.{text_property}) @@ plainto_tsquery('english', %(query)s)
-                                        RETURN properties(n) as n, ts_rank_cd(to_tsvector('english', n.{text_property}), plainto_tsquery('english', %(query)s)) AS score
-                                        ORDER BY score DESC
-                                        LIMIT %(k)s
-                                    )t
-                                )
-                                SELECT
-                                    COALESCE(semantic_search.n, keyword_search.n) AS n,
-                                    COALESCE(1.0 / (60 + semantic_search.rank), 0.0) +
-                                    COALESCE(1.0 / (60 + keyword_search.rank), 0.0) AS score
-                                FROM semantic_search
-                                FULL OUTER JOIN keyword_search ON semantic_search.n->'id' = keyword_search.n->'id'
-                                ORDER BY score DESC
-                            )
-                        ) AS outputs
-                        UNWIND outputs as output
-                        WITH output.score AS score,
-                             output.n as n
-                    """
-                )
-            else:
-                index_query = base_index_query + base_cosine_query
+            # hybrid is handled in query()/aquery() (RRF over two top-level
+            # queries), so a bare hybrid store with no query_str is plain vector.
+            index_query = base_index_query + base_cosine_query
 
         index_query = index_query + " WITH *, n as node "
         default_retrieval = """
@@ -700,7 +659,65 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
 
         return VectorStoreQueryResult(nodes=nodes, similarities=similarities, ids=ids)
 
+    def _hybrid_modality_sql(self, modality: str) -> sql.Composed:
+        """Top-level Cypher for one hybrid modality, returning (id, text, metadata)
+        ordered by relevance. Kept top-level (not nested in a SQL sub-query) so the
+        HNSW / full-text index is used; the modalities are fused in _rrf_fuse."""
+        tail = """
+            WITH n AS node
+            RETURN node.{text_property} AS text, node.id AS id,
+                node || jsonb_build_object({text_property_literal}, Null,
+                    {embedding_property_literal}, Null, 'id', Null) AS metadata
+        """
+        if modality == "semantic":
+            head = """
+                MATCH (n:{label}) WHERE n.{embedding_property} IS NOT NULL
+                WITH n, n.{embedding_property}::vector({embedding_dimension}) <=> %(embedding)s::vector({embedding_dimension}) AS d
+                ORDER BY d LIMIT %(k)s
+            """
+        else:  # keyword
+            head = """
+                MATCH (n:{label})
+                WHERE n.{text_property} IS NOT NULL AND
+                      to_tsvector('english', n.{text_property}) @@ plainto_tsquery('english', %(query)s)
+                WITH n, ts_rank_cd(to_tsvector('english', n.{text_property}), plainto_tsquery('english', %(query)s)) AS s
+                ORDER BY s DESC LIMIT %(k)s
+            """
+        return sql.SQL(head + tail).format(
+            label=sql.Identifier(self.node_label),
+            embedding_property=sql.Identifier(self.embedding_node_property),
+            embedding_dimension=self.embedding_dimension,
+            text_property=sql.Identifier(self.text_node_property),
+            text_property_literal=sql.Literal(self.text_node_property),
+            embedding_property_literal=sql.Literal(self.embedding_node_property),
+        )
+
+    def _rrf_fuse(
+        self, modalities: List[List[Dict[str, Any]]], k: int
+    ) -> List[Dict[str, Any]]:
+        """Reciprocal-rank-fusion of ranked per-modality result rows."""
+        rc = 60  # RRF rank constant in 1/(rc+rank); 60 is the de-facto default
+        scores: Dict[str, float] = {}
+        data: Dict[str, Dict[str, Any]] = {}
+        for rows in modalities:
+            for rank, r in enumerate(rows):
+                scores[r["id"]] = scores.get(r["id"], 0.0) + 1.0 / (rc + rank + 1)
+                data.setdefault(r["id"], r)
+        top = sorted(scores, key=lambda i: scores[i], reverse=True)[:k]
+        return [{**data[i], "score": scores[i]} for i in top]
+
     def query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
+        if self.hybrid_search and query.query_str:
+            params = {
+                "k": query.similarity_top_k,
+                "embedding": query.query_embedding,
+                "query": remove_lucene_chars(query.query_str),
+            }
+            sem = self.database_query(self._hybrid_modality_sql("semantic"), params=params)
+            kw = self.database_query(self._hybrid_modality_sql("keyword"), params=params)
+            return self._results_to_query_result(
+                self._rrf_fuse([sem, kw], query.similarity_top_k)
+            )
         formatted_query, parameters = self._build_query(query)
         results = self.database_query(formatted_query, params=parameters)
         return self._results_to_query_result(results)
@@ -709,6 +726,17 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         self, query: VectorStoreQuery, **kwargs: Any
     ) -> VectorStoreQueryResult:
         """True-async counterpart of :meth:`query`."""
+        if self.hybrid_search and query.query_str:
+            params = {
+                "k": query.similarity_top_k,
+                "embedding": query.query_embedding,
+                "query": remove_lucene_chars(query.query_str),
+            }
+            sem = await self.adatabase_query(self._hybrid_modality_sql("semantic"), params=params)
+            kw = await self.adatabase_query(self._hybrid_modality_sql("keyword"), params=params)
+            return self._results_to_query_result(
+                self._rrf_fuse([sem, kw], query.similarity_top_k)
+            )
         formatted_query, parameters = self._build_query(query)
         results = await self.adatabase_query(formatted_query, params=parameters)
         return self._results_to_query_result(results)

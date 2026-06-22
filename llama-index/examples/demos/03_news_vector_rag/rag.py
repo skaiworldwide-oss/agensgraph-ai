@@ -83,9 +83,6 @@ def filtered(index, store, question: str) -> None:
 
 def hybrid(question: str) -> None:
     console.section("(c) hybrid search (RRF: vector + keyword)")
-    print("  note: hybrid is slow at large scale — AgensGraph doesn't use the HNSW")
-    print("  index for the vector search when it's nested in the hybrid sub-query")
-    print("  (the keyword half is fast). Plain + filtered vector search are fast.")
     # hybrid is incompatible with metadata filters, so it gets its OWN store
     # instance (same graph/label/data; it additionally builds the FTS index).
     hstore = agens.make_vector_store(graph_name=GRAPH, node_label=NODE_LABEL, hybrid_search=True)

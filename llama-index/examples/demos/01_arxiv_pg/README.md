@@ -1,56 +1,82 @@
-# 01 · arXiv PropertyGraphStore (graph + vector)
+# 01 · arXiv — graph + vector in one store
 
-A structured property graph built **deterministically** (no LLM extraction, so it
-scales) through the LlamaIndex `AgensPropertyGraphStore`, plus pgvector HNSW over
-the same entities:
+Build a property graph of papers, authors and categories, then run **four kinds
+of query over the same store**: Cypher analytics, vector search, graph
+expansion, and GraphRAG. The graph is built directly (no LLM extraction), so it
+scales to the full dataset.
 
 ```
-(Paper {id,title,abstract,year}) -[AUTHORED_BY]-> (Author {name})
-(Paper)                          -[IN_CATEGORY]-> (Category {name})
+(Paper {title, abstract, year}) -[AUTHORED_BY]-> (Author)
+(Paper)                         -[IN_CATEGORY]-> (Category)
 ```
-
-Every node lives on one `"__Node__"` vertex label with its type in a `labels`
-list (how the store models labels); Paper entities are embedded (title+abstract,
-OpenAI) so the HNSW `entity` index serves `vector_query`.
 
 ## Run
 
 ```bash
-cd llama-index
-.venv/bin/python examples/demos/01_arxiv_pg/prepare.py          # ingest + embed (ARXIV_LIMIT, default 50000)
-.venv/bin/python examples/demos/01_arxiv_pg/query.py            # analytics + vector + expansion + GraphRAG
+# from llama-index/
+.venv/bin/python examples/demos/01_arxiv_pg/prepare.py        # ingest + embed (ARXIV_LIMIT, default 50000)
+.venv/bin/python examples/demos/01_arxiv_pg/query.py
 .venv/bin/python examples/demos/01_arxiv_pg/query.py "your question"
 
-# quick dry run:
+# quick dry-run (a couple of cents):
 ARXIV_LIMIT=2000 ARXIV_RESET=1 .venv/bin/python examples/demos/01_arxiv_pg/prepare.py
 ```
 
-Knobs: `ARXIV_LIMIT` (papers), `ARXIV_BATCH` (UNWIND batch), `EMBED_CONCURRENCY`
-(parallel OpenAI requests), `EMBED_BATCH` (texts/request), `ARXIV_RESET=1`.
+Knobs: `ARXIV_LIMIT` (papers), `ARXIV_BATCH`, `EMBED_CONCURRENCY`, `EMBED_BATCH`,
+`ARXIV_RESET=1` (drop & rebuild).
 
-## What it demonstrates
+## The patterns (`prepare.py`)
 
-- **`prepare.py`** — batched `upsert_nodes`/`upsert_relations` (UNWIND + MERGE on
-  the `id` btree), then **parallel** OpenAI embedding written back with
-  `aupsert_nodes`; the HNSW `entity` index is created up front (`vector_dimension`).
-- **`query.py`** — four capabilities over the one store:
-  - **(a) analytics** via `structured_query` — top authors, largest categories,
-    papers per year. Note the idiom: `MATCH (n:"__Node__") WHERE 'Author' IN n.labels`.
-  - **(b) semantic search** via `vector_query` (HNSW) with cosine scores.
-  - **(c) graph expansion** via `get_rel_map` over the vector hits (shared authors / categories).
-  - **(d) GraphRAG** — `PropertyGraphIndex.from_existing(...)` + a
-    `VectorContextRetriever` query engine for a grounded, source-backed answer.
+Ingest entities and relationships in batches, then add embeddings:
 
-## The end result
+```python
+from llama_index.core.graph_stores.types import EntityNode, Relation
 
-One AgensGraph graph serves **analytical Cypher, vector search, graph expansion,
-and GraphRAG** over the same Paper entities — no separate graph DB + vector DB.
+store.upsert_nodes([
+    EntityNode(name=paper_id, label="Paper", properties={"title": t, "abstract": a, "year": y}),
+    EntityNode(name=author,   label="Author"),
+])
+store.upsert_relations([Relation(label="AUTHORED_BY", source_id=paper_id, target_id=author)])
 
-## Notes
+# add the embedding for vector search (re-upsert just the embedding):
+await store.aupsert_nodes([EntityNode(name=paper_id, label="Paper", embedding=vec)])
+```
 
-- At scale the wall-clock is dominated by **OpenAI embedding latency**, not
-  AgensGraph (graph ingest is seconds). Embedding runs in parallel
-  (`EMBED_CONCURRENCY`) up to your account's rate limit.
-- Building this demo surfaced — and the library now fixes — a bug where entity
-  embeddings were silently dropped on upsert for entities without a source chunk,
-  plus several scale fixes (lazy schema refresh, indexed vector/graph lookups).
+## The patterns (`query.py`)
+
+```python
+from llama_index.core.vector_stores.types import VectorStoreQuery
+from llama_index.core import PropertyGraphIndex
+from llama_index.core.indices.property_graph import VectorContextRetriever
+
+# (a) analytics — plain Cypher
+store.structured_query(
+    'MATCH (p:"__Node__")-[:"AUTHORED_BY"]->(a:"__Node__") '
+    'RETURN a.name AS author, count(*) AS papers ORDER BY papers DESC LIMIT 10')
+
+# (b) semantic search — HNSW
+nodes, scores = store.vector_query(VectorStoreQuery(query_embedding=vec, similarity_top_k=5))
+
+# (c) expand the hits through the graph
+triplets = store.get_rel_map(nodes, depth=1)
+
+# (d) GraphRAG — attach a PropertyGraphIndex to the populated store
+index = PropertyGraphIndex.from_existing(store, embed_model=embed, llm=llm, kg_extractors=[])
+answer = index.as_query_engine(
+    sub_retrievers=[VectorContextRetriever(graph_store=store, embed_model=embed)]
+).query("recent graph neural network methods?")
+```
+
+## What you get
+
+One AgensGraph graph that answers analytical Cypher, vector search, graph
+expansion and GraphRAG over the same entities — no separate graph and vector DBs
+to keep in sync.
+
+## Tips
+
+- Pass `vector_dimension=` when constructing the store, or the HNSW index isn't
+  built and vector search falls back to a sequential scan.
+- For analytics, prefer `count(*)` over `count(p)` and walk the **edges** rather
+  than filtering on node type (`'Author' IN n.labels`) — both are much faster on
+  a graph whose nodes carry embeddings.

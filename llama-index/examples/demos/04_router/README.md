@@ -1,41 +1,55 @@
-# 04 · Router — one AgensEngine, both stores
+# 04 · Router — one engine, graph + vector
 
-Ties the suite together: a LlamaIndex `RouterQueryEngine` routes a natural-language
-question to either the arXiv **property-graph** engine (demo 1) or the news
-**vector** engine (demo 3). Both stores run on the **same shared `AgensEngine`
-pool** — different graphs in one database, served concurrently.
+Route a natural-language question to the right store: a scientific question goes
+to the arXiv **graph** engine (demo 1), a current-events question to the news
+**vector** engine (demo 3). Both run on the **same `AgensEngine` pool** —
+different graphs in one database, served together.
 
 ## Run
 
-Run after demos 1 and 3 have populated their graphs, then:
+Run after demos 1 and 3 have populated their graphs:
 
 ```bash
-cd llama-index
+# from llama-index/
 .venv/bin/python examples/demos/04_router/router.py
 .venv/bin/python examples/demos/04_router/router.py "your question"
 ```
 
-## What it demonstrates
+## The pattern
 
-- One `agens.get_engine()` pool backs **both** an `AgensPropertyGraphStore`
-  (graph `arxiv`) and an `AgensgraphVectorStore` (graph `news`).
-- `RouterQueryEngine` with an `LLMSingleSelector` picks the right engine per
-  question (and prints its reasoning):
-  - a scientific question → the arXiv graph engine (`VectorContextRetriever`);
-  - a current-events question → the news vector engine.
-- A `pg_stat_activity` readout confirms the connections all come from the single
-  `application_name = 'llama-index-agensgraph'` pool.
+Build a query engine over each store, wrap each as a tool, and let a selector
+route:
 
-## The end result
+```python
+from llama_index.core.query_engine import RouterQueryEngine
+from llama_index.core.selectors import LLMSingleSelector
+from llama_index.core.tools import QueryEngineTool
 
-A graph engine and a vector engine, on different AgensGraph graphs in one
-database, behind one connection pool and one natural-language entry point —
-demonstrating that the property-graph store and the vector store interoperate in
-a single LlamaIndex pipeline.
+engine = agens.get_engine()                       # ONE shared pool
+graph_qe = PropertyGraphIndex.from_existing(arxiv_store, ...).as_query_engine(...)
+news_qe  = VectorStoreIndex.from_vector_store(news_store, ...).as_query_engine(...)
 
-## Notes
+router = RouterQueryEngine.from_defaults(
+    query_engine_tools=[
+        QueryEngineTool.from_defaults(graph_qe, name="arxiv_papers",
+            description="academic / scientific questions about papers, authors, methods"),
+        QueryEngineTool.from_defaults(news_qe, name="news_articles",
+            description="current events: business, technology, world news"),
+    ],
+    selector=LLMSingleSelector.from_defaults(llm=llm),
+)
+router.query("What are companies doing with AI?")   # -> news engine
+router.query("Who works on graph neural networks?") # -> arXiv graph engine
+```
 
-- The engine re-applies `SET graph_path` on every pooled checkout, so the two
-  stores never collide despite sharing the pool.
-- An agentic alternative (a `FunctionAgent` over the same two `QueryEngineTool`s)
-  is a natural extension; the router is the more deterministic, demonstrative default.
+## What you get
+
+A single natural-language entry point over a graph store and a vector store on
+different AgensGraph graphs — one connection pool, no cross-talk.
+
+## Tips
+
+- Pass `engine=` to every store to share one pool. The engine re-binds
+  `graph_path` on each checkout, so the two graphs never collide.
+- For a more autonomous variant, give the same two `QueryEngineTool`s to a
+  `FunctionAgent`; the router is the simpler, more predictable default.

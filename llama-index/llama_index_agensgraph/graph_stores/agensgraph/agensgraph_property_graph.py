@@ -221,6 +221,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         enhanced_schema: bool = False,
         create_indexes: bool = True,
         create: bool = True,
+        refresh_schema: bool = True,
         engine: Optional[AgensEngine] = None,
     ) -> None:
         """Create a new Agensgraph Graph instance."""
@@ -266,7 +267,16 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             ))
             self.connection.commit()
 
-        self.refresh_schema()
+        # Schema introspection scans every node's properties (including full
+        # embedding vectors), so it is O(N) and slow on large graphs — yet it ran
+        # on every construction. Make it optional: with refresh_schema=False it is
+        # deferred and computed lazily on the first get_schema()/get_schema_str().
+        self._schema_refreshed = False
+        self.structured_schema = {
+            "node_props": {}, "rel_props": {}, "relationships": {}, "metadata": {},
+        }
+        if refresh_schema:
+            self.refresh_schema()
         self.verify_vector_support()
         if create_indexes and self._supports_vector_store and not self.vector_dimension:
             logger.warning(
@@ -423,8 +433,12 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         if self.enhanced_schema:
             self._enhance_schema()
 
+        self._schema_refreshed = True
+
     def get_schema(self, refresh: bool = False) -> Any:
-        if refresh:
+        # Lazily run the (O(N)) introspection on first access if it was deferred
+        # at construction (refresh_schema=False).
+        if refresh or not self._schema_refreshed:
             self.refresh_schema()
 
         return self.structured_schema

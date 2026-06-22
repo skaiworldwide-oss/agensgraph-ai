@@ -7,18 +7,28 @@ categories + years AND a pgvector (HNSW) index over the same Paper nodes:
     (:Paper)-[:IN_CATEGORY]->(:Category {name})
     (:Paper)-[:UPDATED_IN]->(:Year {year})
 
-Data: real arXiv metadata streamed from Hugging Face (no full download).
-Scale with ARXIV_LIMIT (default 50000). Everything runs through one shared
-AgensEngine connection pool with batched Cypher UNWIND ingest.
+Data: real arXiv metadata streamed from Hugging Face (no full download). Paper
+nodes are embedded with OpenAI **concurrently** (many requests in flight) and
+indexed with pgvector HNSW. Re-runs only embed papers that don't already have an
+embedding, so a larger ARXIV_LIMIT simply APPENDS to (and reuses) an existing
+load. Everything runs through one shared AgensEngine connection pool.
 
     cd langchain
     .venv/bin/python examples/demos/01_arxiv_graphrag/prepare.py
     ARXIV_LIMIT=2000 .venv/bin/python examples/demos/01_arxiv_graphrag/prepare.py   # quick
     ARXIV_RESET=1    .venv/bin/python examples/demos/01_arxiv_graphrag/prepare.py   # rebuild
+
+Knobs: ARXIV_LIMIT (default 50000), ARXIV_BATCH, ARXIV_RESET, EMBED_CONCURRENCY
+(parallel embedding requests, default 10), EMBED_BATCH (texts per request),
+ARXIV_BUILD_MEM (e.g. "4GB" — raise maintenance_work_mem for the HNSW build when
+loading millions of papers), ARXIV_SKIP_INGEST (skip streaming/ingest and only
+embed + index already-loaded papers — useful to resume after an interruption).
 """
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import os
 import pathlib
 import sys
@@ -35,6 +45,7 @@ from langchain_agensgraph import AgensgraphVector
 
 from _common import agens, config, console
 from _common.datautil import batched, env_int, stream_hf
+from _common.models import get_embeddings
 
 GRAPH = "arxiv"
 DATASET = "UniverseTBD/arxiv-abstracts-large"
@@ -153,9 +164,87 @@ def _ingest(graph, records: Iterable[Dict[str, Any]], batch_size: int) -> Dict[s
     return {"papers": n_papers, "authored_by": n_authored, "in_category": n_incat}
 
 
+# ── parallel embedding + HNSW index ──────────────────────────────────────────
+
+def _exec_autocommit(statements: List[str], **settings: str) -> None:
+    """Run SQL on a dedicated autocommit connection (SET settings inlined first;
+    SET can't take a bind parameter — the values here are trusted constants)."""
+    with psycopg.connect(**config.conf(), autocommit=True) as conn:
+        for key, val in settings.items():
+            conn.execute(f"SET {key} = '{val}'")
+        for stmt in statements:
+            conn.execute(stmt)
+
+
+async def _embed_unembedded(graph, embed, concurrency: int, sub_batch: int) -> int:
+    """Embed every Paper whose embedding IS NULL, with concurrent OpenAI requests.
+
+    Sequential embedding is OpenAI-latency bound (~60 papers/s); issuing many
+    requests at once saturates the account's token-rate limit instead (several
+    times faster). Papers that already have an embedding are skipped, so this
+    only embeds what a re-run/append added.
+    """
+    ids = [r["id"] for r in graph.query('MATCH (p:"Paper") WHERE p.embedding IS NULL RETURN p.id AS id')]
+    n = len(ids)
+    print(f"  {n:,} papers to embed" + ("" if n else " (all already embedded — skipped)"))
+    if not n:
+        return 0
+    sem = asyncio.Semaphore(concurrency)
+
+    async def embed_sub(rows):
+        texts = [f"\ntitle: {r['title']}\nabstract: {r['abstract']}" for r in rows]
+        async with sem:
+            vecs = await embed.aembed_documents(texts)
+        return [{"id": r["id"], "embedding": v} for r, v in zip(rows, vecs)]
+
+    done = 0
+    t0 = time.perf_counter()
+    for page in batched(ids, concurrency * sub_batch):
+        rows = graph.query(
+            'UNWIND %(ids)s AS pid MATCH (p:"Paper" {id: pid}) '
+            "RETURN p.id AS id, p.title AS title, p.abstract AS abstract",
+            {"ids": Jsonb(page)},
+        )
+        for wb in await asyncio.gather(*(embed_sub(s) for s in batched(rows, sub_batch))):
+            graph.query(
+                'UNWIND %(rows)s AS row MATCH (p:"Paper" {id: row.id}) SET p.embedding = row.embedding',
+                {"rows": Jsonb(wb)},
+            )
+            done += len(wb)
+        print(f"    ... embedded {done:,}/{n:,}  ({done / (time.perf_counter() - t0):,.0f}/s)")
+    return done
+
+
+@contextlib.contextmanager
+def _build_resources(maintenance_work_mem: Optional[str]):
+    """Optionally raise maintenance_work_mem (+ parallel workers) for the HNSW
+    build (reloadable, server-wide) and reset afterwards. No-op when unset, so
+    the small-scale demo doesn't touch server config."""
+    if not maintenance_work_mem:
+        yield
+        return
+    _exec_autocommit([
+        f"ALTER SYSTEM SET maintenance_work_mem = '{maintenance_work_mem}'",
+        "ALTER SYSTEM SET max_parallel_maintenance_workers = 4",
+        "SELECT pg_reload_conf()",
+    ])
+    try:
+        yield
+    finally:
+        _exec_autocommit([
+            "ALTER SYSTEM RESET maintenance_work_mem",
+            "ALTER SYSTEM RESET max_parallel_maintenance_workers",
+            "SELECT pg_reload_conf()",
+        ])
+
+
 def main() -> None:
     limit = env_int("ARXIV_LIMIT", 50000)
     batch_size = env_int("ARXIV_BATCH", 1000)
+    concurrency = env_int("EMBED_CONCURRENCY", 10)
+    sub_batch = env_int("EMBED_BATCH", 1000)
+    build_mem = os.getenv("ARXIV_BUILD_MEM")  # e.g. "4GB"; unset = server default
+    skip_ingest = bool(os.getenv("ARXIV_SKIP_INGEST"))  # only (re-)embed + index existing papers
     config.require_openai_key()
 
     console.section(f"arXiv GraphRAG — ingest  (ARXIV_LIMIT={limit:,})")
@@ -163,24 +252,32 @@ def main() -> None:
     if os.getenv("ARXIV_RESET"):
         _reset(config.conf())
 
-    graph = agens.make_graph(GRAPH, create=True)
+    # refresh_schema=False: this script only runs explicit Cypher + the vector
+    # store, so skip the (large-graph) schema introspection scan on construction.
+    graph = agens.make_graph(GRAPH, create=True, refresh_schema=False)
     try:
         console.sub("schema (labels + property indexes)")
         _ensure_schema(graph)
 
-        console.sub("streaming + batched UNWIND ingest")
-        records = (n for n in (_norm(r) for r in stream_hf(DATASET, limit=limit)) if n)
-        counts = _ingest(graph, records, batch_size)
-        console.table(list(counts.items()), headers=["edge/node", "count"])
+        if skip_ingest:
+            console.sub("skipping ingest (ARXIV_SKIP_INGEST) — embedding existing papers")
+        else:
+            console.sub("streaming + batched UNWIND ingest")
+            records = (n for n in (_norm(r) for r in stream_hf(DATASET, limit=limit)) if n)
+            counts = _ingest(graph, records, batch_size)
+            console.table(list(counts.items()), headers=["edge/node", "count"])
 
-        # Vector index over the SAME Paper nodes: embed title+abstract in place,
-        # build the HNSW (cosine) index. Reuses the shared engine + graph.
-        console.sub("embedding Paper abstracts → pgvector HNSW (from_existing_graph)")
-        with console.timer("embed + index") as t:
-            from _common.models import get_embeddings
-
+        # Embed the Paper nodes concurrently (index-free writes), then bulk-build
+        # the pgvector HNSW index over the same nodes.
+        console.sub(f"embedding Paper abstracts (parallel, concurrency={concurrency}) → pgvector HNSW")
+        embed = get_embeddings(max_retries=10, timeout=60)
+        with console.timer("embed") as te:
+            done = asyncio.run(_embed_unembedded(graph, embed, concurrency, sub_batch))
+        if done:
+            print("  " + te.rate(done, "papers embedded"))
+        with _build_resources(build_mem), console.timer("HNSW index build"):
             AgensgraphVector.from_existing_graph(
-                embedding=get_embeddings(),
+                embedding=embed,
                 node_label="Paper",
                 embedding_node_property="embedding",
                 text_node_properties=["title", "abstract"],
@@ -188,7 +285,6 @@ def main() -> None:
                 graph_name=GRAPH,
                 engine=agens.get_engine(),
             )
-        print("  " + t.rate(counts["papers"], "papers embedded"))
 
         console.sub("done")
         total_nodes = graph.query("MATCH (n) RETURN count(n) AS c")[0]["c"]

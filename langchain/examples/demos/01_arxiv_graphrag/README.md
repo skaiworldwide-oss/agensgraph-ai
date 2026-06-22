@@ -82,3 +82,9 @@ connection pool.
   roughly 15–20 min for a full 50k run; use `ARXIV_LIMIT` to shrink it.
 - Graph expansion in step (c) gets richer as the corpus grows (more shared
   authors/categories); at a few thousand papers it is sparse.
+- **Larger workloads (millions of papers):** graph ingest stays fast, but
+  embedding throughput is bounded by **OpenAI API latency / your account's rate
+  limit** (parallelism via `EMBED_CONCURRENCY` only helps up to that ceiling),
+  and the **pgvector HNSW index build needs a large `maintenance_work_mem`**
+  (set `ARXIV_BUILD_MEM` close to the vector-data size) — otherwise the build is
+  I/O-bound and slow.

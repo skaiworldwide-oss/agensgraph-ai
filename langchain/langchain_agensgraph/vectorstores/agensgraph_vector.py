@@ -231,6 +231,9 @@ class VectorIndexAM(str, enum.Enum):
 
     HNSW = "HNSW"
     IVFFLAT = "ivfflat"
+    # TODO: DISKANN is not yet supported — it needs the pgvectorscale extension
+    # (not part of pgvector) plus its own build options. create_new_index() fails
+    # fast on it for now.
     DISKANN = "DISKANN"
 
 class FullTextIndexAM(str, enum.Enum):
@@ -238,6 +241,8 @@ class FullTextIndexAM(str, enum.Enum):
 
     GIN = "GIN"
     GIST = "GIST"
+    # TODO: SPGIST is not yet supported — SP-GiST has no tsvector opclass, so the
+    # keyword index can't use it. create_new_keyword_index() fails fast on it.
     SPGIST = "SPGIST"
 
 DEFAULT_INDEX_TYPE = IndexType.NODE
@@ -700,13 +705,17 @@ class AgensgraphVector(VectorStore):
         graph: Optional[AgensGraph] = None,
         engine: Optional["AgensEngine"] = None,
     ) -> None:
-        # Allow only cosine and euclidean distance strategies
+        # TODO: only COSINE and EUCLIDEAN_DISTANCE are wired up + tested end-to-end.
+        # The op/opclass maps above also cover MAX_INNER_PRODUCT, DOT_PRODUCT and
+        # JACCARD (pgvector supports inner product; JACCARD needs bit vectors) —
+        # enable + test those (and relevance_score_fn) before allowing them here.
         if distance_strategy not in [
             DistanceStrategy.EUCLIDEAN_DISTANCE,
             DistanceStrategy.COSINE,
         ]:
             raise ValueError(
-                "distance_strategy must be either 'EUCLIDEAN_DISTANCE' or 'COSINE'"
+                f"distance_strategy {distance_strategy} is not yet supported; "
+                "use DistanceStrategy.COSINE or DistanceStrategy.EUCLIDEAN_DISTANCE."
             )
 
         # Resolution order: explicit graph object > engine > url/env.
@@ -964,6 +973,15 @@ class AgensgraphVector(VectorStore):
             am = vector_index_am if vector_index_am is not None else self._vector_index_am
             index_config = IndexConfig(am=am)
 
+        # TODO: support DISKANN (requires the pgvectorscale extension + its build
+        # options). Fail fast for now instead of a cryptic "access method
+        # diskann does not exist" deep in the DDL.
+        if index_config.am == VectorIndexAM.DISKANN:
+            raise NotImplementedError(
+                "VectorIndexAM.DISKANN is not yet supported (requires the "
+                "pgvectorscale extension). Use VectorIndexAM.HNSW or VectorIndexAM.IVFFLAT."
+            )
+
         # make sure label exists
         self.verify_label_existence()
         index_query = """CREATE PROPERTY INDEX IF NOT EXISTS {index_name}
@@ -991,6 +1009,13 @@ class AgensgraphVector(VectorStore):
         """
         if fulltext_index_am is None:
             fulltext_index_am = self._fulltext_index_am
+        # TODO: support SPGIST (needs an SP-GiST tsvector opclass, which doesn't
+        # exist today). Fail fast instead of a cryptic opclass error in the DDL.
+        if fulltext_index_am == FullTextIndexAM.SPGIST:
+            raise NotImplementedError(
+                "FullTextIndexAM.SPGIST is not yet supported (no SP-GiST tsvector "
+                "opclass). Use FullTextIndexAM.GIN or FullTextIndexAM.GIST."
+            )
         # make sure label exists
         self.verify_label_existence()
         node_props = self.text_node_properties or [self.text_node_property]

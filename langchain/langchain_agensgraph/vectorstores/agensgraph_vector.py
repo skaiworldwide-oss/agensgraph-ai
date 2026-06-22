@@ -1428,7 +1428,9 @@ class AgensgraphVector(VectorStore):
         parameters = {
             "k": fetch_k,
             "embedding": embedding,
-            "query": remove_lucene_chars(kwargs["query"]),
+            # Only the HYBRID read query references %(query)s; for a plain VECTOR
+            # search by vector the caller need not pass a `query` text.
+            "query": remove_lucene_chars(kwargs.get("query") or ""),
             "embedding_property": self.embedding_node_property,
             "text_property": self.text_node_property,
             "text_node_properties": Jsonb(self.text_node_properties),

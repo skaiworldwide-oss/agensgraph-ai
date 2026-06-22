@@ -58,9 +58,8 @@ CHUNK_SIZE = 1000
 ENHANCED_MAX_EXAMPLES = 5
 VECTOR_INDEX_NAME = "entity"
 # A scalar copy of each node's primary type (the EntityNode label, or 'Chunk'),
-# btree-indexed so `WHERE n.__type__ = 'X'` is an index scan. The type otherwise
-# lives only in the jsonb `labels` list, where `'X' IN n.labels` can't use an
-# index (the cypher compiler's ::text cast defeats a jsonb GIN index).
+# btree-indexed so `WHERE n.__type__ = 'X'` is an index scan. The type also lives
+# in the jsonb `labels` list, but `'X' IN n.labels` cannot use an index.
 TYPE_PROPERTY = "__type__"
 LONG_TEXT_THRESHOLD = 52
 
@@ -229,8 +228,21 @@ Hard rules:
   no EXISTS { ... }; no apoc.*; no CALL { ... } subqueries. To count a node's
   degree, MATCH its relationships and use count().
 - Use only the entity types, relationship types and properties shown in the schema.
+- To count, use count(*) (or count(a small property like n.name)). Do NOT write
+  count(n) on a node variable -- that materializes each node's full properties
+  (including large embeddings) and is far slower.
 - Always end with a LIMIT of at most 50. Return ONLY the Cypher query -- no prose,
   no markdown fences.
+
+Examples:
+  Q: Which authors have the most papers?
+  MATCH (a:"__Node__") WHERE 'Author' IN a.labels
+  MATCH (a)<-[:"AUTHORED_BY"]-(p:"__Node__")
+  RETURN a.name AS author, count(*) AS papers ORDER BY papers DESC LIMIT 10
+
+  Q: How many entities of each type?
+  MATCH (n:"__Node__") UNWIND n.labels AS t WITH t WHERE t <> '__Entity__'
+  RETURN t AS type, count(*) AS n ORDER BY n DESC LIMIT 50
 
 Schema:
 {schema}
@@ -311,10 +323,9 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             ))
             self.connection.commit()
 
-        # Schema introspection scans every node's properties (including full
-        # embedding vectors), so it is O(N) and slow on large graphs — yet it ran
-        # on every construction. Make it optional: with refresh_schema=False it is
-        # deferred and computed lazily on the first get_schema()/get_schema_str().
+        # Schema introspection scans every node's properties (O(N)). With
+        # refresh_schema=False it is deferred and computed lazily on the first
+        # get_schema()/get_schema_str() call.
         self._schema_refreshed = False
         self.structured_schema = {
             "node_props": {}, "rel_props": {}, "relationships": {}, "metadata": {},
@@ -336,16 +347,12 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                         ASSERT id IS UNIQUE;"""
                 )
             )
-            # btree on the scalar primary type, so type-scoped queries
-            # (WHERE n.__type__ = 'X') are index-backed rather than a full
-            # __Node__ scan with a jsonb `'X' IN labels` membership test.
+            # btree on the scalar primary type so `WHERE n.__type__ = 'X'` is
+            # index-backed instead of a full __Node__ scan.
             self.create_property_index(TYPE_PROPERTY)
             if self._supports_vector_index:
-                # Create the HNSW index with a property-index expression that
-                # matches what the Cypher vector query generates
-                # (``n.embedding::vector(N)``), so the planner uses the index
-                # (an index on ``properties->>'embedding'`` would NOT match a
-                # Cypher property cast and would fall back to a seq scan).
+                # The HNSW index expression must match what the Cypher vector
+                # query emits (n.embedding::vector(N)) for the planner to use it.
                 self.structured_query(
                     sql.SQL(
                         "CREATE PROPERTY INDEX IF NOT EXISTS {name} ON {label} "
@@ -615,13 +622,10 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                         BASE_ENTITY_LABEL=sql.Literal(BASE_ENTITY_LABEL)
                     ), {"chunked_params": Jsonb(chunked_params)}
                 ))
-                # Write embeddings for every entity that carries one. This is a
-                # SEPARATE statement from the MENTIONS link below on purpose:
-                # AgensGraph does not persist an earlier SET when a subsequent
-                # `WITH ... WHERE` filters out every row ahead of a MERGE, so folding
-                # the embedding write into the triplet_source_id branch silently
-                # dropped embeddings for any entity that has no source chunk (e.g. a
-                # structured / non-LLM-extracted graph).
+                # Write embeddings in a SEPARATE statement from the MENTIONS link
+                # below: AgensGraph does not persist an earlier SET when a later
+                # `WITH ... WHERE` filters out every row ahead of a MERGE, so
+                # combining them drops the embedding for entities with no chunk.
                 ops.append((
                     sql.SQL("""
                     UNWIND %(chunked_params)s AS row
@@ -746,9 +750,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         query += "WHERE e.id IS NOT NULL "
         if ids is not None and len(ids) == 0:
             # An explicit empty id list means "no nodes". Without this guard the
-            # `if ids:` below would skip the filter entirely and the query would
-            # match the ENTIRE graph — e.g. get_llama_nodes([]) (no source docs)
-            # fetched all 130k+ nodes, making include_text retrieval take ~29s.
+            # `if ids:` below skips the filter and the query matches every node.
             query += "AND false "
         elif ids:
             frag, id_params = self._or_equalities("e.id", ids, "get_id")
@@ -967,11 +969,9 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         # previous `UNWIND idx ... WHERE e.id = ids[idx]` dynamic subscript
         # forced a sequential scan of the whole node set per call.
         seed_frag, seed_params = self._or_equalities("e.id", ids, "rmid")
-        # AgensGraph's variable-length-edge engine is pathologically slow even at
-        # depth 1 -- a plain 1-hop match returns the same rows ~1000x faster
-        # (~12 ms vs ~17 s for depth-1 over a few seeds on a 50k-node graph). Use a
-        # fixed pattern for the common depth<=1 case; only fall back to the
-        # *1..depth path for genuine multi-hop maps.
+        # AgensGraph's variable-length-edge engine is far slower than an equivalent
+        # fixed pattern even at depth 1, so use a plain 1-hop match for the common
+        # depth<=1 case and the *1..depth path only for multi-hop maps.
         if depth <= 1:
             traversal = (
                 """
@@ -1430,9 +1430,12 @@ class AgensPropertyGraphStore(PropertyGraphStore):
     _NUMERIC_TYPES = {"INTEGER", "FLOAT", "NUMBER"}
 
     def _label_count(self, label: str) -> int:
+        # Use the indexed scalar __type__ (not `IN labels`, which scans every node)
+        # and count(*) (not count(a), which materializes every vertex, including
+        # its embedding).
         rows = self.structured_query(
             sql.SQL(
-                "MATCH (a:{base_label}) WHERE %(label)s IN a.labels RETURN count(a) AS c"
+                "MATCH (a:{base_label}) WHERE a.__type__ = %(label)s RETURN count(*) AS c"
             ).format(base_label=sql.Identifier(BASE_NODE_LABEL)),
             {"label": Jsonb(label)},
         )

@@ -77,10 +77,10 @@ code patterns.
 
 | # | What you build | Run |
 |---|----------------|-----|
-| [**01_arxiv_pg**](01_arxiv_pg) | a structured graph + vector search + GraphRAG over arXiv | `prepare.py` → `query.py` |
+| [**01_arxiv_pg**](01_arxiv_pg) | a structured graph + vector search + GraphRAG over arXiv, plus `get`/`get_triplets` and an upsert→delete lifecycle | `prepare.py` → `query.py` |
 | [**02_wikipedia_pgindex**](02_wikipedia_pgindex) | an LLM-extracted knowledge graph + natural-language Q&A | `build.py` → `ask.py` |
-| [**03_news_vector_rag**](03_news_vector_rag) | vector RAG over news: semantic, filtered, hybrid, cited | `ingest.py` → `rag.py` |
-| [**04_router**](04_router) | one engine routing questions to the graph or the vector store | `router.py` |
+| [**03_news_vector_rag**](03_news_vector_rag) | vector RAG over news: semantic, filtered (full operator set), hybrid, cited, plus the store-mutation lifecycle | `ingest.py` → `rag.py` |
+| [**04_router**](04_router) | one engine routing questions to the graph or the vector store — router *and* `FunctionAgent` | `router.py` |
 
 Every demo also ships a **pre-executed notebook** (e.g.
 [`01_arxiv_pg/arxiv_pg.ipynb`](01_arxiv_pg/arxiv_pg.ipynb)) — a narrated,

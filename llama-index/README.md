@@ -19,10 +19,10 @@ blocks.
 
 | Demo | What you build |
 |------|----------------|
-| [01 · arXiv](./examples/demos/01_arxiv_pg) | a property graph + vector search + GraphRAG in one store |
+| [01 · arXiv](./examples/demos/01_arxiv_pg) | a property graph + vector search + GraphRAG in one store, with `get`/`get_triplets` and an upsert→delete lifecycle |
 | [02 · Wikipedia](./examples/demos/02_wikipedia_pgindex) | an LLM-built knowledge graph + natural-language (Text2Cypher) Q&A |
-| [03 · News](./examples/demos/03_news_vector_rag) | vector RAG: semantic, metadata-filtered, hybrid, and cited |
-| [04 · Router](./examples/demos/04_router) | one `AgensEngine` routing questions to the graph or the vector store |
+| [03 · News](./examples/demos/03_news_vector_rag) | vector RAG: semantic, metadata-filtered (full operator set), hybrid, and cited, plus the store-mutation lifecycle |
+| [04 · Router](./examples/demos/04_router) | one `AgensEngine` routing questions to the graph or the vector store — router *and* `FunctionAgent` |
 
 Each demo folder also ships a **pre-executed notebook** — a narrated, end-to-end
 tour with real embedded outputs.

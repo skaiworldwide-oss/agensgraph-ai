@@ -6,6 +6,8 @@ Run after prepare.py. Demonstrates, against the same AgensPropertyGraphStore:
   (b) vector_query      — HNSW semantic search over Paper entities, with scores
   (c) get_rel_map       — expand the vector hits through the graph (shared authors)
   (d) GraphRAG          — PropertyGraphIndex.from_existing → grounded LLM answer
+  (e) get / get_triplets — fetch nodes by id/property and the triplets around them
+  (f) mutation lifecycle — upsert → get → delete on a throwaway scratch graph
 
     cd llama-index
     .venv/bin/python examples/demos/01_arxiv_pg/query.py
@@ -22,9 +24,13 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from llama_index.core import PropertyGraphIndex
+from llama_index.core.graph_stores.types import EntityNode, Relation
 from llama_index.core.indices.property_graph import VectorContextRetriever
 from llama_index.core.query_engine import RetrieverQueryEngine
 from llama_index.core.vector_stores.types import VectorStoreQuery
+
+from llama_index_agensgraph.engine import AgensEngine
+from llama_index_agensgraph.graph_stores.agensgraph import AgensPropertyGraphStore
 
 from _common import agens, config, console
 from _common.models import EMBED_DIM, get_embed_model, get_llm
@@ -131,6 +137,68 @@ def graphrag(store, embed_model, llm, question: str) -> None:
         print(f"\n  grounded on {len(resp.source_nodes)} retrieved context nodes")
 
 
+def read_back(store, hits) -> None:
+    console.section("(e) read by id / triplets — get + get_triplets (read-only)")
+    if not hits:
+        print("  (no seed nodes)")
+        return
+    ids = [n.name for n in hits[:3]]
+    console.sub("get(ids=...) — fetch specific Paper nodes by id")
+    for n in store.get(ids=ids):
+        title = (n.properties or {}).get("title", n.name)
+        print(f"  [{n.name}] {str(title)[:80]}")
+    console.sub("get_triplets(entity_names=...) — relations leaving the top paper")
+    triplets = store.get_triplets(entity_names=ids[:1])
+    for src, rel, tgt in triplets[:12]:
+        print(f"  ({src.name}) -[{rel.label}]-> ({tgt.name})")
+    if not triplets:
+        print("  (no outgoing triplets for this paper)")
+
+
+def crud_lifecycle() -> None:
+    console.section("(f) mutation lifecycle — upsert / get / get_triplets / delete")
+    # Everything here runs on a SEPARATE throwaway graph so the populated `arxiv`
+    # graph is never mutated. Its engine is built with from_conf (the dict-based
+    # constructor) — the shared demo pool uses from_url; both reach the same DB.
+    engine = AgensEngine.from_conf(config.conf())
+    names = lambda nodes: ", ".join(n.name for n in nodes) or "(none)"
+    try:
+        store = AgensPropertyGraphStore(
+            "crud_demo",  # a plain scratch graph (AgensGraph reserves the pg_ prefix)
+            conf=config.conf(),
+            vector_dimension=EMBED_DIM,
+            create=True,
+            create_indexes=True,
+            refresh_schema=False,
+            engine=engine,
+        )
+        store.structured_query('MATCH (n:"__Node__") DETACH DELETE n')  # idempotent reset
+        store.upsert_nodes([
+            EntityNode(name="demo:p1", label="Paper", properties={"title": "Graphs for X", "year": 2024}),
+            EntityNode(name="demo:p2", label="Paper", properties={"title": "Graphs for Y", "year": 2025}),
+            EntityNode(name="demo:alice", label="Author"),
+        ])
+        store.upsert_relations([
+            Relation(label="AUTHORED_BY", source_id="demo:p1", target_id="demo:alice"),
+            Relation(label="AUTHORED_BY", source_id="demo:p2", target_id="demo:alice"),
+        ])
+        console.sub("after upsert — get(ids=...)")
+        print("  " + names(store.get(ids=["demo:p1", "demo:p2", "demo:alice"])))
+        console.sub("get(properties={'year': 2025})")
+        print("  " + names(store.get(properties={"year": 2025})))
+        console.sub("get_triplets(entity_names=['demo:p1', 'demo:p2'])")
+        for src, rel, tgt in store.get_triplets(entity_names=["demo:p1", "demo:p2"]):
+            print(f"  ({src.name}) -[{rel.label}]-> ({tgt.name})")
+        console.sub("delete(ids=['demo:p1']) then delete(entity_names=['demo:alice'])")
+        store.delete(ids=["demo:p1"])
+        store.delete(entity_names=["demo:alice"])
+        print("  remaining: " + names(store.get(ids=["demo:p1", "demo:p2", "demo:alice"])))
+        store.structured_query('MATCH (n:"__Node__") DETACH DELETE n')  # leave the scratch graph empty
+        print("\n  ✓ upsert → get → get_triplets → delete verified (arxiv untouched)")
+    finally:
+        engine.close()
+
+
 def main() -> None:
     config.require_openai_key()
     question = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_QUESTION
@@ -144,6 +212,8 @@ def main() -> None:
         hits = vector_search(store, embed_model, question)
         expand(store, hits)
         graphrag(store, embed_model, llm, question)
+        read_back(store, hits)
+        crud_lifecycle()
     finally:
         agens.close()
 

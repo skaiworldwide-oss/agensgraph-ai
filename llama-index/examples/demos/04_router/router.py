@@ -1,8 +1,9 @@
 """Combined routing — one AgensEngine, both stores, one router.
 
-Ties the previous demos together: a LlamaIndex RouterQueryEngine routes a natural
--language question to either the arXiv **property-graph** engine (demo 1) or the
-news **vector** engine (demo 3). Both stores are built on the SAME shared
+Ties the previous demos together two ways. A LlamaIndex RouterQueryEngine routes
+a natural-language question to either the arXiv **property-graph** engine (demo 1)
+or the news **vector** engine (demo 3); then a **FunctionAgent** is given the same
+two tools as an autonomous alternative. Both stores are built on the SAME shared
 AgensEngine connection pool — different graphs in one database, served together.
 
 Run after 01_arxiv_pg/prepare.py and 03_news_vector_rag/ingest.py.
@@ -14,12 +15,14 @@ Run after 01_arxiv_pg/prepare.py and 03_news_vector_rag/ingest.py.
 
 from __future__ import annotations
 
+import asyncio
 import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from llama_index.core import PropertyGraphIndex, VectorStoreIndex
+from llama_index.core.agent.workflow import FunctionAgent
 from llama_index.core.indices.property_graph import VectorContextRetriever
 from llama_index.core.query_engine import RetrieverQueryEngine, RouterQueryEngine
 from llama_index.core.selectors import LLMSingleSelector
@@ -47,7 +50,7 @@ def pool_activity() -> None:
         print(f"  {r['c']} connection(s)  state={r['state']}  app=llama-index-agensgraph")
 
 
-def build_router(llm, embed_model) -> RouterQueryEngine:
+def build_tools(llm, embed_model) -> list[QueryEngineTool]:
     # arXiv graph engine — VectorContextRetriever (vector_query + get_rel_map).
     arxiv_store = agens.make_pg_store(ARXIV_GRAPH, vector_dimension=EMBED_DIM, create=False)
     arxiv_index = PropertyGraphIndex.from_existing(
@@ -67,7 +70,7 @@ def build_router(llm, embed_model) -> RouterQueryEngine:
         news_store, embed_model=embed_model
     ).as_query_engine(similarity_top_k=5, llm=llm)
 
-    tools = [
+    return [
         QueryEngineTool.from_defaults(
             graph_qe, name="arxiv_papers",
             description=(
@@ -83,6 +86,9 @@ def build_router(llm, embed_model) -> RouterQueryEngine:
                 "via semantic vector search."),
         ),
     ]
+
+
+def build_router(tools, llm) -> RouterQueryEngine:
     return RouterQueryEngine.from_defaults(
         query_engine_tools=tools,
         selector=LLMSingleSelector.from_defaults(llm=llm),
@@ -91,12 +97,37 @@ def build_router(llm, embed_model) -> RouterQueryEngine:
     )
 
 
+async def agent_variant(tools, llm, question: str) -> None:
+    console.section("agentic variant — FunctionAgent over the same two tools")
+    # Same two QueryEngineTools, but the agent decides which to call (and may call
+    # more than one). FunctionAgent.run is async, so it exercises the engine's
+    # ASYNC pool — the router above used the sync pool, same shared AgensEngine.
+    agent = FunctionAgent(
+        tools=tools,
+        llm=llm,
+        system_prompt=(
+            "Answer the question using the tools. Use `arxiv_papers` for "
+            "scientific/academic questions and `news_articles` for current "
+            "events; call a tool, then answer from its result."),
+    )
+    print(f"  Q: {question}\n")
+    try:
+        with console.timer("agent run"):
+            resp = await agent.run(question)
+        print("  " + str(resp).strip().replace("\n", "\n  "))
+    finally:
+        # Close BOTH pools from inside this event loop (the async pool's workers
+        # are bound to it) so nothing is orphaned at exit.
+        await agens.aclose()
+
+
 def main() -> None:
     config.require_openai_key()
     questions = [sys.argv[1]] if len(sys.argv) > 1 else DEFAULT_QUESTIONS
     configure_settings()
     llm, embed_model = get_llm(), get_embed_model()
-    router = build_router(llm, embed_model)
+    tools = build_tools(llm, embed_model)
+    router = build_router(tools, llm)
     try:
         for q in questions:
             console.section(f"Q: {q}")
@@ -108,6 +139,8 @@ def main() -> None:
                       f"(reason: {sel.selections[0].reason[:100]})")
             print("  " + str(resp).strip().replace("\n", "\n  "))
         pool_activity()
+        # autonomous alternative to the router — same tools, agent picks
+        asyncio.run(agent_variant(tools, llm, questions[-1]))
     finally:
         agens.close()
 

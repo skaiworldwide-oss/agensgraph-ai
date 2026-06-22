@@ -1,9 +1,10 @@
 # 01 · arXiv — graph + vector in one store
 
-Build a property graph of papers, authors and categories, then run **four kinds
-of query over the same store**: Cypher analytics, vector search, graph
-expansion, and GraphRAG. The graph is built directly (no LLM extraction), so it
-scales to the full dataset.
+Build a property graph of papers, authors and categories, then **query, read and
+mutate the same store**: Cypher analytics, vector search, graph expansion and
+GraphRAG, plus the `get`/`get_triplets` read API and a full upsert → delete
+lifecycle. The graph is built directly (no LLM extraction), so it scales to the
+full dataset.
 
 ```
 (Paper {title, abstract, year}) -[AUTHORED_BY]-> (Author)
@@ -68,13 +69,22 @@ index = PropertyGraphIndex.from_existing(store, embed_model=embed, llm=llm, kg_e
 answer = index.as_query_engine(
     sub_retrievers=[VectorContextRetriever(graph_store=store, embed_model=embed)]
 ).query("recent graph neural network methods?")
+
+# (e) read by id / property, and the triplets around a node
+papers   = store.get(ids=["0704.0001"])            # also: get(properties={"year": 2024})
+triplets = store.get_triplets(entity_names=["0704.0001"])
+
+# (f) mutate — upsert / delete (the demo does this on a throwaway `crud_demo` graph)
+store.upsert_nodes([EntityNode(name="x", label="Paper", properties={"year": 2025})])
+store.delete(ids=["x"])                             # also: delete(entity_names=[...], properties={...})
 ```
 
 ## What you get
 
 One AgensGraph graph that answers analytical Cypher, vector search, graph
-expansion and GraphRAG over the same entities — no separate graph and vector DBs
-to keep in sync.
+expansion and GraphRAG over the same entities — and that you can read back by
+id/property and mutate (upsert/delete) — no separate graph and vector DBs to
+keep in sync.
 
 ## Tips
 

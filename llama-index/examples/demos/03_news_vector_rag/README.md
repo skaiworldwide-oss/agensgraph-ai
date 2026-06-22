@@ -2,7 +2,9 @@
 
 Use `AgensgraphVectorStore` as a LlamaIndex `VectorStoreIndex`: ingest news
 articles with metadata, then query four ways — plain semantic search,
-metadata-filtered, hybrid (vector + keyword), and RAG with citations.
+metadata-filtered, hybrid (vector + keyword), and RAG with citations. It also
+shows the full metadata-filter operator set and the store-mutation lifecycle
+(`get_nodes` / `delete_nodes` / `delete` / `clear`).
 
 📓 **Guided tour:** [`news_vector_rag.ipynb`](./news_vector_rag.ipynb) is a
 pre-executed notebook walking through every capability below with real outputs —
@@ -65,13 +67,27 @@ VectorStoreIndex.from_vector_store(hybrid).as_retriever(
 
 # RAG with inline [N] citations
 CitationQueryEngine.from_args(index, similarity_top_k=5).query("...")
+
+# richer operators — the full set plus nested boolean groups
+MetadataFilters(condition=FilterCondition.AND, filters=[
+    MetadataFilter(key="domain", operator=FilterOperator.NIN, value=["example.com"]),
+    MetadataFilters(condition=FilterCondition.OR, filters=[
+        MetadataFilter(key="url",   operator=FilterOperator.CONTAINS,   value="http"),
+        MetadataFilter(key="title", operator=FilterOperator.TEXT_MATCH, value="AI")])])
+# EQ NE GT GTE LT LTE IN NIN CONTAINS TEXT_MATCH ANY ALL IS_EMPTY (+ nested AND/OR)
+
+# store lifecycle — read back and delete (no query embedding needed)
+vectors.get_nodes(filters=filters)       # fetch by id and/or metadata
+vectors.delete_nodes(filters=filters)    # delete by id and/or metadata
+vectors.delete(ref_doc_id="doc-1")       # delete every chunk of one source document
+vectors.clear()                          # drop all nodes for this label
 ```
 
 ## What you get
 
-Semantic, filtered, hybrid and cited retrieval over a large corpus — all from
-one AgensGraph graph with an HNSW vector index, a full-text index, and btree
-indexes on the metadata you filter on.
+Semantic, filtered, hybrid and cited retrieval over a large corpus — plus full
+CRUD over the stored chunks — all from one AgensGraph graph with an HNSW vector
+index, a full-text index, and btree indexes on the metadata you filter on.
 
 ## Tips
 

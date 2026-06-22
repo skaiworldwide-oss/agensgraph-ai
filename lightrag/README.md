@@ -14,6 +14,22 @@ four** LightRAG storage types:
 
 You can mix and match — use AgensGraph for the graph only, or for everything.
 
+## Demos
+
+A runnable demo suite lives in [`examples/demos/`](./examples/demos) — five focused,
+big-data examples on real public datasets (Wikipedia, CC-News), each with a README
+and a pre-executed notebook:
+
+| Demo | Shows |
+|---|---|
+| [01 · KG modes](./examples/demos/01_kg_modes) | an LLM-built KG + the five query modes (naive/local/global/hybrid/mix) — dual-level retrieval |
+| [02 · Incremental](./examples/demos/02_incremental) | incremental ingestion, the doc-status pipeline, and cross-document entity merging |
+| [03 · Explore](./examples/demos/03_kg_explore) | exploring the extracted KG (popular labels, search, subgraph export) + multi-hop |
+| [04 · Curation](./examples/demos/04_curation) | merging, editing, and deleting entities/relations/documents |
+| [05 · Workspace](./examples/demos/05_workspace) | multi-tenancy — isolated tenants in one database |
+
+Start at [`examples/demos/README.md`](./examples/demos/README.md).
+
 ## Requirements
 
 - Python 3.10+

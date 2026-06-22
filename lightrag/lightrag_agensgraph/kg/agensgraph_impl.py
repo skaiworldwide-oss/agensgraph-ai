@@ -75,14 +75,27 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
         print("no preloading of graph with Agensgraph in production")
 
     def __post_init__(self):
-        # Preserve the original semantics: the graph name comes from the
-        # storage namespace, falling back to AGENSGRAPH_GRAPHNAME. (Relational
-        # stores isolate tenants by `workspace`; the graph store by graph name.)
-        self.graph_name = self.namespace or os.environ.get(
-            "AGENSGRAPH_GRAPHNAME", "lightrag"
-        )
+        # The graph name comes from the storage namespace, falling back to
+        # AGENSGRAPH_GRAPHNAME. LightRAG hardcodes the graph namespace
+        # (`chunk_entity_relation`), so to isolate tenants the way its other
+        # backends do (Neo4j uses a per-workspace node label, NetworkX a
+        # per-workspace subdirectory) we fold `workspace` into the graph name.
+        # An empty workspace is unchanged, so existing single-tenant graphs and
+        # the AGENSGRAPH_GRAPHNAME convention keep working.
+        base_name = self.namespace or os.environ.get("AGENSGRAPH_GRAPHNAME", "lightrag")
+        self.graph_name = self._graph_name_for(base_name, getattr(self, "workspace", "") or "")
         self._graph_path = self.graph_name
         self._engine = None
+
+    @staticmethod
+    def _graph_name_for(base_name: str, workspace: str) -> str:
+        """Per-workspace graph name (a valid AgensGraph schema identifier)."""
+        if not workspace:
+            return base_name
+        safe = "".join(c if c.isalnum() else "_" for c in workspace.lower()).strip("_")
+        if not safe or safe[0].isdigit() or safe.startswith("pg_"):
+            safe = "w_" + safe
+        return f"{safe}_{base_name}"[:63]  # Postgres identifier limit
 
     async def initialize(self):
         """Acquire the shared engine and bootstrap the graph (once)."""

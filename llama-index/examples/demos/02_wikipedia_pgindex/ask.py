@@ -31,7 +31,7 @@ from llama_index.core.indices.property_graph import (
 from llama_index.core.query_engine import RetrieverQueryEngine
 
 from _common import agens, config, console
-from _common.cypher import AGENS_CYPHER_PROMPT, SafeTextToCypherRetriever, read_only_validator
+from _common.cypher import SafeTextToCypherRetriever, read_only_validator
 from _common.models import EMBED_DIM, configure_settings, get_embed_model, get_llm
 
 GRAPH = "wikipedia_kg"
@@ -48,7 +48,6 @@ def text2cypher_demo(store, llm) -> None:
     t2c = SafeTextToCypherRetriever(
         graph_store=store,
         llm=llm,
-        text_to_cypher_template=AGENS_CYPHER_PROMPT,
         cypher_validator=read_only_validator,
     )
     for q in DEFAULT_QUESTIONS[:2]:
@@ -68,7 +67,7 @@ def ask(index, llm, questions) -> None:
     )
     t2c = SafeTextToCypherRetriever(
         graph_store=store, llm=llm,
-        text_to_cypher_template=AGENS_CYPHER_PROMPT, cypher_validator=read_only_validator,
+        cypher_validator=read_only_validator,
     )
     retriever = index.as_retriever(sub_retrievers=[syn, vec, t2c])
     qe = RetrieverQueryEngine.from_args(retriever, llm=llm)

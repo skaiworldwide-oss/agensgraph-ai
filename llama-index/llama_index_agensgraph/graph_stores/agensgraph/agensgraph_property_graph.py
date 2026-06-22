@@ -197,6 +197,45 @@ typeof_function = r"""
 
 logger = logging.getLogger(__name__)
 
+# Default Text2Cypher prompt tuned for this store's storage model. LlamaIndex's
+# generic DEFAULT_CYPHER_TEMPALTE assumes Neo4j-style labels and makes the LLM emit
+# Cypher this store cannot run -- every node lives on one "__Node__" vertex label
+# with its entity type held in a `labels` list, so `(:Person)` matches nothing, and
+# AgensGraph rejects Neo4j-only constructs. This template teaches that model.
+AGENS_CYPHER_TEMPLATE_STR = """\
+Task: generate a single read-only AgensGraph (openCypher) query to answer the question.
+
+How this graph is stored (important):
+- EVERY node uses one vertex label: "__Node__". Match nodes as (n:"__Node__").
+- The entity TYPES in the schema below (e.g. Person, Organization) are NOT Cypher
+  labels -- they are string values held in each node's `labels` list property. To
+  restrict to a type, filter the list: WHERE 'Person' IN n.labels.
+- The human-readable name of an entity is the property n.name; other properties are
+  as named in the schema.
+- Relationship TYPES are real edge labels: write them double-quoted, e.g.
+  (a)-[r:"WORKS_AT"]->(b), or use an untyped (a)-[r]->(b) and read type(r). Use only
+  relationship types shown in the schema.
+
+Hard rules:
+- Read-only ONLY: MATCH / OPTIONAL MATCH / WHERE / WITH / RETURN / ORDER BY / LIMIT.
+  Never CREATE / MERGE / SET / DELETE / REMOVE / DROP / DETACH.
+- AgensGraph is NOT Neo4j. Do NOT use Neo4j-only constructs: no pattern expressions
+  inside expressions such as size((n)--()) or [(n)-->(m) | m]; no COUNT { ... };
+  no EXISTS { ... }; no apoc.*; no CALL { ... } subqueries. To count a node's
+  degree, MATCH its relationships and use count().
+- Use only the entity types, relationship types and properties shown in the schema.
+- Always end with a LIMIT of at most 50. Return ONLY the Cypher query -- no prose,
+  no markdown fences.
+
+Schema:
+{schema}
+
+Question: {question}
+Cypher query:"""
+
+AGENS_CYPHER_TEMPLATE = PromptTemplate(AGENS_CYPHER_TEMPLATE_STR)
+
+
 class AgensPropertyGraphStore(PropertyGraphStore):
     """
     AgensGraph Property Graph Store.
@@ -209,7 +248,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
 
     supports_structured_queries: bool = True
     supports_vector_queries: bool = True
-    text_to_cypher_template: PromptTemplate = DEFAULT_CYPHER_TEMPALTE
+    text_to_cypher_template: PromptTemplate = AGENS_CYPHER_TEMPLATE
 
     @require_psycopg
     def __init__(

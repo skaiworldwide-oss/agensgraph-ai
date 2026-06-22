@@ -57,6 +57,11 @@ CHUNK_SIZE = 1000
 # Max example values kept per property in the enhanced schema.
 ENHANCED_MAX_EXAMPLES = 5
 VECTOR_INDEX_NAME = "entity"
+# A scalar copy of each node's primary type (the EntityNode label, or 'Chunk'),
+# btree-indexed so `WHERE n.__type__ = 'X'` is an index scan. The type otherwise
+# lives only in the jsonb `labels` list, where `'X' IN n.labels` can't use an
+# index (the cypher compiler's ::text cast defeats a jsonb GIN index).
+TYPE_PROPERTY = "__type__"
 LONG_TEXT_THRESHOLD = 52
 
 # Since we do not support multiple labels, we will maintain the extra labels as a list
@@ -134,7 +139,7 @@ node_properties_query = f"""
     UNWIND a.labels AS label
     UNWIND keys(properties(a)) AS prop
     WITH label, prop, typeof(properties(a)[prop]) AS vtype
-    WHERE prop != 'labels' AND label != '{BASE_ENTITY_LABEL}'
+    WHERE prop != 'labels' AND prop != '__type__' AND label != '{BASE_ENTITY_LABEL}'
     WITH label, prop AS property, COLLECT(DISTINCT vtype) AS types
     RETURN label, COLLECT({{'property': property, 'type': types[0]}}) as props;
 """
@@ -326,11 +331,15 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         if create_indexes:
             self.structured_query(
                 constraint_wrapper.format(
-                    f"""CREATE CONSTRAINT unique_id 
-                        ON "{BASE_NODE_LABEL}" 
+                    f"""CREATE CONSTRAINT unique_id
+                        ON "{BASE_NODE_LABEL}"
                         ASSERT id IS UNIQUE;"""
                 )
             )
+            # btree on the scalar primary type, so type-scoped queries
+            # (WHERE n.__type__ = 'X') are index-backed rather than a full
+            # __Node__ scan with a jsonb `'X' IN labels` membership test.
+            self.create_property_index(TYPE_PROPERTY)
             if self._supports_vector_index:
                 # Create the HNSW index with a property-index expression that
                 # matches what the Cypher vector query generates
@@ -581,7 +590,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                     MERGE (c:{BASE_NODE_LABEL} {{id: row.id}})
                     SET c.text = row.text, c.labels = append_label(c.labels, 'Chunk')
                     WITH c, row
-                    SET c += row.properties, c.embedding = row.embedding
+                    SET c += row.properties, c.embedding = row.embedding, c.__type__ = 'Chunk'
                     RETURN count(*)
                     """).format(
                         BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL)
@@ -599,7 +608,8 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                     SET e.name = CASE WHEN row.name IS NOT NULL THEN row.name ELSE e.name END,
                         e.labels = append_label(e.labels, {BASE_ENTITY_LABEL})
                     WITH e, row
-                    SET e.labels = append_label(e.labels, row.label)
+                    SET e.labels = append_label(e.labels, row.label),
+                        e.__type__ = row.label
                     """).format(
                         BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL),
                         BASE_ENTITY_LABEL=sql.Literal(BASE_ENTITY_LABEL)
@@ -729,7 +739,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         """Build the (query, params) for :meth:`get`."""
         query = """SELECT t.name,
                             t.type,
-                            (t.properties - 'labels') || '{{"embedding": null, "id": null}}'::jsonb AS properties
+                            (t.properties - 'labels' - '__type__') || '{{"embedding": null, "id": null}}'::jsonb AS properties
                      FROM ("""
         params: Dict[str, Any] = {}
         query += 'MATCH (e:{BASE_NODE_LABEL}) '
@@ -837,10 +847,10 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                         t.rel_prop,
                         t.source_id,
                         t.source_type,
-                        (t.source_properties - 'labels') || '{{"embedding": null, "name": null}}'::jsonb AS source_properties,
+                        (t.source_properties - 'labels' - '__type__') || '{{"embedding": null, "name": null}}'::jsonb AS source_properties,
                         t.target_id,
                         t.target_type,
-                        (t.target_properties - 'labels') || '{{"embedding": null, "name": null}}'::jsonb AS target_properties
+                        (t.target_properties - 'labels' - '__type__') || '{{"embedding": null, "name": null}}'::jsonb AS target_properties
                 FROM ("""
         query += "MATCH (e)-[r]->(t) "
         query += "WHERE {BASE_ENTITY_LABEL} IN e.labels "
@@ -945,12 +955,12 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             return triples
         query = """SELECT t.source_id,
                             t.source_type,
-                            (t.source_properties - 'labels') || '{{"embedding": null, "id": null}}'::jsonb AS source_properties,
+                            (t.source_properties - 'labels' - '__type__') || '{{"embedding": null, "id": null}}'::jsonb AS source_properties,
                             t.type,
                             t.rel_properties,
                             t.target_id,
                             t.target_type,
-                            (t.target_properties - 'labels') || '{{"embedding": null, "id": null}}'::jsonb AS target_properties
+                            (t.target_properties - 'labels' - '__type__') || '{{"embedding": null, "id": null}}'::jsonb AS target_properties
                       FROM (
                 """
         # OR-of-equalities seed match uses the id index (BitmapOr), whereas the
@@ -1115,7 +1125,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 SELECT
                     t.name,
                     t.type,
-                    (t.properties - 'labels') || '{{"embedding": null, "name": null, "id": null}}'::jsonb AS properties,
+                    (t.properties - 'labels' - '__type__') || '{{"embedding": null, "name": null, "id": null}}'::jsonb AS properties,
                     t.similarity
                 FROM (
                     MATCH (n: {BASE_NODE_LABEL})
@@ -1156,7 +1166,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             vector_query = """SELECT t.name,
                                 t.type,
                                 t.similarity,
-                                (t.properties - 'labels') || '{{"embedding": null, "name": null, "id": null}}'::jsonb AS properties
+                                (t.properties - 'labels' - '__type__') || '{{"embedding": null, "name": null, "id": null}}'::jsonb AS properties
                             FROM (
                             """
             vector_query += """

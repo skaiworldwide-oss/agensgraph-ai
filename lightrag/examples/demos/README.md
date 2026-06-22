@@ -20,11 +20,19 @@ These demos run on real public datasets (Wikipedia, CC-News) and use **OpenAI**
 for all embeddings + LLM calls (nothing runs on a local model).
 
 > **Cost note — read this first.** Unlike plain vector RAG, LightRAG calls the LLM
-> on *every chunk* at insert time to extract entities and relationships. Cost and
-> time scale with the corpus (~2–3 `gpt-4o-mini` calls/chunk). The demos default
-> to ~1,000 documents (≈$8–15, ≈45–90 min); **every build script prints a cost
-> estimate before it spends anything**, and all sizes are env-overridable — start
-> with a tiny `*_LIMIT` dry-run.
+> on *every chunk* at insert time to extract entities and relationships, so cost
+> and time scale with the corpus (~2–3 `gpt-4o-mini` calls/chunk). In practice the
+> flagship build (~1,000 short Wikipedia articles → ~15k entities) ran in **~1.5–2
+> hours for a few dollars** of `gpt-4o-mini`. **Every build script prints a cost
+> estimate before it spends anything**, and all sizes are env-overridable — always
+> start with a tiny `*_LIMIT` dry-run (a few cents, ~1 min).
+
+## What you'll need
+
+- A running **AgensGraph** with the `vector` extension (the local dev instance on
+  `localhost:55432` works out of the box — each demo creates its own database).
+- An **OpenAI API key**.
+- Python 3.10+ and [`uv`](https://github.com/astral-sh/uv) (or `pip`).
 
 ## Quickstart
 

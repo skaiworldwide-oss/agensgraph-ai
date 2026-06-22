@@ -39,7 +39,8 @@ other's content.
 Multi-tenant RAG on a single AgensGraph database — each tenant's graph, vectors,
 documents, and ingestion status isolated by `workspace`.
 
-> Heads-up: per-workspace **graph** isolation requires the graph name to include
-> the workspace. Early `lightrag-agensgraph` isolated only the relational stores
-> by workspace; this suite folds `workspace` into the graph name so the graph is
-> isolated too (an empty workspace is unchanged).
+> How it works: per-workspace **graph** isolation needs the graph name to include
+> the workspace. `lightrag-agensgraph` folds `workspace` into the graph name
+> (e.g. `acme_chunk_entity_relation`) so each tenant's graph is isolated alongside
+> its relational stores. An empty workspace keeps the default graph, so existing
+> single-tenant setups are unchanged.

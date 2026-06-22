@@ -27,18 +27,25 @@ Knobs: `NEWS_LIMIT` (articles total), `NEWS_WAVES` (default 2), `NEWS_CHARS`,
 await rag.ainsert(texts_w1, ids=ids_w1, file_paths=urls_w1, track_id="wave-1")
 await rag.ainsert(texts_w2, ids=ids_w2, file_paths=urls_w2, track_id="wave-2")
 
-await rag.doc_status.get_all_status_counts()        # {'processed': N, 'failed': 0, 'all': N, ...}
-await rag.doc_status.get_docs_by_track_id("wave-1")  # which docs came in wave 1
+await rag.doc_status.get_all_status_counts()         # processed vs failed (failed includes duplicates)
+await rag.doc_status.get_docs_by_track_id("wave-1")  # which docs arrived in wave 1
 await rag.doc_status.get_docs_paginated(page=1, page_size=5, sort_field="updated_at")
 
-# follow one recurring entity across waves — degree + source chunks grow
+# entities that recur across many documents are merged into one node
+node = await rag.chunk_entity_relation_graph.get_node(entity)   # description + accumulated source_id
 await rag.chunk_entity_relation_graph.node_degree(entity)
-await rag.chunk_entity_relation_graph.get_node(entity)   # description, source_id, ...
 ```
 
-The demo tracks a recurring entity across the two waves (its degree and number of
-source chunks climb as more articles mention it), then re-submits an already-
-processed document and shows the total document count is unchanged (deduped).
+After both waves the demo lists the **most cross-document entities** — those found
+in the most source documents, which LightRAG has merged into a single node
+(accumulating their relationships and source chunks) — then re-submits an
+already-processed document and shows it's **detected as a duplicate, not
+re-processed**.
+
+> Public news corpora contain many duplicate articles; LightRAG detects them (by
+> filename / content hash) and records them as `failed` in doc-status rather than
+> re-extracting — so a non-zero `failed` count here is the dedup pipeline at work,
+> not an error.
 
 ## What you get
 

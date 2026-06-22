@@ -1,0 +1,9 @@
+# Extra deps the demos need beyond the editable `llama-index-agensgraph` package.
+# Install into the demo venv:
+#   uv pip install --python llama-index/.venv/bin/python -e ./llama-index -r llama-index/examples/demos/requirements-demos.txt
+llama-index-llms-openai
+llama-index-embeddings-openai
+datasets
+huggingface-hub
+python-dotenv
+tqdm

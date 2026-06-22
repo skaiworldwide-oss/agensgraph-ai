@@ -82,6 +82,10 @@ code patterns.
 | [**03_news_vector_rag**](03_news_vector_rag) | vector RAG over news: semantic, filtered, hybrid, cited | `ingest.py` → `rag.py` |
 | [**04_router**](04_router) | one engine routing questions to the graph or the vector store | `router.py` |
 
+Every demo also ships a **pre-executed notebook** (e.g.
+[`01_arxiv_pg/arxiv_pg.ipynb`](01_arxiv_pg/arxiv_pg.ipynb)) — a narrated,
+end-to-end tour with real embedded outputs, ideal for reading offline.
+
 ## Scale, cost, knobs
 
 Big by default (~50k arXiv papers, ~100k news chunks, ~500 Wikipedia articles;

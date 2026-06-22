@@ -5,6 +5,9 @@ to the arXiv **graph** engine (demo 1), a current-events question to the news
 **vector** engine (demo 3). Both run on the **same `AgensEngine` pool** —
 different graphs in one database, served together.
 
+📓 **Guided tour:** [`router.ipynb`](./router.ipynb) is a pre-executed notebook
+walking through routing + the shared pool with real outputs.
+
 ## Run
 
 Run after demos 1 and 3 have populated their graphs:

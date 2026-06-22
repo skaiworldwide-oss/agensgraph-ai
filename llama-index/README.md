@@ -24,6 +24,9 @@ blocks.
 | [03 · News](./examples/demos/03_news_vector_rag) | vector RAG: semantic, metadata-filtered, hybrid, and cited |
 | [04 · Router](./examples/demos/04_router) | one `AgensEngine` routing questions to the graph or the vector store |
 
+Each demo folder also ships a **pre-executed notebook** — a narrated, end-to-end
+tour with real embedded outputs.
+
 Short, single-feature notebooks:
 
 - [Property graph store](./examples/property_graph/property_graph_agensgraph.ipynb)

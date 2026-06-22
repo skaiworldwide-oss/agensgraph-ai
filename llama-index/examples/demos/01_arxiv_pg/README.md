@@ -10,6 +10,9 @@ scales to the full dataset.
 (Paper)                         -[IN_CATEGORY]-> (Category)
 ```
 
+📓 **Guided tour:** [`arxiv_pg.ipynb`](./arxiv_pg.ipynb) is a pre-executed notebook
+that walks through every capability below with real outputs — open it after `prepare.py`.
+
 ## Run
 
 ```bash

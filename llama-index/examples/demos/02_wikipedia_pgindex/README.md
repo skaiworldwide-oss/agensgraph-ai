@@ -3,6 +3,10 @@
 Let an LLM extract a typed knowledge graph from text, store it in AgensGraph,
 then ask questions in natural language — the LLM writes the Cypher for you.
 
+📓 **Guided tour:** [`wikipedia_pgindex.ipynb`](./wikipedia_pgindex.ipynb) is a
+pre-executed notebook walking through every capability below with real outputs —
+open it after `build.py`.
+
 ## Run
 
 ```bash

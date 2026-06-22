@@ -4,6 +4,10 @@ Use `AgensgraphVectorStore` as a LlamaIndex `VectorStoreIndex`: ingest news
 articles with metadata, then query four ways — plain semantic search,
 metadata-filtered, hybrid (vector + keyword), and RAG with citations.
 
+📓 **Guided tour:** [`news_vector_rag.ipynb`](./news_vector_rag.ipynb) is a
+pre-executed notebook walking through every capability below with real outputs —
+open it after `ingest.py`.
+
 ## Run
 
 ```bash

@@ -1,0 +1,35 @@
+[project]
+name = "mcp-agensgraph-common"
+version = "0.1.0"
+description = "Shared core for the AgensGraph MCP servers (config, connection, results, safety, transport)."
+readme = "README.md"
+requires-python = ">=3.10,<4.0"
+license = { text = "MIT" }
+dependencies = [
+    "fastmcp>=2.10.5,<3.0.0",
+    "pydantic>=2.10.1",
+    "tiktoken>=0.11.0",
+    "starlette>=0.47.0",
+]
+
+# Database-backed servers (cypher, memory) install the `db` extra to pull psycopg.
+# The data-modeling server has no DB connection and omits it.
+[project.optional-dependencies]
+db = [
+    "psycopg[binary,pool]>=3.2.9,<4.0.0",
+    "psycopg-pool>=3.2.6,<4.0.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+dev-dependencies = [
+    "pyright>=1.1.389",
+    "pytest>=8.3.5",
+    "pytest-asyncio>=0.25.3",
+    "ruff>=0.11.5",
+    "psycopg[binary,pool]>=3.2.9,<4.0.0",
+    "psycopg-pool>=3.2.6,<4.0.0",
+]

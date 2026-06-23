@@ -564,8 +564,8 @@ def test_relationship_cypher_generation_for_many_records():
         == """UNWIND %(records)s as record
 MATCH (startNode: "Person" {"personId": record."sourceId"})
 MATCH (endNode: "Place" {"placeId": record."targetId"})
-MERGE (startNode)-[: "KNOWS" {"relId": record."relId"}]->(endNode)
-SET endNode += {since: record.since}"""
+MERGE (startNode)-[r: "KNOWS" {"relId": record."relId"}]->(endNode)
+SET r += {since: record.since}"""
     )
 
 
@@ -587,8 +587,8 @@ def test_relationship_cypher_generation_for_many_records_no_key_property():
         == """UNWIND %(records)s as record
 MATCH (startNode: "Person" {"personId": record."sourceId"})
 MATCH (endNode: "Place" {"placeId": record."targetId"})
-MERGE (startNode)-[: "KNOWS"]->(endNode)
-SET endNode += {since: record.since}"""
+MERGE (startNode)-[r: "KNOWS"]->(endNode)
+SET r += {since: record.since}"""
     )
 
 
@@ -608,7 +608,7 @@ def test_relationship_cypher_generation_for_many_records_no_properties():
         == """UNWIND %(records)s as record
 MATCH (startNode: "Person" {"personId": record."sourceId"})
 MATCH (endNode: "Place" {"placeId": record."targetId"})
-MERGE (startNode)-[: "KNOWS"]->(endNode)"""
+MERGE (startNode)-[r: "KNOWS"]->(endNode)"""
     )
 
 
@@ -638,7 +638,7 @@ def test_get_relationship_cypher_ingest_query_for_many_records(
         == """UNWIND %(records)s as record
 MATCH (startNode: "Person" {id: record."sourceId"})
 MATCH (endNode: "Place" {id: record."targetId"})
-MERGE (startNode)-[: "LIVES_IN"]->(endNode)"""
+MERGE (startNode)-[r: "LIVES_IN"]->(endNode)"""
     )
 
 

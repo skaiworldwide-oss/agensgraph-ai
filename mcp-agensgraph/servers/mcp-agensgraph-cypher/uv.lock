@@ -1,6 +1,6 @@
 version = 1
 revision = 2
-requires-python = ">=3.10"
+requires-python = ">=3.10, <4.0"
 
 [[package]]
 name = "aiohappyeyeballs"
@@ -1070,15 +1070,52 @@ wheels = [
 ]
 
 [[package]]
-name = "mcp-agensgraph-cypher"
+name = "mcp-agensgraph-common"
 version = "0.1.0"
+source = { editable = "../mcp-agensgraph-common" }
+dependencies = [
+    { name = "fastmcp" },
+    { name = "pydantic" },
+    { name = "starlette" },
+    { name = "tiktoken" },
+]
+
+[package.optional-dependencies]
+db = [
+    { name = "psycopg", extra = ["binary", "pool"] },
+    { name = "psycopg-pool" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "fastmcp", specifier = ">=2.10.5,<3.0.0" },
+    { name = "psycopg", extras = ["binary", "pool"], marker = "extra == 'db'", specifier = ">=3.2.9,<4.0.0" },
+    { name = "psycopg-pool", marker = "extra == 'db'", specifier = ">=3.2.6,<4.0.0" },
+    { name = "pydantic", specifier = ">=2.10.1" },
+    { name = "starlette", specifier = ">=0.47.0" },
+    { name = "tiktoken", specifier = ">=0.11.0" },
+]
+provides-extras = ["db"]
+
+[package.metadata.requires-dev]
+dev = [
+    { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.2.9,<4.0.0" },
+    { name = "psycopg-pool", specifier = ">=3.2.6,<4.0.0" },
+    { name = "pyright", specifier = ">=1.1.389" },
+    { name = "pytest", specifier = ">=8.3.5" },
+    { name = "pytest-asyncio", specifier = ">=0.25.3" },
+    { name = "ruff", specifier = ">=0.11.5" },
+]
+
+[[package]]
+name = "mcp-agensgraph-cypher"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastmcp" },
+    { name = "mcp-agensgraph-common", extra = ["db"] },
     { name = "psycopg", extra = ["binary", "pool"] },
-    { name = "psycopg-pool" },
     { name = "pydantic" },
-    { name = "tiktoken" },
 ]
 
 [package.dev-dependencies]
@@ -1092,20 +1129,18 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "fastmcp", specifier = ">=2.10.5" },
-    { name = "psycopg", specifier = ">=3.2.9,<4.0.0" },
+    { name = "fastmcp", specifier = ">=2.10.5,<3.0.0" },
+    { name = "mcp-agensgraph-common", extras = ["db"], editable = "../mcp-agensgraph-common" },
     { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.2.9,<4.0.0" },
-    { name = "psycopg-pool", specifier = ">=3.2.6,<4.0.0" },
     { name = "pydantic", specifier = ">=2.10.1" },
-    { name = "tiktoken", specifier = ">=0.11.0" },
 ]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "aiohttp", specifier = ">=3.8.0" },
     { name = "pyright", specifier = ">=1.1.389" },
-    { name = "pytest", specifier = ">=7.0.0" },
-    { name = "pytest-asyncio", specifier = ">=0.20.3" },
+    { name = "pytest", specifier = ">=8.3.5" },
+    { name = "pytest-asyncio", specifier = ">=0.25.3" },
     { name = "ruff", specifier = ">=0.11.5" },
 ]
 

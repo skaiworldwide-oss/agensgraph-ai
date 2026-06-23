@@ -383,10 +383,11 @@ class Relationship(BaseModel):
         query = f"""UNWIND %(records)s as record
 MATCH (startNode: {self.start_node_label} {{{start_node_key_property_name}: record.sourceId}})
 MATCH (endNode: {self.end_node_label} {{{end_node_key_property_name}: record.targetId}})
-MERGE (startNode)-[:{self.type}{key_prop}]->(endNode)"""
+MERGE (startNode)-[r:{self.type}{key_prop}]->(endNode)"""
         if formatted_props:
+            # Relationship properties belong on the relationship (r), not the end node.
             query += f"""
-SET endNode += {{{formatted_props}}}"""
+SET r += {{{formatted_props}}}"""
         return _quote_identifiers(query)
 
     def get_cypher_constraint_query(self) -> str | None:

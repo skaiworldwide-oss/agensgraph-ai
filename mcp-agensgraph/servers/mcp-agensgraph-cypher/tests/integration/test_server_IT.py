@@ -79,9 +79,9 @@ async def test_read_query_timeout_with_slow_query(
             result = json.loads(response.content[0].text)
             assert isinstance(result, list)
     except ToolError as e:
-        # If it times out, that's also acceptable behavior
-        error_message = str(e)
-        assert "Error" in error_message or "timeout" in error_message.lower()
+        # If it times out, the tool raises a sanitized error (details go to the
+        # server log, not the client).
+        assert "failed" in str(e).lower()
 
 
 @pytest.mark.asyncio(loop_scope="function")

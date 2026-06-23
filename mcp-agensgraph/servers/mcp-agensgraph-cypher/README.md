@@ -61,7 +61,7 @@ If running locally, use the following configuration after running `uv sync` in t
       "AGENSGRAPH_URL": "postgresql://<host>:<port>",
       "AGENSGRAPH_USERNAME": "<your-username>",
       "AGENSGRAPH_PASSWORD": "<your-password>",
-      "AGENSGRAPH_DB": "<dbname>",
+      "AGENSGRAPH_DATABASE": "<dbname>",
       "AGENSGRAPH_GRAPHNAME": "<graphname>"
     }
   }
@@ -73,12 +73,12 @@ Alternatively, using the released package(not available at the moment):
 "mcpServers": {
   "agensgraph-cypher": {
     "command": "uvx",
-    "args": [ "mcp-agensgraph-cypher@0.1.0", "--transport", "stdio"  ],
+    "args": [ "mcp-agensgraph-cypher@0.2.0", "--transport", "stdio"  ],
     "env": {
       "AGENSGRAPH_URL": "postgresql://<host>:<port>",
       "AGENSGRAPH_USERNAME": "<your-username>",
       "AGENSGRAPH_PASSWORD": "<your-password>",
-      "AGENSGRAPH_DB": "<dbname>",
+      "AGENSGRAPH_DATABASE": "<dbname>",
       "AGENSGRAPH_GRAPHNAME": "<graphname>"
     }
   }
@@ -106,7 +106,7 @@ If running locally, use the following configuration after running `uv sync` in t
         "AGENSGRAPH_URL": "postgresql://<host>:<port>",
         "AGENSGRAPH_USERNAME": "<your-username>",
         "AGENSGRAPH_PASSWORD": "<your-password>",
-        "AGENSGRAPH_DB": "<dbname>",
+        "AGENSGRAPH_DATABASE": "<dbname>",
         "AGENSGRAPH_GRAPHNAME": "graph1"
       }
     },
@@ -122,7 +122,7 @@ If running locally, use the following configuration after running `uv sync` in t
         "AGENSGRAPH_URL": "postgresql://<host>:<port>",
         "AGENSGRAPH_USERNAME": "<your-username>",
         "AGENSGRAPH_PASSWORD": "<your-password>",
-        "AGENSGRAPH_DB": "<dbname>",
+        "AGENSGRAPH_DATABASE": "<dbname>",
         "AGENSGRAPH_GRAPHNAME": "graph2"
       }
     }
@@ -136,23 +136,23 @@ Alternatively, using the released package(not available at the moment) with name
   "mcpServers": {
     "graph1-agensgraph": {
       "command": "uvx",
-      "args": [ "mcp-agensgraph-cypher@0.1.0", "--namespace", "graph1" ],
+      "args": [ "mcp-agensgraph-cypher@0.2.0", "--namespace", "graph1" ],
       "env": {
         "AGENSGRAPH_URL": "postgresql://<host>:<port>",
         "AGENSGRAPH_USERNAME": "<your-username>",
         "AGENSGRAPH_PASSWORD": "<your-password>",
-        "AGENSGRAPH_DB": "<dbname>",
+        "AGENSGRAPH_DATABASE": "<dbname>",
         "AGENSGRAPH_GRAPHNAME": "graph1"
       }
     },
     "graph2-agensgraph": {
       "command": "uvx",
-      "args": [ "mcp-agensgraph-cypher@0.1.0", "--namespace", "graph2" ],
+      "args": [ "mcp-agensgraph-cypher@0.2.0", "--namespace", "graph2" ],
       "env": {
         "AGENSGRAPH_URL": "postgresql://<host>:<port>",
         "AGENSGRAPH_USERNAME": "<your-username>",
         "AGENSGRAPH_PASSWORD": "<your-password>",
-        "AGENSGRAPH_DB": "<dbname>",
+        "AGENSGRAPH_DATABASE": "<dbname>",
         "AGENSGRAPH_GRAPHNAME": "graph2"
       }
     }
@@ -174,7 +174,7 @@ Syntax with `--db-url`, `--username`, `--password` and other command line argume
   "agensgraph": {
     "command": "uvx",
     "args": [
-      "mcp-agensgraph-cypher@0.1.0",
+      "mcp-agensgraph-cypher@0.2.0",
       "--db-url",
       "postgresql://<host>:<port>",
       "--db-name",
@@ -255,7 +255,7 @@ uv pip install -e ".[dev]"
     "env": {
       "AGENSGRAPH_USERNAME": "<your-username>",
       "AGENSGRAPH_PASSWORD": "<your-password>",
-      "AGENSGRAPH_DB": "<dbname>",
+      "AGENSGRAPH_DATABASE": "<dbname>",
       "AGENSGRAPH_HOST": "localhost",
       "AGENSGRAPH_PORT": "5432",
       "AGENSGRAPH_GRAPH_NAME": "graph"

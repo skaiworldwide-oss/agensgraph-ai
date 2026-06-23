@@ -323,10 +323,11 @@ class TestRelationshipIngestion:
         await cursor.execute(ingest_query, {"records": Jsonb(records)})
         await conn.commit()
 
-        # Verify relationship with properties
+        # Verify relationship with properties — both the key and the extra
+        # property must live on the relationship (r), not the end node.
         verify_query = _quote_identifiers("""
             MATCH (a: Account)-[r: HAS_TRANSACTION]->(t: Transaction)
-            RETURN r.linkId, t.timestamp
+            RETURN r.linkId, r.timestamp
         """)
         print(f"\nVerify Query: {verify_query}")
         await cursor.execute(verify_query)

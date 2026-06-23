@@ -1,19 +1,22 @@
 [project]
 name = "mcp-agensgraph-data-modeling"
-version = "0.1.0"
-description = "A simple AgensGraph MCP server for creating graph data models."
+version = "0.2.0"
+description = "AgensGraph data-modeling MCP server (validate models, generate ingest/constraint Cypher, Arrows/Mermaid)."
 readme = "README.md"
 requires-python = ">=3.10,<4.0"
 dependencies = [
-    "fastmcp>=2.0.0",
+    "mcp-agensgraph-common>=0.1.0",
+    "fastmcp>=2.10.5,<3.0.0",
     "pydantic>=2.10.1",
-    "starlette>=0.47.0",
 ]
 
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+[tool.uv.sources]
+mcp-agensgraph-common = { path = "../mcp-agensgraph-common", editable = true }
 
 [tool.uv]
 dev-dependencies = [

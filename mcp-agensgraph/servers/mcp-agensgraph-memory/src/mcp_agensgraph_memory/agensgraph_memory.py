@@ -1,11 +1,14 @@
 import logging
 from typing import Any, Dict, List
 
-from psycopg import AsyncConnection
+from psycopg import AsyncConnection, sql
 from psycopg.rows import namedtuple_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, Field
+
+from mcp_agensgraph_common.connection import get_pool_connection
+from mcp_agensgraph_common.safety import quote_label
 
 # Set up logging
 logger = logging.getLogger("mcp_agensgraph_memory")
@@ -124,11 +127,6 @@ class ObservationDeletion(BaseModel):
     )
 
 
-def get_pool_connection(pool: AsyncConnectionPool):
-    """Context manager for getting a connection from the pool."""
-    return pool.connection()
-
-
 class AgensGraphMemory:
     def __init__(self, connection_pool: AsyncConnectionPool, graphname: str):
         self.pool = connection_pool
@@ -140,7 +138,9 @@ class AgensGraphMemory:
         """Execute a Cypher query within AgensGraph."""
         async with conn.cursor(row_factory=namedtuple_row) as cursor:
             # Set graph path
-            await cursor.execute(f"SET graph_path = {self.graphname}")
+            await cursor.execute(
+                sql.SQL("SET graph_path = {}").format(sql.Identifier(self.graphname))
+            )
 
             # Execute the Cypher query
             if params:
@@ -167,7 +167,9 @@ class AgensGraphMemory:
             async with get_pool_connection(self.pool) as conn:
                 async with conn.cursor(row_factory=namedtuple_row) as cursor:
                     # Set graph path
-                    await cursor.execute(f"SET graph_path = {self.graphname}")
+                    await cursor.execute(
+                sql.SQL("SET graph_path = {}").format(sql.Identifier(self.graphname))
+            )
 
                     # Ensure Memory VLABEL exists
                     await cursor.execute('CREATE VLABEL IF NOT EXISTS "Memory"')
@@ -240,7 +242,7 @@ class AgensGraphMemory:
             if entity_names:
                 rel_query = """
                     MATCH (source:"Memory")-[r]->(target:"Memory")
-                    WHERE source.name <@ %(names)s OR target.name <@ %(names)s
+                    WHERE source.name IN %(names)s OR target.name IN %(names)s
                     RETURN source.name AS source, target.name AS target, label(r) AS "relationType"
                 """
 
@@ -298,10 +300,14 @@ class AgensGraphMemory:
         async with get_pool_connection(self.pool) as conn:
             for relation in relations:
                 # create the relationship
+                # Relationship types cannot be parameterized in Cypher, so the
+                # (client-supplied) type is validated + identifier-quoted rather
+                # than interpolated raw.
+                rel_type = quote_label(relation.relationType)
                 query = f"""
                     MATCH (fromNode:"Memory"), (toNode:"Memory")
                     WHERE fromNode.name = %(source)s AND toNode.name = %(target)s
-                    MERGE (fromNode)-[r:"{relation.relationType}"]->(toNode)
+                    MERGE (fromNode)-[r:{rel_type}]->(toNode)
                 """
 
                 await self._execute_cypher(
@@ -431,8 +437,9 @@ class AgensGraphMemory:
 
         async with get_pool_connection(self.pool) as conn:
             for relation in relations:
+                rel_type = quote_label(relation.relationType)
                 query = f"""
-                    MATCH (source:"Memory")-[r:"{relation.relationType}"]->(target:"Memory")
+                    MATCH (source:"Memory")-[r:{rel_type}]->(target:"Memory")
                     WHERE source.name = %(source)s AND target.name = %(target)s
                     DELETE r
                 """
@@ -467,7 +474,7 @@ class AgensGraphMemory:
             # Get entities
             entity_query = """
                 MATCH (e:"Memory")
-                WHERE e.name <@ %(names)s
+                WHERE e.name IN %(names)s
                 RETURN e.name AS name, e.type AS type, e.observations AS observations
             """
 
@@ -490,8 +497,8 @@ class AgensGraphMemory:
             if entities:
                 rel_query = """
                     MATCH (source:"Memory")-[r]->(target:"Memory")
-                    WHERE source.name <@ %(names)s OR target.name <@ %(names)s
-                    RETURN source.name AS source, target.name AS target, label(r) AS relationType
+                    WHERE source.name IN %(names)s OR target.name IN %(names)s
+                    RETURN source.name AS source, target.name AS target, label(r) AS "relationType"
                 """
 
                 relations_data = await self._execute_cypher(

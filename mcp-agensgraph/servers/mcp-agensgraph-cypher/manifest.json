@@ -2,7 +2,7 @@
   "dxt_version": "0.1",
   "name": "mcp-agensgraph-cypher",
   "display_name": "Agensgraph Cypher MCP Server",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Execute read and write Cypher queries on your Agensgraph database.",
   "long_description": "A Model Context Protocol (MCP) server that provides tools for interacting with Agensgraph database using Cypher queries. Supports both read and write operations with proper validation and error handling.",
   "keywords": ["agensgraph", "cypher", "graph", "database", "mcp", "ai", "llm"],

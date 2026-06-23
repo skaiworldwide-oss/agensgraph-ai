@@ -1,16 +1,22 @@
 import json
 import logging
-from typing import Literal
+from typing import List, Literal, Optional
 
 from fastmcp.exceptions import ToolError
 from fastmcp.server import FastMCP
 from fastmcp.tools.tool import ToolResult
 from mcp.types import TextContent, ToolAnnotations
-from psycopg_pool import AsyncConnectionPool
+from psycopg import sql
 from pydantic import Field
-from starlette.middleware import Middleware
-from starlette.middleware.cors import CORSMiddleware
-from starlette.middleware.trustedhost import TrustedHostMiddleware
+
+from mcp_agensgraph_common.connection import (
+    build_dsn,
+    create_pool,
+    ensure_graph,
+    get_pool_connection,
+)
+from mcp_agensgraph_common.config import format_namespace
+from mcp_agensgraph_common.transport import run_server
 
 from .agensgraph_memory import (
     AgensGraphMemory,
@@ -19,7 +25,6 @@ from .agensgraph_memory import (
     ObservationDeletion,
     Relation,
 )
-from .utils import build_connection_url, format_namespace
 
 # Set up logging
 logger = logging.getLogger("mcp_agensgraph_memory")
@@ -499,101 +504,49 @@ def create_mcp_server(memory: AgensGraphMemory, namespace: str = "") -> FastMCP:
 
 
 async def main(
-    agensgraph_url: str,
-    agensgraph_user: str,
-    agensgraph_password: str,
-    agensgraph_database: str,
-    agensgraph_graphname: str,
+    db_url: str,
+    username: str,
+    password: str,
+    database: str,
+    graphname: str,
     transport: Literal["stdio", "sse", "http"] = "stdio",
     namespace: str = "",
-    host: str = "127.0.0.1",
-    port: int = 8000,
-    path: str = "/mcp/",
-    allow_origins: list[str] = [],
-    allowed_hosts: list[str] = [],
+    host: Optional[str] = None,
+    port: Optional[int] = None,
+    path: Optional[str] = None,
+    allow_origins: Optional[List[str]] = None,
+    allowed_hosts: Optional[List[str]] = None,
 ) -> None:
+    """Open the pool, bootstrap the graph + helpers, and serve over the chosen transport."""
     logger.info("Starting AgensGraph MCP Memory Server")
-    logger.info(f"Connecting to AgensGraph with URL: {agensgraph_url}")
 
-    # Build full connection URL
-    db_url = build_connection_url(
-        agensgraph_url, agensgraph_user, agensgraph_password, agensgraph_database
-    )
-
-    # Create connection pool
-    connection_pool = AsyncConnectionPool(db_url, open=False)
-
-    # Verify connection
+    pool = create_pool(build_dsn(db_url, username, password, database))
     try:
-        await connection_pool.open()
-        logger.info("Connected to AgensGraph successfully")
-    except Exception as e:
-        logger.error(f"Failed to connect to AgensGraph: {e}")
-        exit(1)
+        await pool.open()
+        logger.info("Connection pool opened")
+        await ensure_graph(pool, graphname)
 
-    # Create graph if it doesn't exist
-    try:
-        from psycopg.rows import namedtuple_row
-
-        from .agensgraph_memory import get_pool_connection
-
-        async with get_pool_connection(connection_pool) as conn:
-            async with conn.cursor(row_factory=namedtuple_row) as cursor:
-                await cursor.execute(
-                    f"CREATE GRAPH IF NOT EXISTS {agensgraph_graphname}"
-                )
+        # Create the jsonb_to_string helper used by fulltext search (idempotent).
+        async with get_pool_connection(pool) as conn:
+            async with conn.cursor() as cursor:
                 await cursor.execute(jsonb_to_string)
-                await conn.commit()
-        logger.info(f"Ensured graph '{agensgraph_graphname}' exists")
-    except Exception as e:
-        logger.error(f"Failed to create graph: {e}")
-        exit(1)
+            await conn.commit()
 
-    # Initialize memory
-    memory = AgensGraphMemory(connection_pool, agensgraph_graphname)
-    logger.info("AgensGraphMemory initialized")
+        memory = AgensGraphMemory(pool, graphname)
+        await memory.create_fulltext_index()
+        logger.info("AgensGraphMemory initialized")
 
-    # Create fulltext index
-    await memory.create_fulltext_index()
-
-    # Configure security middleware
-    custom_middleware = [
-        Middleware(
-            CORSMiddleware,
-            allow_origins=allow_origins,
-            allow_methods=["GET", "POST"],
-            allow_headers=["*"],
-        ),
-        Middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts),
-    ]
-
-    # Create MCP server
-    mcp = create_mcp_server(memory, namespace)
-    logger.info("MCP server created")
-
-    # Run the server with the specified transport
-    logger.info(f"Starting server with transport: {transport}")
-    match transport:
-        case "http":
-            logger.info(f"HTTP server starting on {host}:{port}{path}")
-            await mcp.run_http_async(
-                host=host,
-                port=port,
-                path=path,
-                middleware=custom_middleware,
-                stateless_http=True,
-            )
-        case "stdio":
-            logger.info("STDIO server starting")
-            await mcp.run_stdio_async()
-        case "sse":
-            logger.info(f"SSE server starting on {host}:{port}{path}")
-            await mcp.run_http_async(
-                host=host,
-                port=port,
-                path=path,
-                middleware=custom_middleware,
-                transport="sse",
-            )
-        case _:
-            raise ValueError(f"Unsupported transport: {transport}")
+        mcp = create_mcp_server(memory, namespace)
+        await run_server(
+            mcp,
+            transport=transport,
+            host=host,
+            port=port,
+            path=path,
+            allow_origins=allow_origins or [],
+            allowed_hosts=allowed_hosts or [],
+            server_name="AgensGraph Memory MCP",
+        )
+    finally:
+        await pool.close()
+        logger.info("Connection pool closed")

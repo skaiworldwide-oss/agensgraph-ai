@@ -130,7 +130,7 @@ Alternatively, you can set environment variables:
       "AGENSGRAPH_URL": "postgresql://localhost:5432",
       "AGENSGRAPH_USERNAME": "<your-username>",
       "AGENSGRAPH_PASSWORD": "<your-password>",
-      "AGENSGRAPH_DB": "<your-database>",
+      "AGENSGRAPH_DATABASE": "<your-database>",
       "AGENSGRAPH_GRAPH_NAME": "memory"
     }
   }

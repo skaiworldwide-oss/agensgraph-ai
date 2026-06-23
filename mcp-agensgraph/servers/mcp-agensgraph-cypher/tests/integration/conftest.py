@@ -4,7 +4,7 @@ import pytest
 import pytest_asyncio
 
 from mcp_agensgraph_cypher.server import create_mcp_server, get_pool_connection
-from mcp_agensgraph_cypher.utils import _quote_identifiers
+from mcp_agensgraph_common.safety import quote_identifiers as _quote_identifiers
 from psycopg.rows import namedtuple_row  # type: ignore
 from psycopg_pool import AsyncConnectionPool, PoolTimeout  # type: ignore
 
@@ -74,16 +74,12 @@ async def init_data(setup, clear_data: Any, graphname):
 
 
 @pytest_asyncio.fixture(scope="function")
-async def clear_data(setup):
+async def clear_data(setup, graphname):
     async with get_pool_connection(setup) as conn:
         async with conn.cursor(row_factory=namedtuple_row) as cursor:
-            # Clear existing data
-            await cursor.execute("""
-                SET graph_path = 'test'
-            """)
-            await cursor.execute("""
-                MATCH (n) DETACH DELETE n
-            """)
+            # Clear existing data in the configured graph
+            await cursor.execute(f"SET graph_path = {graphname}")
+            await cursor.execute("MATCH (n) DETACH DELETE n")
             await conn.commit()
 
 

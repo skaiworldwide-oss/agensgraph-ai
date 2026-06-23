@@ -1,12 +1,11 @@
 import json
 import logging
-from typing import Any, Literal
+from typing import Any, Literal, Optional
 
 from fastmcp.server import FastMCP
 from pydantic import Field, ValidationError
-from starlette.middleware import Middleware
-from starlette.middleware.cors import CORSMiddleware
-from starlette.middleware.trustedhost import TrustedHostMiddleware
+
+from mcp_agensgraph_common.transport import run_server
 
 from .data_model import (
     DataModel,
@@ -405,55 +404,25 @@ Process:
 async def main(
     transport: Literal["stdio", "sse", "http"] = "stdio",
     namespace: str = "",
-    host: str = "127.0.0.1",
-    port: int = 8000,
-    path: str = "/mcp/",
-    allow_origins: list[str] = [],
-    allowed_hosts: list[str] = [],
+    host: Optional[str] = None,
+    port: Optional[int] = None,
+    path: Optional[str] = None,
+    allow_origins: Optional[list[str]] = None,
+    allowed_hosts: Optional[list[str]] = None,
 ) -> None:
+    """Serve the (DB-less) data-modeling tools over the chosen transport."""
     logger.info("Starting MCP AgensGraph Data Modeling Server")
-
-    custom_middleware = [
-        Middleware(
-            CORSMiddleware,
-            allow_origins=allow_origins,
-            allow_methods=["GET", "POST"],
-            allow_headers=["*"],
-        ),
-        Middleware(TrustedHostMiddleware, allowed_hosts=allowed_hosts),
-    ]
-
     mcp = create_mcp_server(namespace=namespace)
-
-    match transport:
-        case "http":
-            logger.info(
-                f"Running AgensGraph Data Modeling MCP Server with HTTP transport on {host}:{port}..."
-            )
-            await mcp.run_http_async(
-                host=host,
-                port=port,
-                path=path,
-                middleware=custom_middleware,
-                stateless_http=True,
-            )
-        case "stdio":
-            logger.info(
-                "Running AgensGraph Data Modeling MCP Server with stdio transport..."
-            )
-            await mcp.run_stdio_async()
-        case "sse":
-            logger.info(
-                f"Running AgensGraph Data Modeling MCP Server with SSE transport on {host}:{port}..."
-            )
-            await mcp.run_http_async(
-                host=host,
-                port=port,
-                path=path,
-                middleware=custom_middleware,
-                transport="sse",
-                stateless_http=True,
-            )
+    await run_server(
+        mcp,
+        transport=transport,
+        host=host,
+        port=port,
+        path=path,
+        allow_origins=allow_origins or [],
+        allowed_hosts=allowed_hosts or [],
+        server_name="AgensGraph Data Modeling MCP",
+    )
 
 
 if __name__ == "__main__":

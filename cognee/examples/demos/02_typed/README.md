@@ -1,24 +1,26 @@
 # 02 · Typed — ontology-guided extraction
 
-By default cognee lets the LLM pick whatever entity types it likes
+By default, cognee lets the LLM pick whatever entity types it likes
 ("organization", "thing", …). Hand it a domain **ontology** and extraction is
 grounded in *your* vocabulary instead: the ontology's classes become `EntityType`
-nodes, and entities matched to them are flagged `ontology_valid`. Same robust
-graph build as demo 1, now schema-aligned.
+nodes, and entities that match it are flagged `ontology_valid`. It's the same robust
+graph build as demo 1 — now aligned to a schema you control.
 
-📓 **Guided tour:** [`typed.ipynb`](./typed.ipynb).
+📓 **Just want to read it?** Open [`typed.ipynb`](./typed.ipynb) — already executed,
+with real outputs.
 
-## Run
+## Run it
 
 ```bash
-# from cognee/
-TYPED_LIMIT=15 .venv/bin/python examples/demos/02_typed/build.py   # tiny dry-run
-.venv/bin/python examples/demos/02_typed/build.py                 # ~120 articles
+# from the cognee/ directory of this repo
+TYPED_LIMIT=15 .venv/bin/python examples/demos/02_typed/build.py   # start tiny: a dry-run
+.venv/bin/python examples/demos/02_typed/build.py                  # ~120 articles
 .venv/bin/python examples/demos/02_typed/ask.py
 ```
 
 Knobs: `TYPED_LIMIT`, `TYPED_CHARS`, `TYPED_RESET=0`. The ontology is
-[`ontology.ttl`](./ontology.ttl) (Turtle/OWL) — edit it to fit your domain.
+[`ontology.ttl`](./ontology.ttl) (Turtle/OWL) — edit it to fit your own domain.
+`build.py` prints a cost estimate first.
 
 ## The pattern
 

@@ -44,10 +44,22 @@ async def main() -> None:
     import cognee
     from cognee.modules.search.types import SearchType
     from cognee.infrastructure.databases.graph import get_graph_engine
+    from cognee.modules.engine.models.node_set import NodeSet
 
-    m = await (await get_graph_engine()).get_graph_metrics(include_optional=False)
+    g = await get_graph_engine()
+    m = await g.get_graph_metrics(include_optional=False)
     console.section("One unified memory (encyclopedia + news, built incrementally)")
     console.kv("nodes / edges", f"{m['num_nodes']} / {m['num_edges']}")
+
+    # Each cognee.add(..., node_set=[tag]) tags its nodes; get_nodeset_subgraph
+    # pulls back just that slice of the unified memory.
+    console.section("node_set — the slice of memory tagged by each dataset")
+    for tag in ("reference", "current_events"):
+        try:
+            ns_nodes, ns_edges = await g.get_nodeset_subgraph(NodeSet, [tag])
+            console.kv(f"'{tag}'", f"{len(ns_nodes)} nodes, {len(ns_edges)} edges")
+        except Exception as e:
+            print(f"  '{tag}': {e}")
 
     console.section("A single query retrieves from BOTH datasets (CHUNKS)")
     hits = await config.search(query_text="notable people, places, and recent events",

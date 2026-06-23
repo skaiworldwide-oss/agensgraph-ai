@@ -1,59 +1,54 @@
 # Cognee AgensGraph adapters
 
-AgensGraph **graph** and **vector** database adapters for the Cognee framework.
-Because AgensGraph is PostgreSQL + Cypher + pgvector, a single AgensGraph
-database can serve as both cognee's graph store and its vector store — or you
-can use just the graph adapter and keep vectors elsewhere.
+[Cognee](https://github.com/topoteretes/cognee) is an **AI-memory** framework: you
+`add` your data, `cognify` it into a **knowledge graph + embeddings**, then
+`search` that memory many ways. This package lets **one AgensGraph database back
+both** of cognee's stores at once.
 
-## What's new in 0.2.0
+AgensGraph is PostgreSQL + Cypher + `pgvector`, so a single database can be cognee's
+**graph store** *and* its **vector store**:
 
-- **Fixed an O(N²) ingest bug.** Every node lookup and MERGE keys on the `id`
-  property, but the only index was on a different label (`base`) and a different
-  property (`entity_id`) — so ingest was quadratic and every lookup did a
-  sequential scan. Node ingest, edge ingest, and id lookups are now backed by a
-  `base_id_idx ON "__Node__" (id)` index (e.g. 5000 nodes + 5000 edges ingest in
-  ~1.2s).
-- **New dedicated vector adapter.** `AgensgraphVectorAdapter` implements cognee's
-  `VectorDBInterface` over pgvector (HNSW cosine), selectable with
-  `VECTOR_DB_PROVIDER=agensgraph`, so AgensGraph can be cognee's vector store too.
-- **End-to-end `cognify` with AgensGraph vectors.** The vector adapter now
-  implements cognee's indexing hooks (`create_vector_index` / `index_data_points`),
-  so a full `add → cognify → search` runs with `VECTOR_DB_PROVIDER=agensgraph`
-  (previously `cognify` raised `AttributeError` on the missing methods).
-- **Batched `add_edges`.** Edges are UNWIND-batched per relationship type instead
-  of one query per edge.
-- **`name` is indexed** and nodeset retrieval uses it (was a sequential scan).
-- **Shared async connection pool.** One refcounted pool is opened once per
-  process and reused by both adapters; `graph_path` is reapplied per checkout
-  instead of on every query.
-- **Correctness fixes.** `add_node`, `has_node`, `has_edge`, and `get_neighbors`
-  were broken (bad parameter binding / never awaited / undefined variables / a
-  call to a non-existent method) and now work.
-- **Modernized packaging.** Poetry → hatchling, Python ≥3.10, version 0.2.0.
+- **Graph adapter** (`GRAPH_DATABASE_PROVIDER=agensgraph`) — the knowledge graph
+  (entities + relationships) as a Cypher property graph.
+- **Vector adapter** (`VECTOR_DB_PROVIDER=agensgraph`) — the embeddings as
+  `pgvector` HNSW tables.
 
-## Demos
+Use both for one-database simplicity, or use just the graph adapter and keep your
+vectors elsewhere. (cognee's small bookkeeping — datasets, users — stays in a local
+SQLite file by default.)
 
-A runnable demo suite lives in [`examples/demos/`](./examples/demos) — five
-focused examples on real public datasets (Wikipedia, CC-News, a Python repo),
-each with a README and a pre-executed notebook:
+## Try the demos
+
+The fastest way to see what this enables is the runnable demo suite in
+[`examples/demos/`](./examples/demos) — five focused examples on real public
+datasets (Wikipedia, CC-News, a Python repo), each with its own README and a
+**pre-executed notebook** you can read without running anything:
 
 | Demo | What it shows |
 |---|---|
-| [01 · Search modes](./examples/demos/01_search_modes) | build a KG from Wikipedia, then query it via GRAPH_COMPLETION / INSIGHTS / RAG / CHUNKS / SUMMARIES / chain-of-thought |
-| [02 · Typed](./examples/demos/02_typed) | ontology-guided extraction — make the graph follow your domain vocabulary |
-| [03 · Memory](./examples/demos/03_memory) | a multi-dataset memory layer — isolated datasets, `node_set`, incremental builds |
-| [04 · Code graph](./examples/demos/04_code_graph) | turn a Python repo into a code knowledge graph; `SearchType.CODE` + visualize |
-| [05 · Explore](./examples/demos/05_explore) | inspect the AgensGraph-backed graph — metrics, raw Cypher, HTML visualization |
+| [01 · Search modes](./examples/demos/01_search_modes) | Build a knowledge graph from Wikipedia, then query it ten ways — `GRAPH_COMPLETION` (+ summary / chain-of-thought / context-extension variants), `RAG_COMPLETION`, `INSIGHTS`, `CHUNKS`, `SUMMARIES`, `NATURAL_LANGUAGE`, and raw `CYPHER` |
+| [02 · Typed](./examples/demos/02_typed) | Ontology-guided extraction — make the graph follow *your* domain vocabulary |
+| [03 · Memory](./examples/demos/03_memory) | A multi-dataset memory layer — named datasets, `node_set` tags, incremental builds |
+| [04 · Code graph](./examples/demos/04_code_graph) | Turn a Python repo into a code knowledge graph; `SearchType.CODE` + visualize |
+| [05 · Explore](./examples/demos/05_explore) | Inspect the AgensGraph-backed graph — metrics, traversal, raw Cypher, HTML visualization |
 
 Start at [`examples/demos/README.md`](./examples/demos/README.md).
 
 ## Installation
 
 ```bash
-pip install cognee-agensgraph
+# from the cognee/ directory of this repo
+pip install -e .          # installs cognee-agensgraph + the cognee core it requires
+# (uv: uv pip install -e .)
 ```
 
-## Usage
+Then activate the adapters by importing the package once at startup:
+
+```python
+import cognee_agensgraph   # registers the agensgraph graph + vector providers
+```
+
+## Quickstart
 
 ```python
 import asyncio
@@ -210,17 +205,29 @@ cognee.config.data_root_directory("/path/to/data")
 > The vector embedding dimension is fixed when a collection's table is first
 > created; to change embedding models, drop the affected collection tables.
 
-## Example
+## What's new in 0.2.0
 
-See `examples` for a complete working example that demonstrates:
-- Setting up the AgensGraph adapter
-- Adding comprehensive AI/ML knowledge to the graph
-- Processing data with cognee
-- Searching with graph completion
-- Chain of Thought reasoning searches
-- Direct graph data access and inspection
-- Comprehensive error handling
+- **A working, dedicated vector adapter.** `AgensgraphVectorAdapter` implements
+  cognee's `VectorDBInterface` over `pgvector` (HNSW cosine), selectable with
+  `VECTOR_DB_PROVIDER=agensgraph`, so AgensGraph can be cognee's vector store too.
+- **End-to-end `cognify` with AgensGraph vectors.** The vector adapter implements
+  cognee's indexing hooks (`create_vector_index` / `index_data_points`), so a full
+  `add → cognify → search` runs with `VECTOR_DB_PROVIDER=agensgraph` (previously
+  `cognify` raised `AttributeError` on the missing methods).
+- **Fixed an O(N²) ingest bug.** Node lookups and MERGE key on the `id` property,
+  but the only index was on a different label/property — so ingest was quadratic
+  and every lookup did a sequential scan. Ingest and id lookups are now backed by a
+  `base_id_idx ON "__Node__" (id)` index (≈5000 nodes + 5000 edges in ~1.2s).
+- **Batched `add_edges`.** Edges are UNWIND-batched per relationship type instead
+  of one query per edge; `name` is indexed and used by nodeset retrieval (was a
+  sequential scan).
+- **Shared async connection pool.** One refcounted pool is opened once per process
+  and reused by both adapters; `graph_path` is reapplied per checkout, not per query.
+- **Correctness fixes.** `add_node`, `has_node`, `has_edge`, `get_neighbors`, and
+  `get_disconnected_nodes` were broken (bad parameter binding / never awaited /
+  undefined variables / non-existent method calls / invalid Cypher) and now work.
+- **Modernized packaging.** Poetry → hatchling, Python ≥3.10.
 
 ## Contributing
 
-Contributions are welcome! Please feel free to submit a Pull Request.
+Contributions are welcome! Please open an issue or submit a Pull Request.

@@ -1,27 +1,30 @@
 # 04 · Code graph — turn a codebase into queryable memory
 
-cognee has a dedicated **code pipeline**: it parses a Python repository into a
-graph of files, classes, functions, and imports, stored in AgensGraph
-(`cognee_code`). Then you can search the code semantically (`SearchType.CODE`),
-inspect the extracted structure, and visualize it.
+cognee has a dedicated **code pipeline**: it parses a Python repository into a graph
+of files, classes, functions, and imports, stored in AgensGraph (`cognee_code`). Then
+you can search the code semantically (`SearchType.CODE`), inspect the extracted
+structure, and visualize it — your codebase as memory, in the same database the other
+demos use for documents.
 
-> Needs the `tree-sitter` + `tree-sitter-python` parsers (`pip install tree-sitter
-> tree-sitter-python`) — that's what cognee's code pipeline uses to parse Python.
+> This demo uses the `tree-sitter` + `tree-sitter-python` parsers (cognee parses
+> Python with them). They're in [`requirements-demos.txt`](../requirements-demos.txt),
+> so the suite install already covers it.
 
-📓 **Guided tour:** [`code_graph.ipynb`](./code_graph.ipynb).
+📓 **Just want to read it?** Open [`code_graph.ipynb`](./code_graph.ipynb) — already
+executed, with real outputs.
 
-## Run
+## Run it
 
 ```bash
-# from cognee/  (clones a small package by default; first run pulls it)
+# from the cognee/ directory of this repo (clones a small package by default)
 .venv/bin/python examples/demos/04_code_graph/build.py
 .venv/bin/python examples/demos/04_code_graph/ask.py
 .venv/bin/python examples/demos/04_code_graph/ask.py "how are sessions handled?"
 ```
 
 Knobs: `CODE_REPO` (path to a local Python package to analyze — skips cloning),
-`CODE_REPO_URL` (git URL to shallow-clone, default a small well-known library),
-`CODE_RESET=0`.
+`CODE_REPO_URL` (git URL to shallow-clone; defaults to a small, well-known library),
+`CODE_RESET=0` (keep the existing code graph).
 
 ## The pattern
 

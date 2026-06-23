@@ -29,8 +29,8 @@ TOP_ENTITIES = """
 MATCH (n:"__Node__")
 WHERE n.name IS NOT NULL
 OPTIONAL MATCH (n)-[r]-()
-WITH n.name AS name, count(r) AS degree
-RETURN name, degree ORDER BY degree DESC LIMIT 12
+WITH n.id AS id, n.name AS name, count(r) AS degree
+RETURN id, name, degree ORDER BY degree DESC LIMIT 12
 """
 
 
@@ -60,16 +60,45 @@ async def main() -> None:
         console.kv("isolated nodes (no edges)", len(disconnected))
     except Exception as e:
         print(f"  get_disconnected_nodes: {e}")
+    try:
+        degree_one = await g.get_degree_one_nodes("Entity")
+        console.kv("degree-one Entity nodes", len(degree_one or []))
+    except Exception as e:
+        print(f"  get_degree_one_nodes: {e}")
+
+    console.section("Filter the graph by node type (get_filtered_graph_data)")
+    try:
+        fnodes, fedges = await g.get_filtered_graph_data([{"type": ["Entity"]}])
+        console.kv("Entity-only subgraph", f"{len(fnodes)} nodes, {len(fedges)} edges")
+    except Exception as e:
+        print(f"  get_filtered_graph_data: {e}")
 
     console.section("Top entities by degree — raw AgensGraph Cypher (query)")
+    top_name = top_id = None
     try:
         rows = await g.query(TOP_ENTITIES)
-        console.table(
-            [(r.get("name"), r.get("degree")) for r in rows if isinstance(r, dict)][:12],
-            headers=["entity", "degree"],
-        )
+        table = [(r.get("name"), r.get("id"), r.get("degree")) for r in rows if isinstance(r, dict)]
+        console.table([(n, d) for n, _i, d in table][:12], headers=["entity", "degree"])
+        if table:
+            top_name, top_id, _ = table[0]
     except Exception as e:
         print(f"  query failed: {e}")
+
+    if top_id is not None:
+        console.section(f"Traverse from the top entity — '{top_name}' (get_neighbors / get_connections)")
+        try:
+            neighbors = await g.get_neighbors(str(top_id))
+            console.kv("get_neighbors", f"{len(neighbors or [])} adjacent nodes")
+            for nb in (neighbors or [])[:5]:
+                if isinstance(nb, dict):
+                    print(f"   - {nb.get('name') or nb.get('id')}  ({nb.get('type')})")
+        except Exception as e:
+            print(f"  get_neighbors: {e}")
+        try:
+            connections = await g.get_connections(top_id)
+            console.kv("get_connections", f"{len(connections or [])} (node, edge, node) connections")
+        except Exception as e:
+            print(f"  get_connections: {e}")
 
     console.section("Visualize the knowledge graph (HTML)")
     out = str(config.DATA_DIR / "wiki_graph.html")

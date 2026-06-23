@@ -6,3 +6,7 @@ huggingface-hub>=0.23
 python-dotenv>=1.0
 tqdm>=4.66
 tiktoken>=0.7
+
+# For 04_code_graph only — cognee's code pipeline parses Python with tree-sitter.
+tree-sitter>=0.21
+tree-sitter-python>=0.21

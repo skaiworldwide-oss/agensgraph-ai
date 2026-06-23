@@ -76,11 +76,11 @@ notebook. They showcase what cognee does that plain vector RAG does **not**.
 
 | # | What it shows | Run |
 |---|----------------|-----|
-| [**01_search_modes**](01_search_modes) | build a KG from Wikipedia, then query it many ways — GRAPH_COMPLETION / INSIGHTS / RAG / CHUNKS / SUMMARIES / chain-of-thought | `build.py` → `ask.py` |
-| [**02_typed**](02_typed) | domain-structured extraction — guide cognify with a typed schema / ontology | `build.py` → `ask.py` |
-| [**03_memory**](03_memory) | a multi-dataset memory layer — isolated datasets, `node_set`, incremental add | `build.py` → `ask.py` |
+| [**01_search_modes**](01_search_modes) | build a KG from Wikipedia, then query it ten ways — graph completion, chain-of-thought, RAG baseline, INSIGHTS triplets, CHUNKS, SUMMARIES, natural-language → Cypher, raw Cypher | `build.py` → `ask.py` |
+| [**02_typed**](02_typed) | domain-structured extraction — guide cognify with an ontology so the graph follows your vocabulary | `build.py` → `ask.py` |
+| [**03_memory**](03_memory) | a memory grown from multiple named datasets — incremental `add`, `node_set` tags, one unified query | `build.py` → `ask.py` |
 | [**04_code_graph**](04_code_graph) | turn a Python repo into a code knowledge graph; `SearchType.CODE` + visualize | `build.py` → `ask.py` |
-| [**05_explore**](05_explore) | inspect the AgensGraph-backed KG — metrics, subgraphs, raw Cypher, HTML graph | `explore.py` |
+| [**05_explore**](05_explore) | inspect the AgensGraph-backed KG — metrics, slices, traversal, raw Cypher, HTML graph | `explore.py` |
 
 ## Configuration
 

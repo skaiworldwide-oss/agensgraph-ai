@@ -669,38 +669,20 @@ class AgensgraphAdapter(GraphDBInterface):
 
             - list[str]: A list of IDs of disconnected nodes.
         """
-        # return await self.query(
-        #     "MATCH (node) WHERE NOT (node)<-[:*]-() RETURN node.id as id",
-        # )
-        query = """
-        // Step 1: Collect all nodes
-        MATCH (n)
-        WITH COLLECT(n) AS nodes
-
-        // Step 2: Find all connected components
-        WITH nodes
-        UNWIND nodes AS startNode
-        MATCH path = (startNode)-[*]-(connectedNode)
-        WITH startNode, COLLECT(DISTINCT connectedNode) AS component
-
-        // Step 3: Aggregate components
-        WITH COLLECT(component) AS components
-
-        // Step 4: Identify the largest connected component
-        UNWIND components AS component
-        WITH component
-        ORDER BY SIZE(component) DESC
-        LIMIT 1
-        WITH component AS largestComponent
-
-        // Step 5: Find nodes not in the largest connected component
-        MATCH (n)
-        WHERE NOT n IN largestComponent
-        RETURN COLLECT(ID(n)) AS ids
-        """
-
+        # AgensGraph's Cypher rejects `//` comments and is pathologically slow on
+        # unbounded variable-length `[*]` traversals, so we don't compute connected
+        # components here. Per the docstring, "disconnected" = isolated nodes (no
+        # incident edges) — a cheap single-hop degree check returning the cognee
+        # `id` property (not the internal vertex id).
+        query = (
+            'MATCH (n:"__Node__") '
+            "OPTIONAL MATCH (n)-[r]-() "
+            "WITH n, count(r) AS deg "
+            "WHERE deg = 0 "
+            "RETURN COLLECT(n.id) AS ids"
+        )
         results = await self.query(query)
-        return results[0]["ids"] if len(results) > 0 else []
+        return results[0]["ids"] if results else []
 
     async def get_predecessors(self, node_id: str, edge_label: str = None) -> list[str]:
         """

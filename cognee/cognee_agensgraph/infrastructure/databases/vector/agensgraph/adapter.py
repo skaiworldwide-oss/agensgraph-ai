@@ -47,6 +47,13 @@ def _vec_literal(vector) -> str:
     return "[" + ",".join(str(float(x)) for x in vector) + "]"
 
 
+class IndexSchema(DataPoint):
+    """A minimal embeddable data point (id + text) used for field-level indexing."""
+
+    text: str
+    metadata: dict = {"index_fields": ["text"]}
+
+
 class AgensgraphVectorAdapter(VectorDBInterface):
     """
     Cognee vector storage backed by pgvector tables in AgensGraph.
@@ -130,6 +137,22 @@ class AgensgraphVectorAdapter(VectorDBInterface):
                 for start in range(0, len(params), CHUNK_SIZE):
                     await cur.executemany(query, params[start : start + CHUNK_SIZE])
             await conn.commit()
+
+    async def create_vector_index(self, index_name: str, index_property_name: str):
+        """Create the collection cognee indexes a DataPoint field into."""
+        await self.create_collection(f"{index_name}_{index_property_name}")
+
+    async def index_data_points(
+        self, index_name: str, index_property_name: str, data_points: List[DataPoint]
+    ):
+        """Embed + store the indexable field of each data point in its collection."""
+        await self.create_data_points(
+            f"{index_name}_{index_property_name}",
+            [
+                IndexSchema(id=dp.id, text=DataPoint.get_embeddable_data(dp))
+                for dp in data_points
+            ],
+        )
 
     async def retrieve(self, collection_name: str, data_point_ids: List[str]):
         if not data_point_ids or not await self.has_collection(collection_name):

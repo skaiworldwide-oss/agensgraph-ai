@@ -1087,44 +1087,54 @@ class AgensgraphAdapter(GraphDBInterface):
             - Tuple[List[Tuple[int, dict]], List[Tuple[int, int, str, dict]]}: A tuple
               containing nodes and edges in the requested subgraph.
         """
-        query = """
+        # Run the node and edge selection as two queries (like `get_graph_data`).
+        # A single combined query — collect the node set, then `MATCH (a)-[r]-(b)`
+        # among it — plans on AgensGraph as a scan over every edge in the graph and
+        # hangs at scale (and AgensGraph won't let an UNWIND-bound vertex anchor a
+        # later MATCH). Split apart, each part is index-backed: the node match is
+        # anchored on the indexed `name`, and the edge match uses the `id` index on
+        # both endpoints.
+
+        # 1) the named nodes of the requested type plus their 1-hop neighbours.
+        nodes_query = """
         UNWIND %(names)s AS wantedName
         MATCH (n:"__Node__" {name: wantedName})
         WHERE n.labels @> %(label)s
-        WITH DISTINCT n
         OPTIONAL MATCH (n)-[]-(nbr)
-        WITH collect(DISTINCT properties(n)) AS prim, collect(DISTINCT properties(nbr)) AS nbrs
-        WITH prim + nbrs AS nodelist
-        UNWIND nodelist AS node
-        WITH collect(DISTINCT node) AS nodes, collect(DISTINCT node.id) AS node_ids
-        MATCH (a)-[r]-(b)
-        WHERE a.id IN node_ids AND b.id IN node_ids
-        WITH nodes, collect(DISTINCT r) AS rels
-        RETURN
-          [n IN nodes |
-             { id: n.id,
-                properties: n }] AS "rawNodes",
-          [r IN rels  |
-             { type: get_label_name(r.id::graphid),
-                properties: r.properties }] AS "rawRels"
+        RETURN collect(DISTINCT properties(n)) AS centers,
+               collect(DISTINCT properties(nbr)) AS nbrs
         """
-
-        result = await self.query(query, {"names": Jsonb(node_name), "label": Jsonb(node_type.__name__)})
+        result = await self.query(
+            nodes_query, {"names": Jsonb(node_name), "label": Jsonb(node_type.__name__)}
+        )
         if not result:
             return [], []
 
-        raw_nodes = result[0]["rawNodes"]
-        raw_rels = result[0]["rawRels"]
+        by_id = {}
+        for prop in (result[0]["centers"] or []) + (result[0]["nbrs"] or []):
+            if prop:
+                by_id[prop["id"]] = prop
+        if not by_id:
+            return [], []
+        node_ids = list(by_id)
 
-        nodes = [(n["properties"]["id"], n["properties"]) for n in raw_nodes]
+        # 2) the edges among that node set (index lookup on both endpoint ids).
+        edges_query = """
+        MATCH (a:"__Node__")-[r]->(b:"__Node__")
+        WHERE a.id IN %(ids)s AND b.id IN %(ids)s
+        RETURN TYPE(r) AS type, properties(r) AS properties
+        """
+        edge_result = await self.query(edges_query, {"ids": Jsonb(node_ids)})
+
+        nodes = [(prop["id"], prop) for prop in by_id.values()]
         edges = [
             (
-                r["properties"]["source_node_id"],
-                r["properties"]["target_node_id"],
-                r["type"],
-                r["properties"],
+                record["properties"]["source_node_id"],
+                record["properties"]["target_node_id"],
+                record["type"],
+                record["properties"],
             )
-            for r in raw_rels
+            for record in edge_result
         ]
 
         return nodes, edges

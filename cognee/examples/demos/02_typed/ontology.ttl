@@ -1,0 +1,44 @@
+# A small domain ontology (Turtle/OWL). cognee aligns extracted entities to it
+# during cognify: ontology classes become EntityType nodes, and extracted entities
+# whose name matches an ontology *individual* are flagged `ontology_valid` — so the
+# graph is grounded in YOUR vocabulary and known entities, not just whatever the LLM
+# happens to emit. (Individuals here are notable entities from the demo corpus; in
+# your own project you'd list your domain's classes and key entities.)
+@prefix : <http://cognee.example/kg#> .
+@prefix owl: <http://www.w3.org/2002/07/owl#> .
+@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .
+
+# --- classes (your domain vocabulary) ---
+:Person a owl:Class .
+:Organization a owl:Class .
+:Location a owl:Class .
+:Event a owl:Class .
+:Work a owl:Class .
+:Concept a owl:Class .
+:Field a owl:Class .
+:Award a owl:Class .
+:Deity a owl:Class .
+
+# --- individuals (known entities; URI fragment matches the extracted entity name) ---
+:aristotle a :Person .
+:ayn_rand a :Person .
+:alexander_the_great a :Person .
+:andrei_tarkovsky a :Person .
+:allan_dwan a :Person .
+:alain_connes a :Person .
+:asia a :Location .
+:atlantic_ocean a :Location .
+:alaska a :Location .
+:albania a :Location .
+:alabama a :Location .
+:anarchism a :Concept .
+:animal a :Concept .
+:asteroids a :Concept .
+:anthropology a :Field .
+:allah a :Deity .
+:american_revolutionary_war a :Event .
+:animalia a :Work .
+:actrius a :Work .
+:alien_film_franchise a :Work .
+:america_the_beautiful a :Work .
+:academy_award_for_best_production_design a :Award .

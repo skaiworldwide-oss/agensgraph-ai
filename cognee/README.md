@@ -16,6 +16,10 @@ can use just the graph adapter and keep vectors elsewhere.
 - **New dedicated vector adapter.** `AgensgraphVectorAdapter` implements cognee's
   `VectorDBInterface` over pgvector (HNSW cosine), selectable with
   `VECTOR_DB_PROVIDER=agensgraph`, so AgensGraph can be cognee's vector store too.
+- **End-to-end `cognify` with AgensGraph vectors.** The vector adapter now
+  implements cognee's indexing hooks (`create_vector_index` / `index_data_points`),
+  so a full `add → cognify → search` runs with `VECTOR_DB_PROVIDER=agensgraph`
+  (previously `cognify` raised `AttributeError` on the missing methods).
 - **Batched `add_edges`.** Edges are UNWIND-batched per relationship type instead
   of one query per edge.
 - **`name` is indexed** and nodeset retrieval uses it (was a sequential scan).
@@ -26,6 +30,22 @@ can use just the graph adapter and keep vectors elsewhere.
   were broken (bad parameter binding / never awaited / undefined variables / a
   call to a non-existent method) and now work.
 - **Modernized packaging.** Poetry → hatchling, Python ≥3.10, version 0.2.0.
+
+## Demos
+
+A runnable demo suite lives in [`examples/demos/`](./examples/demos) — five
+focused examples on real public datasets (Wikipedia, CC-News, a Python repo),
+each with a README and a pre-executed notebook:
+
+| Demo | What it shows |
+|---|---|
+| [01 · Search modes](./examples/demos/01_search_modes) | build a KG from Wikipedia, then query it via GRAPH_COMPLETION / INSIGHTS / RAG / CHUNKS / SUMMARIES / chain-of-thought |
+| [02 · Typed](./examples/demos/02_typed) | ontology-guided extraction — make the graph follow your domain vocabulary |
+| [03 · Memory](./examples/demos/03_memory) | a multi-dataset memory layer — isolated datasets, `node_set`, incremental builds |
+| [04 · Code graph](./examples/demos/04_code_graph) | turn a Python repo into a code knowledge graph; `SearchType.CODE` + visualize |
+| [05 · Explore](./examples/demos/05_explore) | inspect the AgensGraph-backed graph — metrics, raw Cypher, HTML visualization |
+
+Start at [`examples/demos/README.md`](./examples/demos/README.md).
 
 ## Installation
 

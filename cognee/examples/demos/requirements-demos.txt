@@ -1,0 +1,8 @@
+# Demo extras (cognee + cognee-agensgraph themselves come from the editable install).
+# Install into the cognee venv:
+#   uv pip install --python ../../.venv/bin/python -r requirements-demos.txt
+datasets>=2.19
+huggingface-hub>=0.23
+python-dotenv>=1.0
+tqdm>=4.66
+tiktoken>=0.7

@@ -29,6 +29,7 @@ from mcp_agensgraph_common.connection import (
     create_pool,
     ensure_graph,
     get_pool_connection,
+    run_paginated_query,
     run_query,
 )
 from mcp_agensgraph_common.safety import is_write_query, quote_identifiers
@@ -39,6 +40,12 @@ logger = logging.getLogger("mcp_agensgraph_cypher")
 # Default cap on nodes sampled when introspecting the schema (bounds cost on large
 # graphs); overridable via AGENSGRAPH_SCHEMA_SAMPLE.
 DEFAULT_SCHEMA_SAMPLE = 1000
+
+# Read-result pagination: default page size and hard ceiling on rows per call, so an
+# unbounded query can't flood the agent's context or the server's memory. Overridable
+# via AGENSGRAPH_PAGE_SIZE / AGENSGRAPH_MAX_PAGE_SIZE.
+DEFAULT_PAGE_SIZE = 100
+MAX_PAGE_SIZE = 1000
 
 # Helper SQL functions used by the schema query (created once at startup).
 SQL_PROPERTY_CONSTRAINT_FUNCTION = """
@@ -171,11 +178,15 @@ def create_mcp_server(
     token_limit: Optional[int] = None,
     read_only: bool = False,
     schema_sample: int = DEFAULT_SCHEMA_SAMPLE,
+    page_size: int = DEFAULT_PAGE_SIZE,
+    max_page_size: int = MAX_PAGE_SIZE,
 ) -> FastMCP:
     """Create the FastMCP server with the schema / read / write tools."""
     mcp = FastMCP("mcp-agensgraph-cypher")
     prefix = format_namespace(namespace)
     sample = max(1, int(schema_sample))
+    default_page = max(1, min(int(page_size), int(max_page_size)))
+    max_page = max(1, int(max_page_size))
 
     schema_query = f"""
         SELECT label, attributes, relationships - 'non' AS relationships FROM (
@@ -248,29 +259,55 @@ def create_mcp_server(
         ),
     )
     async def read_agensgraph_cypher(
-        query: str = Field(..., description="The Cypher query to execute."),
+        query: str = Field(..., description="The Cypher query to execute (read-only: MATCH/RETURN)."),
         params: Optional[Dict[str, Any]] = Field(
             None, description="Parameters to pass to the Cypher query."
         ),
+        limit: int = Field(
+            default_page,
+            ge=1,
+            description=(
+                f"Max rows to return in this page (default {default_page}); values above "
+                f"{max_page} are clamped to {max_page}. The response echoes the effective limit."
+            ),
+        ),
+        offset: int = Field(
+            0, ge=0, description="Rows to skip — use with `next_offset` to page through results."
+        ),
     ) -> list[ToolResult]:
-        """Execute a read-only Cypher query.
+        """Execute a read-only Cypher query and return one page of results.
 
-        Runs in a read-only transaction, so the database rejects any write even if
-        the query slips past the keyword check. Subject to the configured timeout.
+        Runs in a read-only transaction, so the database rejects any write even if the
+        query slips past the keyword check. Results are paginated: at most `limit` rows
+        are returned, and the response's `has_more` / `next_offset` tell you whether and
+        how to fetch the next page. Returns a JSON object:
+        `{"rows": [...], "row_count", "offset", "limit", "has_more", "next_offset"}`.
         """
         if is_write_query(query):
             raise ToolError("Only read (MATCH/RETURN) queries are allowed by this tool.")
+        page_limit = min(max(1, int(limit)), max_page)
+        page_offset = max(0, int(offset))
         try:
-            results = await run_query(
+            rows, has_more = await run_paginated_query(
                 pool,
                 graphname,
                 quote_identifiers(query),
                 params=params,
                 read_only=True,
                 timeout=float(read_timeout),
+                limit=page_limit,
+                offset=page_offset,
             )
-            sanitized = [value_sanitize(el) for el in results]
-            results_json = json.dumps(sanitized, default=str)
+            sanitized = [value_sanitize(el) for el in rows]
+            payload = {
+                "rows": sanitized,
+                "row_count": len(sanitized),
+                "offset": page_offset,
+                "limit": page_limit,
+                "has_more": has_more,
+                "next_offset": page_offset + page_limit if has_more else None,
+            }
+            results_json = json.dumps(payload, default=str)
             if token_limit:
                 results_json = truncate_to_tokens(results_json, token_limit)
             return ToolResult(content=[TextContent(type="text", text=results_json)])
@@ -330,6 +367,8 @@ async def main(
     """Open the pool, bootstrap the graph + helpers, and serve over the chosen transport."""
     logger.info("Starting MCP AgensGraph Cypher Server")
     schema_sample = int(os.getenv("AGENSGRAPH_SCHEMA_SAMPLE", DEFAULT_SCHEMA_SAMPLE))
+    page_size = int(os.getenv("AGENSGRAPH_PAGE_SIZE", DEFAULT_PAGE_SIZE))
+    max_page_size = int(os.getenv("AGENSGRAPH_MAX_PAGE_SIZE", MAX_PAGE_SIZE))
 
     pool = create_pool(build_dsn(db_url, username, password, database))
     try:
@@ -339,7 +378,8 @@ async def main(
         await _ensure_helper_functions(pool, graphname)
 
         mcp = create_mcp_server(
-            pool, graphname, namespace, read_timeout, token_limit, read_only, schema_sample
+            pool, graphname, namespace, read_timeout, token_limit, read_only,
+            schema_sample, page_size, max_page_size,
         )
         await run_server(
             mcp,

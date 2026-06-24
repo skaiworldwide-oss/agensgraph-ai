@@ -122,3 +122,37 @@ async def run_query(
                 return []
 
     return [record_to_dict(r) for r in rows]
+
+
+async def run_paginated_query(
+    pool: AsyncConnectionPool,
+    graphname: str,
+    query: str,
+    params: Optional[dict[str, Any]] = None,
+    *,
+    read_only: bool = False,
+    timeout: Optional[float] = None,
+    limit: int = 100,
+    offset: int = 0,
+) -> tuple[list[dict[str, Any]], bool]:
+    """Run a Cypher query and return one page of rows plus a ``has_more`` flag.
+
+    The query is wrapped as an AgensGraph SQL subquery so ``LIMIT``/``OFFSET`` are
+    applied **by the database** — it can short-circuit instead of materializing the
+    whole result set (the point of paginating an arbitrary read). One extra row is
+    fetched to detect whether more results exist beyond this page. Vertex/edge
+    values survive the wrap, so the normal parsing still applies.
+
+    Returns ``(rows, has_more)`` where ``rows`` has at most ``limit`` items.
+    """
+    limit = max(1, int(limit))
+    offset = max(0, int(offset))
+    inner = query.rstrip().rstrip(";").rstrip()
+    # limit/offset are validated ints, so inlining them is injection-safe (and SQL
+    # LIMIT/OFFSET would accept binds, but the inner query owns the param namespace).
+    wrapped = f"SELECT * FROM (\n{inner}\n) AS _page LIMIT {limit + 1} OFFSET {offset}"
+    rows = await run_query(
+        pool, graphname, wrapped, params, read_only=read_only, timeout=timeout
+    )
+    has_more = len(rows) > limit
+    return rows[:limit], has_more

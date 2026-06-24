@@ -59,6 +59,7 @@ def __getattr__(name: str):  # pragma: no cover - thin lazy shim
         "get_pool_connection",
         "ensure_graph",
         "run_query",
+        "run_paginated_query",
     }:
         from . import connection
 

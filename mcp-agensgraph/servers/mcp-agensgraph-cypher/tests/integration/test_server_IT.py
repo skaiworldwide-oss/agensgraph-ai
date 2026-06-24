@@ -47,12 +47,36 @@ async def test_read_agensgraph_cypher(mcp_server: FastMCP, init_data: Any):
     response = await tool.run(dict(query=query))
 
     result = json.loads(response.content[0].text)
-    # Verify the query result
-    assert len(result) == 2
-    assert result[0]["person"] == "Alice"
-    assert result[0]["friend_name"] == "Bob"
-    assert result[1]["person"] == "Bob"
-    assert result[1]["friend_name"] == "Charlie"
+    # Paginated envelope: {"rows": [...], "row_count", "has_more", ...}
+    rows = result["rows"]
+    assert result["row_count"] == 2
+    assert result["has_more"] is False
+    assert len(rows) == 2
+    assert rows[0]["person"] == "Alice"
+    assert rows[0]["friend_name"] == "Bob"
+    assert rows[1]["person"] == "Bob"
+    assert rows[1]["friend_name"] == "Charlie"
+
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_read_agensgraph_cypher_pagination(mcp_server: FastMCP, init_data: Any):
+    """Reading is paginated: limit bounds the page, has_more/next_offset drive paging."""
+    query = "MATCH (p:Person) RETURN p.name AS name ORDER BY name"
+    tool = await mcp_server.get_tool("read_agensgraph_cypher")
+
+    # init_data has 3 people (Alice, Bob, Charlie); page through them 2 at a time.
+    page1 = json.loads((await tool.run(dict(query=query, limit=2))).content[0].text)
+    assert [r["name"] for r in page1["rows"]] == ["Alice", "Bob"]
+    assert page1["row_count"] == 2
+    assert page1["has_more"] is True
+    assert page1["next_offset"] == 2
+
+    page2 = json.loads(
+        (await tool.run(dict(query=query, limit=2, offset=page1["next_offset"]))).content[0].text
+    )
+    assert [r["name"] for r in page2["rows"]] == ["Charlie"]
+    assert page2["has_more"] is False
+    assert page2["next_offset"] is None
 
 
 @pytest.mark.asyncio(loop_scope="function")
@@ -77,7 +101,7 @@ async def test_read_query_timeout_with_slow_query(
         # If it completes, verify it returns valid results
         if response.content[0].text:
             result = json.loads(response.content[0].text)
-            assert isinstance(result, list)
+            assert isinstance(result["rows"], list)
     except ToolError as e:
         # If it times out, the tool raises a sanitized error (details go to the
         # server log, not the client).
@@ -96,11 +120,12 @@ async def test_read_query_with_normal_timeout_succeeds(
 
     result = json.loads(response.content[0].text)
 
-    # Should succeed and return expected results
-    assert len(result) == 3
-    assert result[0]["name"] == "Alice"
-    assert result[1]["name"] == "Bob"
-    assert result[2]["name"] == "Charlie"
+    # Should succeed and return expected results (paginated envelope)
+    rows = result["rows"]
+    assert len(rows) == 3
+    assert rows[0]["name"] == "Alice"
+    assert rows[1]["name"] == "Bob"
+    assert rows[2]["name"] == "Charlie"
 
 
 @pytest.mark.asyncio(loop_scope="function")
@@ -117,9 +142,8 @@ async def test_schema_query_timeout(mcp_server_short_timeout: FastMCP):
             schema = json.loads(response.content[0].text)
             assert isinstance(schema, dict)
     except ToolError as e:
-        # If it times out, that's also acceptable behavior for this test
-        error_message = str(e)
-        assert "Error" in error_message or "timeout" in error_message.lower()
+        # If it times out, the tool raises a sanitized error (details in the log).
+        assert "failed" in str(e).lower()
 
 
 @pytest.mark.asyncio(loop_scope="function")

@@ -12,11 +12,20 @@ The server offers these core tools:
 
 #### 📊 Query Tools
 - `read-agensgraph-cypher`
-   - Execute Cypher read queries to read data from the database
-   - Input: 
+   - Execute Cypher read queries to read data from the database. Runs in a read-only
+     transaction (the database rejects writes even if the keyword check is bypassed),
+     and results are **paginated** so an unbounded query can't flood the context.
+   - Input:
      - `query` (string): The Cypher query to execute
      - `params` (dictionary, optional): Parameters to pass to the Cypher query
-   - Returns: Query results as JSON serialized array of objects
+     - `limit` (int, optional): max rows for this page (default 100; clamped to a
+       server max, default 1000)
+     - `offset` (int, optional): rows to skip — pass the response's `next_offset` to
+       fetch the next page
+   - Returns: a JSON object
+     `{ "rows": [...], "row_count", "offset", "limit", "has_more", "next_offset" }`.
+     When `has_more` is true, call again with `offset = next_offset` for the next page.
+     (Page sizes are configurable via `AGENSGRAPH_PAGE_SIZE` / `AGENSGRAPH_MAX_PAGE_SIZE`.)
 
 - `write-agensgraph-cypher`
    - Execute updating Cypher queries

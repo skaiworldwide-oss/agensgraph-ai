@@ -227,3 +227,27 @@ async def test_find_nodes(memory: AgensGraphMemory):
     assert "Kevin" in entity_names
     assert "Laura" in entity_names
     assert "Mike" not in entity_names
+
+
+@pytest.mark.asyncio
+async def test_read_graph_limit_and_truncation(memory: AgensGraphMemory):
+    """read_graph caps entities at `limit` and flags truncation; relations (by name) stay coherent."""
+    await memory.create_entities(
+        [Entity(name=f"N{i}", type="thing", observations=[f"obs {i}"]) for i in range(4)]
+    )
+    await memory.create_relations(
+        [Relation(source="N0", target="N1", relationType="LINKS")]
+    )
+
+    capped = await memory.read_graph(limit=2)
+    assert len(capped.entities) == 2
+    assert capped.truncated is True
+
+    full = await memory.read_graph()  # class default is unbounded
+    assert len(full.entities) == 4
+    assert full.truncated is False
+    assert any(r.relationType == "LINKS" for r in full.relations)
+
+    found = await memory.search_memories("thing", limit=3)
+    assert len(found.entities) == 3
+    assert found.truncated is True

@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from typing import List, Literal, Optional
 
 from fastmcp.exceptions import ToolError
@@ -30,6 +31,11 @@ from .agensgraph_memory import (
 logger = logging.getLogger("mcp_agensgraph_memory")
 logger.setLevel(logging.INFO)
 
+# Default cap on entities returned by read_graph / search_memories, so a memory that
+# has grown large can't flood the caller's context. Overridable via
+# AGENSGRAPH_MEMORY_LIMIT; the response's `truncated` flag signals when it bit.
+DEFAULT_MEMORY_LIMIT = 1000
+
 jsonb_to_string = r"""
     CREATE OR REPLACE FUNCTION jsonb_to_string(j jsonb, sep text DEFAULT ', ')
     RETURNS text AS $$
@@ -49,11 +55,16 @@ jsonb_to_string = r"""
 """
 
 
-def create_mcp_server(memory: AgensGraphMemory, namespace: str = "") -> FastMCP:
+def create_mcp_server(
+    memory: AgensGraphMemory,
+    namespace: str = "",
+    memory_limit: int = DEFAULT_MEMORY_LIMIT,
+) -> FastMCP:
     """Create an MCP server instance for memory management."""
 
     namespace_prefix = format_namespace(namespace)
     mcp: FastMCP = FastMCP("mcp-agensgraph-memory")
+    default_limit = max(1, int(memory_limit))
 
     @mcp.tool(
         name=namespace_prefix + "read_graph",
@@ -65,14 +76,25 @@ def create_mcp_server(memory: AgensGraphMemory, namespace: str = "") -> FastMCP:
             openWorldHint=True,
         ),
     )
-    async def read_graph() -> ToolResult:
-        """Read the entire knowledge graph with all entities and relationships.
+    async def read_graph(
+        limit: int = Field(
+            default_limit,
+            ge=1,
+            description=(
+                f"Max entities to return (default {default_limit}). If the memory has "
+                "more, the response's `truncated` flag is set — narrow with "
+                "search_memories. Relations reference entities by name, so the result "
+                "stays coherent even when capped."
+            ),
+        ),
+    ) -> ToolResult:
+        """Read the knowledge graph (entities + relationships) from memory.
 
-        Returns the complete memory graph including all stored entities and their relationships.
-        Use this to get a full overview of stored knowledge.
+        Returns up to `limit` entities and the relationships touching them. Use this
+        for an overview; for a large memory, prefer search_memories to narrow.
 
         Returns:
-            KnowledgeGraph: Complete graph with all entities and relations
+            KnowledgeGraph: { "entities": [...], "relations": [...], "truncated": bool }
 
         Example response:
         {
@@ -82,12 +104,13 @@ def create_mcp_server(memory: AgensGraphMemory, namespace: str = "") -> FastMCP:
             ],
             "relations": [
                 {"source": "John Smith", "target": "SKAI Worldwide Inc", "relationType": "WORKS_AT"}
-            ]
+            ],
+            "truncated": false
         }
         """
         logger.info("MCP tool: read_graph")
         try:
-            result = await memory.read_graph()
+            result = await memory.read_graph(limit=max(1, int(limit)))
             return ToolResult(
                 content=[TextContent(type="text", text=result.model_dump_json())],
                 structured_content=result,
@@ -432,14 +455,22 @@ def create_mcp_server(memory: AgensGraphMemory, namespace: str = "") -> FastMCP:
             ...,
             description="Search query to find entities by name, type, or observations",
         ),
+        limit: int = Field(
+            default_limit,
+            ge=1,
+            description=(
+                f"Max matching entities to return (default {default_limit}); the "
+                "response's `truncated` flag is set if there are more."
+            ),
+        ),
     ) -> ToolResult:
         """Search for entities in the knowledge graph using text search.
 
         Searches across entity names, types, and observations.
-        Returns matching entities and their related connections. Supports partial matches.
+        Returns matching entities (up to `limit`) and their connections. Supports partial matches.
 
         Returns:
-            KnowledgeGraph: Subgraph containing matching entities and their relationships
+            KnowledgeGraph: { "entities": [...], "relations": [...], "truncated": bool }
 
         Example call:
         {
@@ -450,7 +481,7 @@ def create_mcp_server(memory: AgensGraphMemory, namespace: str = "") -> FastMCP:
         """
         logger.info(f"MCP tool: search_memories ('{query}')")
         try:
-            result = await memory.search_memories(query)
+            result = await memory.search_memories(query, limit=max(1, int(limit)))
             return ToolResult(
                 content=[TextContent(type="text", text=result.model_dump_json())],
                 structured_content=result,
@@ -536,7 +567,8 @@ async def main(
         await memory.create_fulltext_index()
         logger.info("AgensGraphMemory initialized")
 
-        mcp = create_mcp_server(memory, namespace)
+        memory_limit = int(os.getenv("AGENSGRAPH_MEMORY_LIMIT", DEFAULT_MEMORY_LIMIT))
+        mcp = create_mcp_server(memory, namespace, memory_limit)
         await run_server(
             mcp,
             transport=transport,

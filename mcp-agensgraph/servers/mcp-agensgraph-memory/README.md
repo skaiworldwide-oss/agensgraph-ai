@@ -21,15 +21,20 @@ The server offers these core tools:
 
 #### 🔎 Query Tools
 - `read_graph`
-   - Read the entire knowledge graph
-   - No input required
-   - Returns: Complete graph with entities and relations
+   - Read the knowledge graph
+   - Input:
+     - `limit` (int, optional): max entities to return (default 1000). Relations
+       reference entities by name, so the result stays coherent when capped.
+   - Returns: `{ "entities": [...], "relations": [...], "truncated": bool }`. When
+     `truncated` is true the memory has more — narrow with `search_memories` or raise
+     the limit. (Default cap configurable via `AGENSGRAPH_MEMORY_LIMIT`.)
 
 - `search_memories`
    - Search for nodes based on a query
    - Input:
      - `query` (string): Search query matching names, types, observations
-   - Returns: Matching subgraph
+     - `limit` (int, optional): max matching entities to return (default 1000)
+   - Returns: matching subgraph as `{ "entities", "relations", "truncated" }`
 
 - `find_memories_by_name`
    - Find specific nodes by name

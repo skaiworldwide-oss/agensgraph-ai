@@ -103,8 +103,8 @@ class TestNamespacing:
         read_tool = tools.get("test-read_graph")
         assert read_tool is not None
 
-        # Call the tool function and verify it works
-        await read_tool.fn()
+        # Invoke via .run (resolves arg/Field defaults) and verify it works
+        await read_tool.run({})
         mock_memory.read_graph.assert_called_once()
 
     @pytest.mark.asyncio

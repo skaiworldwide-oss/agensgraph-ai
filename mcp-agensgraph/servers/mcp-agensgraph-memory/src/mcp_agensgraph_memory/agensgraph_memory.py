@@ -83,6 +83,13 @@ class KnowledgeGraph(BaseModel):
     relations: List[Relation] = Field(
         description="List of all relationships between entities", default=[]
     )
+    truncated: bool = Field(
+        default=False,
+        description=(
+            "True if the entity list was capped by the limit. Narrow with "
+            "search_memories or request a higher limit to see more."
+        ),
+    )
 
 
 class ObservationAddition(BaseModel):
@@ -196,8 +203,14 @@ class AgensGraphMemory:
             # Index might already exist, which is fine
             logger.debug(f"Fulltext property index creation: {e}")
 
-    async def load_graph(self, filter_query: str = None):
-        """Load the entire knowledge graph from AgensGraph."""
+    async def load_graph(self, filter_query: str = None, limit: int = None):
+        """Load the knowledge graph from AgensGraph.
+
+        If ``limit`` is set, at most that many entities are returned (capped at the
+        database with ``LIMIT`` so a large memory can't flood the caller's context);
+        the returned graph's ``truncated`` flag indicates whether more exist.
+        Relations reference entities by name, so the capped graph stays coherent.
+        """
         logger.info("Loading knowledge graph from AgensGraph")
 
         async with get_pool_connection(self.pool) as conn:
@@ -217,13 +230,24 @@ class AgensGraphMemory:
                 filter_condition = ""
                 params = {}
 
-            # Query to get all matching entities
+            # Fetch one extra row to detect truncation when a limit is applied.
+            # limit is a validated int, so inlining it is injection-safe.
+            limit_clause = ""
+            if limit is not None:
+                limit = max(1, int(limit))
+                limit_clause = f"ORDER BY entity.name LIMIT {limit + 1}"
+
             entity_query = f"""
                 MATCH (entity:"Memory")
                 {filter_condition}
                 RETURN entity.name AS name, entity.type AS type, entity.observations AS observations
+                {limit_clause}
             """
             entities_data = await self._execute_cypher(conn, entity_query, params)
+
+            truncated = limit is not None and len(entities_data) > limit
+            if truncated:
+                entities_data = entities_data[:limit]
 
             entities = []
             entity_names = []
@@ -264,7 +288,9 @@ class AgensGraphMemory:
             logger.debug(f"Loaded entities: {entities}")
             logger.debug(f"Loaded relations: {relations}")
 
-            return KnowledgeGraph(entities=entities, relations=relations)
+            return KnowledgeGraph(
+                entities=entities, relations=relations, truncated=truncated
+            )
 
     async def create_entities(self, entities: List[Entity]) -> List[Entity]:
         """Create multiple new entities in the knowledge graph."""
@@ -457,14 +483,14 @@ class AgensGraphMemory:
 
         logger.info(f"Successfully deleted {len(relations)} relations")
 
-    async def read_graph(self) -> KnowledgeGraph:
-        """Read the entire knowledge graph."""
-        return await self.load_graph()
+    async def read_graph(self, limit: int = None) -> KnowledgeGraph:
+        """Read the knowledge graph (up to ``limit`` entities)."""
+        return await self.load_graph(limit=limit)
 
-    async def search_memories(self, query: str) -> KnowledgeGraph:
-        """Search for memories based on a query."""
+    async def search_memories(self, query: str, limit: int = None) -> KnowledgeGraph:
+        """Search for memories based on a query (up to ``limit`` entities)."""
         logger.info(f"Searching for memories with query: '{query}'")
-        return await self.load_graph(query)
+        return await self.load_graph(query, limit=limit)
 
     async def find_memories_by_name(self, names: List[str]) -> KnowledgeGraph:
         """Find specific memories by their names."""

@@ -1,0 +1,18 @@
+# Demo extras. The three MCP servers (+ shared core) are installed editable from
+# ../../servers/* and bring fastmcp + psycopg + pydantic with them. Set up the venv:
+#
+#   cd mcp-agensgraph/examples/demos
+#   uv venv .venv
+#   uv pip install --python .venv/bin/python \
+#       -e ../../servers/mcp-agensgraph-common \
+#       -e ../../servers/mcp-agensgraph-cypher \
+#       -e ../../servers/mcp-agensgraph-memory \
+#       -e ../../servers/mcp-agensgraph-data-modeling \
+#       -r requirements-demos.txt
+#
+# (No OpenAI/Anthropic key needed — the MCP servers are pure tools.)
+python-dotenv>=1.0
+tqdm>=4.66
+jupyter>=1.0
+ipykernel>=6.29
+nbconvert>=7.16

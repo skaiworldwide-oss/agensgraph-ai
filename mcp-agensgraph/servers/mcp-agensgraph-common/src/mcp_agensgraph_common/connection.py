@@ -21,11 +21,28 @@ from urllib.parse import quote, urlparse
 import psycopg
 from psycopg import sql
 from psycopg.rows import namedtuple_row
+from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
 from .results import record_to_dict
 
 logger = logging.getLogger("mcp_agensgraph_common")
+
+
+def jsonb_params(params: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Wrap list/dict param values as JSONB.
+
+    Cypher parameters are JSONB-shaped (a query like ``UNWIND $records AS r`` or
+    ``WHERE n.name IN $names`` expects a JSONB array/object), but psycopg cannot adapt
+    a bare Python ``list``/``dict``. Params reaching an MCP tool arrive as plain JSON
+    values, so wrap any list/dict in ``Jsonb`` here; scalars and already-wrapped
+    values pass through unchanged.
+    """
+    if not params:
+        return params
+    return {
+        k: (Jsonb(v) if isinstance(v, (list, dict)) else v) for k, v in params.items()
+    }
 
 
 def build_dsn(db_url: str, username: str, password: str, database: str) -> str:
@@ -106,8 +123,9 @@ async def run_query(
                         )
                     )
                 await cur.execute(set_path)
-                if params:
-                    await cur.execute(query, params)
+                bound = jsonb_params(params)
+                if bound:
+                    await cur.execute(query, bound)
                 else:
                     await cur.execute(query)
                 await conn.commit()

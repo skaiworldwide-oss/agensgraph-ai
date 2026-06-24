@@ -29,6 +29,7 @@ from mcp_agensgraph_common.connection import (
     create_pool,
     ensure_graph,
     get_pool_connection,
+    jsonb_params,
     run_paginated_query,
     run_query,
 )
@@ -151,8 +152,9 @@ async def _execute_write(
         async with conn.cursor(row_factory=namedtuple_row) as cur:
             try:
                 await cur.execute(set_path)
-                if params:
-                    await cur.execute(query, params)
+                bound = jsonb_params(params)
+                if bound:
+                    await cur.execute(query, bound)
                 else:
                     await cur.execute(query)
                 try:
@@ -220,7 +222,9 @@ def create_mcp_server(
                 ) AS relationships
         )t
     """
-    count_query = "MATCH (n) RETURN label(n) AS label, count(n) AS count"
+    # count(*) — NOT count(n): count(n) materializes each node (de-TOASTing large
+    # properties like embeddings), making schema introspection slow on big graphs.
+    count_query = "MATCH (n) RETURN label(n) AS label, count(*) AS count"
 
     @mcp.tool(
         name=prefix + "get_agensgraph_schema",

@@ -18,6 +18,32 @@ async def test_get_agensgraph_schema(mcp_server: FastMCP, init_data: Any):
     assert schema["Person"]["count"] == 3
     assert len(schema["Person"]["properties"]) == 2
     assert "FRIEND" in schema["Person"]["relationships"]
+@pytest.mark.asyncio(loop_scope="function")
+async def test_get_agensgraph_schema_describes_every_label(
+    mcp_server_tiny_sample: FastMCP, two_label_data: Any
+):
+    """Every label is described when the sample is smaller than one label's node count."""
+    tool = await mcp_server_tiny_sample.get_tool("get_agensgraph_schema")
+    schema = json.loads((await tool.run(dict())).content[0].text)
+
+    assert set(schema) == {"Person", "Company"}
+    # Counts stay exact regardless of the sample.
+    assert schema["Person"]["count"] == 4
+    assert schema["Company"]["count"] == 2
+    assert set(schema["Person"]["properties"]) == {"name", "age"}
+    assert set(schema["Company"]["properties"]) == {"name", "founded"}
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_get_agensgraph_schema_reports_every_target_label(
+    mcp_server: FastMCP, two_label_data: Any
+):
+    """A relationship type reaching two labels reports both of them."""
+    tool = await mcp_server.get_tool("get_agensgraph_schema")
+    schema = json.loads((await tool.run(dict())).content[0].text)
+
+    knows = schema["Person"]["relationships"]["KNOWS"]
+    assert knows["direction"] == "OUT"
+    assert sorted(knows["labels"]) == ["Company", "Person"]
 
 @pytest.mark.asyncio(loop_scope="function")
 async def test_write_agensgraph_cypher(mcp_server: FastMCP):

@@ -33,13 +33,13 @@ from mcp_agensgraph_common.connection import (
     run_paginated_query,
     run_query,
 )
-from mcp_agensgraph_common.safety import is_write_query, quote_identifiers
+from mcp_agensgraph_common.safety import is_write_query, quote_identifiers, quote_label
 from mcp_agensgraph_common.transport import run_server
 
 logger = logging.getLogger("mcp_agensgraph_cypher")
 
-# Default cap on nodes sampled when introspecting the schema (bounds cost on large
-# graphs); overridable via AGENSGRAPH_SCHEMA_SAMPLE.
+# Default cap on nodes sampled *per label* when introspecting the schema (bounds cost on
+# large graphs); overridable via AGENSGRAPH_SCHEMA_SAMPLE.
 DEFAULT_SCHEMA_SAMPLE = 1000
 
 # Read-result pagination: default page size and hard ceiling on rows per call, so an
@@ -48,27 +48,7 @@ DEFAULT_SCHEMA_SAMPLE = 1000
 DEFAULT_PAGE_SIZE = 100
 MAX_PAGE_SIZE = 1000
 
-# Helper SQL functions used by the schema query (created once at startup).
-SQL_PROPERTY_CONSTRAINT_FUNCTION = """
-CREATE OR REPLACE FUNCTION property_has_unique_constraint(key_name TEXT)
-RETURNS BOOLEAN AS $$
-DECLARE
-    found BOOLEAN;
-BEGIN
-    SELECT EXISTS (
-        SELECT 1
-        FROM pg_catalog.pg_constraint r
-        JOIN pg_catalog.ag_label l ON r.conrelid = l.relid
-        JOIN pg_catalog.ag_graph g ON l.graphid = g.oid
-        WHERE g.graphname = current_setting('graph_path')
-        AND r.contype IN ('c', 'x')
-        AND pg_catalog.ag_get_graphconstraintdef(r.oid) ILIKE '%(' || key_name || ') IS UNIQUE%'
-    ) INTO found;
-    RETURN found;
-END;
-$$ LANGUAGE plpgsql;
-"""
-
+# Helper SQL function used by the schema query (created once at startup).
 SQL_TYPEOF_FUNCTION = r"""
 CREATE OR REPLACE FUNCTION typeof(element jsonb)
 RETURNS text AS $$
@@ -96,45 +76,159 @@ $$ LANGUAGE plpgsql IMMUTABLE;
 """
 
 
-def _transform_schema_format(records: List[Dict], counts: List[Dict]) -> Dict:
+def _vertex_labels_query() -> str:
+    """SQL listing the graph's vertex labels.
+
+    ``ag_vertex`` is the inheritance parent every vertex label hangs off, not a label of
+    its own.
+    """
+    return """
+        SELECT l.labname AS labname
+        FROM pg_catalog.ag_label l
+        JOIN pg_catalog.ag_graph g ON g.oid = l.graphid
+        WHERE g.graphname = %(graph)s
+          AND l.labkind = 'v'
+          AND l.labname <> 'ag_vertex'
+        ORDER BY l.labname
+    """
+
+
+def _attributes_query(labels: List[str], sample: int) -> str:
+    """Cypher reporting each label's property names and types, sampling per label.
+
+    One query part per label, each carrying its own ``LIMIT``, so the sample bounds every
+    label.
+    """
+    parts = []
+    for label in labels:
+        try:
+            quoted = quote_label(label)
+        except ValueError:
+            # A label the Cypher quoting cannot express: describe the rest of the graph
+            # rather than fail the whole tool.
+            logger.warning("Skipping label in schema introspection: %r", label)
+            continue
+        parts.append(
+            f"MATCH (s:{quoted})\n"
+            "WITH s, keys(s) AS keys, properties(s) AS props\n"
+            f"LIMIT {int(sample)}\n"
+            "UNWIND keys AS key\n"
+            "RETURN label(s) AS label,\n"
+            "       jsonb_object_agg(key::text, typeof(props[key])) AS attributes"
+        )
+    return "\nUNION ALL\n".join(parts)
+
+
+def _node_counts_query(graphname: str) -> str:
+    """SQL counting nodes per label, exactly.
+
+    A ``graphid`` carries the label id of the row it identifies, so grouping on it counts
+    per label without reading a property.
+    """
+    vertex_table = sql.Identifier(graphname, "ag_vertex").as_string(None)
+    return f"""
+        SELECT l.labname AS label,
+               c.count    AS count
+        FROM (
+            SELECT graphid_labid(v.id) AS labid, count(*) AS count
+            FROM {vertex_table} v
+            GROUP BY 1
+        ) c
+        JOIN pg_catalog.ag_graph g  ON g.graphname = %(graph)s
+        JOIN pg_catalog.ag_label l  ON l.graphid = g.oid AND l.labid = c.labid
+    """
+
+
+def _relationships_query(graphname: str) -> str:
+    """SQL reporting the graph's (start label, type, end label) triples.
+
+    A ``graphid`` carries the label id of the row it identifies, so an edge already names
+    both of its endpoint labels: ``start``, ``end`` and ``id`` off the edge tables give the
+    triples without reading a vertex. The ids resolve to names by catalog join.
+    """
+    edge_table = sql.Identifier(graphname, "ag_edge").as_string(None)
+    return f"""
+        SELECT sl.labname AS label,
+               el.labname AS relationship_type,
+               tl.labname AS end_label
+        FROM (
+            SELECT DISTINCT graphid_labid(e.start) AS start_labid,
+                            graphid_labid(e.id)    AS edge_labid,
+                            graphid_labid(e."end") AS end_labid
+            FROM {edge_table} e
+        ) d
+        JOIN pg_catalog.ag_graph g  ON g.graphname = %(graph)s
+        JOIN pg_catalog.ag_label el ON el.graphid = g.oid AND el.labid = d.edge_labid
+        JOIN pg_catalog.ag_label sl ON sl.graphid = g.oid AND sl.labid = d.start_labid
+        JOIN pg_catalog.ag_label tl ON tl.graphid = g.oid AND tl.labid = d.end_labid
+    """
+
+
+# Every property key the graph declares UNIQUE, read once per introspection. A constraint
+# names the key it covers only inside its rendered definition.
+_UNIQUE_PROPERTY_KEYS_QUERY = r"""
+    SELECT DISTINCT m[1] AS key_name
+    FROM pg_catalog.pg_constraint r
+    JOIN pg_catalog.ag_label l ON r.conrelid = l.relid
+    JOIN pg_catalog.ag_graph g ON l.graphid = g.oid
+    CROSS JOIN LATERAL regexp_matches(
+        pg_catalog.ag_get_graphconstraintdef(r.oid),
+        '\(([^()]+)\)\s+IS\s+UNIQUE', 'gi'
+    ) AS m
+    WHERE g.graphname = %(graph)s
+      AND r.contype IN ('c', 'x')
+"""
+
+
+def _transform_schema_format(
+    attributes: List[Dict],
+    relationships: List[Dict],
+    counts: List[Dict],
+    unique_keys: set[str],
+) -> Dict:
     """Shape the raw schema rows into ``{Label: {type, count, properties, relationships}}``."""
     schema: Dict[str, Any] = {}
     count_map = {c["label"]: c["count"] for c in counts}
 
-    for record in records:
+    rel_map: Dict[str, Dict[str, Any]] = {}
+    for row in relationships:
+        label = row["label"]
+        rel_type = row["relationship_type"]
+        end_label = row["end_label"]
+        if not (label and rel_type and end_label):
+            continue
+        entry = rel_map.setdefault(label, {}).setdefault(
+            rel_type.upper(), {"direction": "OUT", "labels": []}
+        )
+        target = end_label.capitalize()
+        # One relationship type can reach more than one label; keep them all.
+        if target not in entry["labels"]:
+            entry["labels"].append(target)
+
+    for record in attributes:
         label = record["label"]
         label_key = label.capitalize()
 
         properties = {}
-        for prop_name, prop_type_str in (record["attributes"] or {}).items():
-            indexed = "unique indexed" in prop_type_str
+        for prop_name, prop_type in (record["attributes"] or {}).items():
             properties[prop_name] = {
-                "type": prop_type_str.replace(" unique indexed", ""),
-                "indexed": indexed,
+                "type": prop_type,
+                "indexed": prop_name in unique_keys,
             }
-
-        relationships = {}
-        for rel_type, target_label in (record.get("relationships") or {}).items():
-            if rel_type and target_label:
-                relationships[rel_type.upper()] = {
-                    "direction": "OUT",
-                    "labels": [target_label.capitalize()],
-                }
 
         schema[label_key] = {
             "type": "node",
             "count": count_map.get(label, 0),
             "properties": properties,
         }
-        if relationships:
-            schema[label_key]["relationships"] = relationships
+        if label in rel_map:
+            schema[label_key]["relationships"] = rel_map[label]
 
     return schema
 
 
 async def _ensure_helper_functions(pool: AsyncConnectionPool, graphname: str) -> None:
-    """Create the schema-introspection helper functions once (idempotent)."""
-    await run_query(pool, graphname, SQL_PROPERTY_CONSTRAINT_FUNCTION)
+    """Create the schema-introspection helper function once (idempotent)."""
     await run_query(pool, graphname, SQL_TYPEOF_FUNCTION)
 
 
@@ -190,41 +284,7 @@ def create_mcp_server(
     default_page = max(1, min(int(page_size), int(max_page_size)))
     max_page = max(1, int(max_page_size))
 
-    schema_query = f"""
-        SELECT label, attributes, relationships - 'non' AS relationships FROM (
-            MATCH (start_node)
-            WITH start_node,
-                keys(start_node) AS keys,
-                properties(start_node) AS props
-            LIMIT {sample}
-            OPTIONAL MATCH (start_node)-[r]->(end_node)
-            WITH DISTINCT
-                label(start_node) as label,
-                type(r) AS relationship_type,
-                label(end_node) AS end_label,
-                keys, props
-            UNWIND keys AS key
-            RETURN
-                label,
-                jsonb_object_agg(
-                    key::text,
-                    CASE
-                        WHEN property_has_unique_constraint(key) THEN typeof(props[key]) || ' unique indexed'
-                        ELSE typeof(props[key])
-                    END
-                ) AS attributes,
-                jsonb_object_agg(
-                    CASE
-                        WHEN relationship_type IS NOT NULL THEN relationship_type::text
-                        ELSE 'non'
-                    END,
-                    end_label
-                ) AS relationships
-        )t
-    """
-    # count(*) — NOT count(n): count(n) materializes each node (de-TOASTing large
-    # properties like embeddings), making schema introspection slow on big graphs.
-    count_query = "MATCH (n) RETURN label(n) AS label, count(*) AS count"
+    count_query = _node_counts_query(graphname)
 
     @mcp.tool(
         name=prefix + "get_agensgraph_schema",
@@ -239,12 +299,38 @@ def create_mcp_server(
     async def get_agensgraph_schema() -> list[ToolResult]:
         """List node labels, their properties (with types/indexing), and relationships.
 
-        Properties are inferred from a sample of nodes; node counts are exact.
+        Properties are inferred from a sample of nodes per label; node counts, the
+        relationships, and which properties are unique are exact.
         """
         try:
-            records = await run_query(pool, graphname, schema_query, read_only=True)
-            counts = await run_query(pool, graphname, count_query, read_only=True)
-            schema = _transform_schema_format(records, counts)
+            graph_param = {"graph": graphname}
+            labels = [
+                row["labname"]
+                for row in await run_query(
+                    pool, graphname, _vertex_labels_query(), graph_param, read_only=True
+                )
+            ]
+            attributes_query = _attributes_query(labels, sample)
+            attributes = (
+                await run_query(pool, graphname, attributes_query, read_only=True)
+                if attributes_query
+                else []
+            )
+            relationships = await run_query(
+                pool, graphname, _relationships_query(graphname), graph_param, read_only=True
+            )
+            counts = await run_query(
+                pool, graphname, count_query, graph_param, read_only=True
+            )
+            unique_keys = {
+                row["key_name"]
+                for row in await run_query(
+                    pool, graphname, _UNIQUE_PROPERTY_KEYS_QUERY, graph_param, read_only=True
+                )
+            }
+            schema = _transform_schema_format(
+                attributes, relationships, counts, unique_keys
+            )
             return ToolResult(
                 content=[TextContent(type="text", text=json.dumps(schema, default=str))]
             )

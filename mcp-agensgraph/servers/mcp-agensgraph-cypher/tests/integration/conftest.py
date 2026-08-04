@@ -3,7 +3,11 @@ from typing import Any
 import pytest
 import pytest_asyncio
 
-from mcp_agensgraph_cypher.server import create_mcp_server, get_pool_connection
+from mcp_agensgraph_cypher.server import (
+    _ensure_helper_functions,
+    create_mcp_server,
+    get_pool_connection,
+)
 from mcp_agensgraph_common.safety import quote_identifiers as _quote_identifiers
 from psycopg.rows import namedtuple_row  # type: ignore
 from psycopg_pool import AsyncConnectionPool, PoolTimeout  # type: ignore
@@ -34,6 +38,10 @@ async def setup(graphname):
             await cursor.execute(f"CREATE GRAPH IF NOT EXISTS {graphname}")
             await conn.commit()
 
+    # The schema tool's helper is an ordinary function the server installs at startup,
+    # not a built-in.
+    await _ensure_helper_functions(agensgraph_driver, graphname)
+
     yield agensgraph_driver
 
     await agensgraph_driver.close()
@@ -51,6 +59,34 @@ async def mcp_server_short_timeout(setup, graphname):
     """MCP server with very short timeout for testing timeout behavior."""
     mcp = create_mcp_server(setup, graphname=graphname, read_timeout=0.01)
     return mcp
+
+
+@pytest_asyncio.fixture(scope="function")
+async def mcp_server_tiny_sample(setup, graphname):
+    """MCP server whose schema sample is smaller than one label's node count."""
+    mcp = create_mcp_server(setup, graphname=graphname, schema_sample=2)
+    return mcp
+
+
+@pytest_asyncio.fixture(scope="function")
+async def two_label_data(setup, clear_data: Any, graphname):
+    """Two labels, the first with more nodes than the tiny sample, plus a relationship
+    type that reaches both labels."""
+    async with get_pool_connection(setup) as conn:
+        async with conn.cursor(row_factory=namedtuple_row) as cursor:
+            await cursor.execute(f"SET graph_path = {graphname}")
+            query = """
+                CREATE (a:Person {name: 'Alice', age: 30}),
+                       (b:Person {name: 'Bob', age: 25}),
+                       (c:Person {name: 'Charlie', age: 35}),
+                       (d:Person {name: 'Dana', age: 40}),
+                       (x:Company {name: 'Acme', founded: 1999}),
+                       (y:Company {name: 'Globex', founded: 2005}),
+                       (a)-[:KNOWS]->(b),
+                       (a)-[:KNOWS]->(x)
+            """
+            await cursor.execute(_quote_identifiers(query))
+            await conn.commit()
 
 
 @pytest_asyncio.fixture(scope="function")

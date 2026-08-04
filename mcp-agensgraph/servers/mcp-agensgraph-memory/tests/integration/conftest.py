@@ -8,7 +8,7 @@ from psycopg.rows import namedtuple_row
 from psycopg_pool import AsyncConnectionPool
 
 from mcp_agensgraph_memory.agensgraph_memory import AgensGraphMemory
-from mcp_agensgraph_memory.server import create_mcp_server
+from mcp_agensgraph_memory.server import create_mcp_server, jsonb_to_string
 
 
 def get_pool_connection(pool: AsyncConnectionPool):
@@ -292,10 +292,12 @@ async def db_setup(graphname):
 
     await agensgraph_pool.open()
 
-    # Ensure graph exists
+    # Ensure the graph exists, plus the fulltext-search helper the server installs at
+    # startup — an ordinary function, not a built-in.
     async with get_pool_connection(agensgraph_pool) as conn:
         async with conn.cursor(row_factory=namedtuple_row) as cursor:
             await cursor.execute(f"CREATE GRAPH IF NOT EXISTS {graphname}")
+            await cursor.execute(jsonb_to_string)
             await conn.commit()
 
     yield agensgraph_pool

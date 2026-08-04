@@ -6,11 +6,47 @@ import logging
 
 import pytest
 
-from langchain_agensgraph.graphs.agensgraph import AgensGraph
+from langchain_agensgraph.graphs.agensgraph import (
+    _AG_BANNER_RE,
+    _AG_VERSION_RE,
+    AgensGraph,
+)
 from langchain_agensgraph.vectorstores.agensgraph_vector import (
     DEFAULT_VECTOR_INDEX_AM,
     VectorIndexAM,
 )
+
+
+@pytest.mark.parametrize(
+    "setting, expected",
+    [
+        # A development build names only major.minor; a release names all three.
+        ("2.18-devel", ("2", "18", None)),
+        ("2.18.0", ("2", "18", "0")),
+        ("2.17.3", ("2", "17", "3")),
+        ("2.18.0-devel", ("2", "18", "0")),
+    ],
+)
+def test_agversion_setting_parses(setting: str, expected: tuple) -> None:
+    match = _AG_VERSION_RE.search(setting)
+    assert match is not None
+    assert match.groups() == expected
+
+
+def test_version_banner_reads_agensgraph_not_postgres() -> None:
+    # Both versions sit in one string, PostgreSQL's first; the product name is what
+    # keeps 18beta1 from being read as the AgensGraph version.
+    banner = (
+        "PostgreSQL 18beta1 (AgensGraph 2.18-devel) on x86_64-pc-linux-gnu, "
+        "compiled by gcc 9.4.0, 64-bit"
+    )
+    match = _AG_BANNER_RE.search(banner)
+    assert match is not None
+    assert match.groups() == ("2", "18", None)
+
+
+def test_version_banner_ignores_a_string_without_agensgraph() -> None:
+    assert _AG_BANNER_RE.search("PostgreSQL 18.4 on x86_64-pc-linux-gnu") is None
 
 
 def test_ivfflat_enum_value_is_pgvector_name() -> None:

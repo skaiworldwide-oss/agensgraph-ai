@@ -102,6 +102,12 @@ triple_query = f"""
 LIST_LIMIT = 128
 """List-valued result properties longer than this are dropped when sanitize=True."""
 
+# A version with an optional patch component: the ``agversion`` setting on its own, and
+# the same inside the ``version()`` banner, where the product name distinguishes it from
+# the PostgreSQL version alongside.
+_AG_VERSION_RE = re.compile(r"(\d+)\.(\d+)(?:\.(\d+))?")
+_AG_BANNER_RE = re.compile(r"AgensGraph\s+(\d+)\.(\d+)(?:\.(\d+))?")
+
 
 def _package_version() -> str:
     try:
@@ -327,18 +333,26 @@ class AgensGraph(GraphStore):
         ``(0,0,0)`` / ``False`` if the probe itself fails — so the integration
         always falls back to behaviors that work on older AgensGraph builds.
         """
-        try:
-            rows = self.query("SELECT version() AS v")
-            ver_str = rows[0]["v"] if rows else ""
-            match = re.search(r"AgensGraph\s+(\d+)\.(\d+)\.(\d+)", ver_str)
+        # ``agversion`` reports the AgensGraph version on its own; ``version()`` is the
+        # fallback for a build that does not expose the setting.
+        for query, pattern in (
+            ("SELECT current_setting('agversion') AS v", _AG_VERSION_RE),
+            ("SELECT version() AS v", _AG_BANNER_RE),
+        ):
+            try:
+                rows = self.query(query)
+            except Exception:
+                continue
+            match = pattern.search(rows[0]["v"] if rows else "")
             if match:
+                # The patch component is optional, a development build naming only
+                # major.minor ("2.18-devel").
                 self._server_version = (
                     int(match.group(1)),
                     int(match.group(2)),
-                    int(match.group(3)),
+                    int(match.group(3) or 0),
                 )
-        except Exception:
-            pass
+                break
         try:
             rows = self.query(
                 "SELECT 1 AS ok FROM pg_extension WHERE extname = 'meta'"

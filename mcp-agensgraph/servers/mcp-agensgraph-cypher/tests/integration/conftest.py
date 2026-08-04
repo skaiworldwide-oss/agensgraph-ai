@@ -1,4 +1,7 @@
+import asyncio
 import os
+import signal
+import time
 from typing import Any
 import pytest
 import pytest_asyncio
@@ -11,6 +14,67 @@ from mcp_agensgraph_cypher.server import (
 from mcp_agensgraph_common.safety import quote_identifiers as _quote_identifiers
 from psycopg.rows import namedtuple_row  # type: ignore
 from psycopg_pool import AsyncConnectionPool, PoolTimeout  # type: ignore
+
+
+async def _wait_for_port_free(port: int, timeout: float = 30.0) -> None:
+    """Wait until nothing on localhost holds ``port``."""
+    deadline = time.monotonic() + timeout
+    while await _port_is_open(port):
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"port {port} still in use after {timeout}s")
+        await asyncio.sleep(0.05)
+
+
+async def _wait_for_server(process: Any, port: int, timeout: float = 30.0) -> None:
+    """Wait until a spawned server accepts connections on ``port``.
+
+    Polling beats sleeping a fixed interval twice over: a server that is ready sooner is
+    not waited on, and one that needs longer is not called broken. If it exits instead,
+    report its output rather than time out.
+    """
+    deadline = time.monotonic() + timeout
+    while not await _port_is_open(port):
+        if process.returncode is not None:
+            stdout, stderr = await process.communicate()
+            raise RuntimeError(
+                f"server exited before taking port {port}. "
+                f"stdout: {stdout.decode()}, stderr: {stderr.decode()}"
+            )
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"server did not take port {port} within {timeout}s")
+        await asyncio.sleep(0.05)
+
+
+async def _port_is_open(port: int) -> bool:
+    try:
+        _, writer = await asyncio.open_connection("127.0.0.1", port)
+    except OSError:
+        return False
+    writer.close()
+    await writer.wait_closed()
+    return True
+
+
+async def _stop_server(process: Any, port: int) -> None:
+    """Stop a spawned server and wait for its port to come free.
+
+    The launcher runs the server as its own child, so the signal goes to the process
+    group: signalling the launcher alone can leave the server holding the port, which the
+    next test then tries to bind.
+    """
+    for sig in (signal.SIGTERM, signal.SIGKILL):
+        if process.returncode is not None:
+            break
+        try:
+            os.killpg(os.getpgid(process.pid), sig)
+        except (ProcessLookupError, PermissionError):
+            process.kill()
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5.0)
+            break
+        except asyncio.TimeoutError:
+            continue
+    await _wait_for_port_free(port)
 
 @pytest.fixture(scope="module")
 def graphname():
@@ -133,6 +197,8 @@ async def http_server(setup, graphname):
 
     db_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
 
+    await _wait_for_port_free(8001)
+
     # Start server process in HTTP mode using the installed binary
     process = await asyncio.create_subprocess_exec(
         "uv",
@@ -157,27 +223,15 @@ async def http_server(setup, graphname):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=os.getcwd(),
+        start_new_session=True,
     )
 
-    # Wait for server to start
-    await asyncio.sleep(3)
-
-    # Check if process is still running
-    if process.returncode is not None:
-        stdout, stderr = await process.communicate()
-        raise RuntimeError(
-            f"Server failed to start. stdout: {stdout.decode()}, stderr: {stderr.decode()}"
-        )
+    await _wait_for_server(process, 8001)
 
     yield process
 
     # Cleanup
-    try:
-        process.terminate()
-        await asyncio.wait_for(process.wait(), timeout=5.0)
-    except asyncio.TimeoutError:
-        process.kill()
-        await process.wait()
+    await _stop_server(process, 8001)
 
 
 @pytest_asyncio.fixture(scope="function")
@@ -193,6 +247,8 @@ async def http_server_read_only(setup, graphname):
     db_port = os.getenv("AGENSGRAPH_PORT", "5432")
 
     db_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+
+    await _wait_for_port_free(8005)
 
     # Start server process in HTTP mode with read-only
     process = await asyncio.create_subprocess_exec(
@@ -221,10 +277,10 @@ async def http_server_read_only(setup, graphname):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=os.getcwd(),
+        start_new_session=True,
     )
 
-    # Wait for server to start
-    await asyncio.sleep(3)
+    await _wait_for_server(process, 8005)
 
     # Check if process is still running
     if process.returncode is not None:
@@ -233,12 +289,7 @@ async def http_server_read_only(setup, graphname):
     yield process
 
     # Cleanup
-    try:
-        process.terminate()
-        await asyncio.wait_for(process.wait(), timeout=5.0)
-    except asyncio.TimeoutError:
-        process.kill()
-        await process.wait()
+    await _stop_server(process, 8005)
 
 
 @pytest_asyncio.fixture(scope="function")
@@ -254,6 +305,8 @@ async def http_server_restricted_cors(setup, graphname):
     db_port = os.getenv("AGENSGRAPH_PORT", "5432")
 
     db_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+
+    await _wait_for_port_free(8003)
 
     # Start server process in HTTP mode with restricted CORS
     process = await asyncio.create_subprocess_exec(
@@ -281,27 +334,15 @@ async def http_server_restricted_cors(setup, graphname):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=os.getcwd(),
+        start_new_session=True,
     )
 
-    # Wait for server to start
-    await asyncio.sleep(3)
-
-    # Check if process is still running
-    if process.returncode is not None:
-        stdout, stderr = await process.communicate()
-        raise RuntimeError(
-            f"Restricted CORS server failed to start. stdout: {stdout.decode()}, stderr: {stderr.decode()}"
-        )
+    await _wait_for_server(process, 8003)
 
     yield process
 
     # Cleanup
-    try:
-        process.terminate()
-        await asyncio.wait_for(process.wait(), timeout=5.0)
-    except asyncio.TimeoutError:
-        process.kill()
-        await process.wait()
+    await _stop_server(process, 8003)
 
 
 @pytest_asyncio.fixture(scope="function")
@@ -317,6 +358,8 @@ async def http_server_custom_hosts(setup, graphname):
     db_port = os.getenv("AGENSGRAPH_PORT", "5432")
 
     db_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+
+    await _wait_for_port_free(8004)
 
     # Start server process in HTTP mode with custom allowed hosts
     process = await asyncio.create_subprocess_exec(
@@ -344,27 +387,15 @@ async def http_server_custom_hosts(setup, graphname):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=os.getcwd(),
+        start_new_session=True,
     )
 
-    # Wait for server to start
-    await asyncio.sleep(3)
-
-    # Check if process is still running
-    if process.returncode is not None:
-        stdout, stderr = await process.communicate()
-        raise RuntimeError(
-            f"Custom hosts server failed to start. stdout: {stdout.decode()}, stderr: {stderr.decode()}"
-        )
+    await _wait_for_server(process, 8004)
 
     yield process
 
     # Cleanup
-    try:
-        process.terminate()
-        await asyncio.wait_for(process.wait(), timeout=5.0)
-    except asyncio.TimeoutError:
-        process.kill()
-        await process.wait()
+    await _stop_server(process, 8004)
 
 
 @pytest_asyncio.fixture(scope="function")
@@ -380,6 +411,8 @@ async def sse_server(setup, graphname):
     db_port = os.getenv("AGENSGRAPH_PORT", "5432")
 
     db_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
+
+    await _wait_for_port_free(8002)
 
     process = await asyncio.create_subprocess_exec(
         "uv",
@@ -404,9 +437,10 @@ async def sse_server(setup, graphname):
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=os.getcwd(),
+        start_new_session=True,
     )
 
-    await asyncio.sleep(3)
+    await _wait_for_server(process, 8002)
 
     if process.returncode is not None:
         stdout, stderr = await process.communicate()
@@ -416,9 +450,4 @@ async def sse_server(setup, graphname):
 
     yield process
 
-    try:
-        process.terminate()
-        await asyncio.wait_for(process.wait(), timeout=5.0)
-    except asyncio.TimeoutError:
-        process.kill()
-        await process.wait()
+    await _stop_server(process, 8002)

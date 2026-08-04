@@ -14,6 +14,7 @@ Identifiers (graph name) are composed with ``psycopg.sql`` rather than f-strings
 from __future__ import annotations
 
 import logging
+import re
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 from urllib.parse import quote, urlparse
@@ -25,8 +26,13 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
 from .results import record_to_dict
+from .safety import strip_comments_and_strings
 
 logger = logging.getLogger("mcp_agensgraph_common")
+
+# Paging clauses the caller ended their own query with. Cypher takes one set of them per
+# query part, so ours cannot follow theirs (see ``run_paginated_query``).
+_TRAILING_PAGING = re.compile(r"\b(?:SKIP|LIMIT)\s+\S+\s*$", re.IGNORECASE)
 
 
 def jsonb_params(params: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
@@ -155,22 +161,29 @@ async def run_paginated_query(
 ) -> tuple[list[dict[str, Any]], bool]:
     """Run a Cypher query and return one page of rows plus a ``has_more`` flag.
 
-    The query is wrapped as an AgensGraph SQL subquery so ``LIMIT``/``OFFSET`` are
-    applied **by the database** — it can short-circuit instead of materializing the
-    whole result set (the point of paginating an arbitrary read). One extra row is
-    fetched to detect whether more results exist beyond this page. Vertex/edge
-    values survive the wrap, so the normal parsing still applies.
+    Paging is applied **by the database**, so it can short-circuit instead of
+    materializing the whole result set (the point of paginating an arbitrary read). One
+    extra row is fetched to detect whether more results exist beyond this page.
+
+    Cypher's ``SKIP``/``LIMIT`` carries the page. A query the caller already ended with
+    paging clauses takes another set only from outside, wrapped as
+    ``SELECT * FROM (<cypher>) AS _page``.
+
+    Vertex/edge values survive both forms, so the normal parsing still applies.
 
     Returns ``(rows, has_more)`` where ``rows`` has at most ``limit`` items.
     """
     limit = max(1, int(limit))
     offset = max(0, int(offset))
     inner = query.rstrip().rstrip(";").rstrip()
-    # limit/offset are validated ints, so inlining them is injection-safe (and SQL
-    # LIMIT/OFFSET would accept binds, but the inner query owns the param namespace).
-    wrapped = f"SELECT * FROM (\n{inner}\n) AS _page LIMIT {limit + 1} OFFSET {offset}"
+    # limit/offset are validated ints, so inlining them is injection-safe (and both
+    # forms accept binds, but the caller's query owns the param namespace).
+    if _TRAILING_PAGING.search(strip_comments_and_strings(inner)):
+        paged = f"SELECT * FROM (\n{inner}\n) AS _page LIMIT {limit + 1} OFFSET {offset}"
+    else:
+        paged = f"{inner}\nSKIP {offset} LIMIT {limit + 1}"
     rows = await run_query(
-        pool, graphname, wrapped, params, read_only=read_only, timeout=timeout
+        pool, graphname, paged, params, read_only=read_only, timeout=timeout
     )
     has_more = len(rows) > limit
     return rows[:limit], has_more

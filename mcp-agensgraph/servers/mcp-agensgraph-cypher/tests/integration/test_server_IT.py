@@ -46,6 +46,42 @@ async def test_get_agensgraph_schema_reports_every_target_label(
     assert sorted(knows["labels"]) == ["Company", "Person"]
 
 @pytest.mark.asyncio(loop_scope="function")
+async def test_read_agensgraph_cypher_with_mid_query_limit(
+    mcp_server: FastMCP, init_data: Any
+):
+    """A LIMIT that is not the caller's last clause still runs."""
+    query = """
+    MATCH (p:Person)
+    WITH p LIMIT 3
+    MATCH (p)-[:FRIEND]->(friend)
+    RETURN p.name AS person, friend.name AS friend_name
+    ORDER BY person
+    """
+
+    tool = await mcp_server.get_tool("read_agensgraph_cypher")
+    result = json.loads((await tool.run(dict(query=query))).content[0].text)
+
+    assert result["has_more"] is False
+    assert [(row["person"], row["friend_name"]) for row in result["rows"]] == [
+        ("Alice", "Bob"),
+        ("Bob", "Charlie"),
+    ]
+
+@pytest.mark.asyncio(loop_scope="function")
+async def test_read_agensgraph_cypher_keeps_callers_own_limit(
+    mcp_server: FastMCP, init_data: Any
+):
+    """A LIMIT the caller ends the query with still bounds the result."""
+    query = "MATCH (p:Person) RETURN p.name AS person ORDER BY person LIMIT 2"
+
+    tool = await mcp_server.get_tool("read_agensgraph_cypher")
+    result = json.loads((await tool.run(dict(query=query))).content[0].text)
+
+    assert result["row_count"] == 2
+    assert result["has_more"] is False
+    assert [row["person"] for row in result["rows"]] == ["Alice", "Bob"]
+
+@pytest.mark.asyncio(loop_scope="function")
 async def test_write_agensgraph_cypher(mcp_server: FastMCP):
     query = "CREATE (n:Test {name: 'test', age: 123}) RETURN n.name"
     tool = await mcp_server.get_tool("write_agensgraph_cypher")

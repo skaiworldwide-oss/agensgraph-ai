@@ -56,6 +56,7 @@ packages = ["cognee_agensgraph"]
 
 [tool.hatch.build.targets.sdist]
 include = ["/cognee_agensgraph", "/examples", "/README.md", "/LICENSE"]
+exclude = ["**/.data"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]

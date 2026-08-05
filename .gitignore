@@ -54,3 +54,6 @@ gui/
 # cognee
 .cognee_system/
 .data_storage/
+
+# Demo run output
+**/examples/demos/.data/

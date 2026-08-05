@@ -7,10 +7,11 @@ name = "langchain-agensgraph"
 version = "0.2.0"
 description = "LangChain integration for the AgensGraph graph + vector store."
 readme = "README.md"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
+license-files = ["LICENSE"]
 requires-python = ">=3.10,<3.15"
 authors = [
-    { name = "Muhammad Taha Naveed", email = "taha.n@skaiworldwide.co.kr" },
+    { name = "Muhammad Taha Naveed", email = "skaisw@skaiworldwide.com" },
 ]
 keywords = [
     "agensgraph",
@@ -24,7 +25,6 @@ keywords = [
 classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
-    "License :: OSI Approved :: Apache Software License",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",

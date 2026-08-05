@@ -7,6 +7,7 @@ demos root is loaded if present), defaulting to the local dev instance.
 
 from __future__ import annotations
 
+import getpass
 import os
 import pathlib
 
@@ -19,7 +20,7 @@ except Exception:  # pragma: no cover - dotenv optional
 
 HOST = os.getenv("AGENS_HOST", os.getenv("AGENSGRAPH_HOST", "127.0.0.1"))
 PORT = os.getenv("AGENS_PORT", os.getenv("AGENSGRAPH_PORT", "55432"))
-USER = os.getenv("AGENS_USER", os.getenv("AGENSGRAPH_USERNAME", "taha-linux"))
+USER = os.getenv("AGENS_USER", os.getenv("AGENSGRAPH_USERNAME", getpass.getuser()))
 PASSWORD = os.getenv("AGENS_PASSWORD", os.getenv("AGENSGRAPH_PASSWORD", ""))
 
 DATA_DIR = pathlib.Path(__file__).resolve().parent.parent / ".data"

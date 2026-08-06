@@ -256,7 +256,22 @@ class AgensSaver(BaseCheckpointSaver):
         ).format(l=sql.Identifier(_CHECKPOINT_LABEL), pred=predicate)
 
     def _select_by_thread_cypher(self, predicate):
-        return self._select_by_run_cypher(predicate)
+        """Checkpoints with the parent link and payload a delta walk needs."""
+        return sql.SQL(
+            "MATCH (n:{l}) WHERE {pred} "
+            "RETURN n.thread_id AS thread_id, n.checkpoint_ns AS checkpoint_ns, "
+            "       n.checkpoint_id AS checkpoint_id, "
+            "       n.parent_checkpoint_id AS parent_checkpoint_id, "
+            "       n.checkpoint_type AS checkpoint_type, n.checkpoint AS checkpoint"
+        ).format(l=sql.Identifier(_CHECKPOINT_LABEL), pred=predicate)
+
+    def _select_thread_blobs_cypher(self, predicate):
+        """Which channel values are stored, across every namespace of a thread."""
+        return sql.SQL(
+            "MATCH (n:{l}) WHERE {pred} "
+            "RETURN n.thread_id AS thread_id, n.checkpoint_ns AS checkpoint_ns, "
+            "       n.channel AS channel, n.version AS version, n.type AS type"
+        ).format(l=sql.Identifier(_BLOB_LABEL), pred=predicate)
 
     def _copy_thread_cypher(self, label: str):
         """Copy every row of a label from one thread to another.
@@ -292,23 +307,75 @@ class AgensSaver(BaseCheckpointSaver):
             )
         return sql.SQL(" OR ").join(terms)
 
-    @staticmethod
-    def _superseded(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """Every checkpoint except the most recent of each thread and namespace.
+    def _stored_channels(self, row: Dict[str, Any], stored: set) -> Tuple[set, set]:
+        """Split a checkpoint's channels into those it stores and those it does not.
+
+        A channel is stored at a checkpoint when a non-empty blob exists for the version
+        that checkpoint records. A channel that is versioned but not stored is carried
+        by the writes of this checkpoint and its ancestors instead — which is how a
+        delta channel is held between snapshots.
+        """
+        checkpoint = self._load(row["checkpoint_type"], row["checkpoint"])
+        versions = checkpoint.get("channel_versions", {}) or {}
+        group = (row["thread_id"], row["checkpoint_ns"])
+        held, carried = set(), set()
+        for channel, version in versions.items():
+            if (group, channel, str(version)) in stored:
+                held.add(channel)
+            else:
+                carried.add(channel)
+        return held, carried
+
+    def _superseded(
+        self, rows: List[Dict[str, Any]], stored: set
+    ) -> List[Dict[str, Any]]:
+        """Checkpoints that may be dropped, keeping each group's newest and its chain.
 
         Checkpoint ids sort in creation order, so the greatest id of a group is its
-        current state and the rest are history.
+        current state. Dropping everything older is wrong when a channel is not stored
+        at that checkpoint: rebuilding it walks back through ancestors' writes until it
+        reaches one that does store it, so those ancestors are part of the current state
+        rather than history. They are kept, along with their writes.
+
+        When every channel is stored at the newest checkpoint — the ordinary case,
+        with no delta channels — only that checkpoint is kept and this costs nothing.
         """
-        latest: Dict[Tuple[str, str], str] = {}
+        by_group: Dict[Tuple[str, str], Dict[str, Dict[str, Any]]] = {}
         for row in rows:
             group = (row["thread_id"], row["checkpoint_ns"])
-            if row["checkpoint_id"] > latest.get(group, ""):
-                latest[group] = row["checkpoint_id"]
+            by_group.setdefault(group, {})[row["checkpoint_id"]] = row
+
+        keep: set = set()
+        for group, by_id in by_group.items():
+            latest = max(by_id)
+            keep.add((group, latest))
+            _, carried = self._stored_channels(by_id[latest], stored)
+            cursor = by_id[latest].get("parent_checkpoint_id")
+            while carried and cursor and cursor in by_id:
+                keep.add((group, cursor))
+                held, _ = self._stored_channels(by_id[cursor], stored)
+                carried -= held
+                cursor = by_id[cursor].get("parent_checkpoint_id")
+
         return [
             row
             for row in rows
-            if latest[(row["thread_id"], row["checkpoint_ns"])] != row["checkpoint_id"]
+            if ((row["thread_id"], row["checkpoint_ns"]), row["checkpoint_id"])
+            not in keep
         ]
+
+    @staticmethod
+    def _stored_index(blob_rows: List[Dict[str, Any]]) -> set:
+        """The (group, channel, version) triples that hold a value."""
+        return {
+            (
+                (row["thread_id"], row["checkpoint_ns"]),
+                row["channel"],
+                str(row["version"]),
+            )
+            for row in blob_rows
+            if row["type"] != "empty"
+        }
 
     # ---- assembly helpers (pure) ----
 
@@ -574,13 +641,103 @@ class AgensSaver(BaseCheckpointSaver):
         if strategy != "keep_latest":
             raise ValueError(f"Unsupported prune strategy: {strategy}")
         params: Dict[str, Any] = {}
+        predicate = self._value_predicate("thread_id", thread_ids, params)
+        rows = self._graph.query(self._select_by_thread_cypher(predicate), params)
+        blobs = self._graph.query(self._select_thread_blobs_cypher(predicate), params)
+        self._delete_checkpoints(self._superseded(rows, self._stored_index(blobs)))
+
+    # ---- delta channel history ----
+
+    def _thread_state(
+        self, thread_id: str, checkpoint_ns: str
+    ) -> Tuple[
+        Dict[str, Dict[str, Any]], Dict[str, Any], Dict[str, List[Dict[str, Any]]]
+    ]:
+        """Every checkpoint, channel value and write of one thread namespace."""
+        params = {"tid": Jsonb(thread_id), "ns": Jsonb(checkpoint_ns)}
         rows = self._graph.query(
-            self._select_by_thread_cypher(
-                self._value_predicate("thread_id", thread_ids, params)
-            ),
-            params,
+            self._select_checkpoint_cypher(False, False, None), params
         )
-        self._delete_checkpoints(self._superseded(rows))
+        blobs = self._graph.query(self._select_blobs_cypher(), params)
+        writes = self._graph.query(self._select_all_writes_cypher(), params)
+        return self._index_thread_state(rows, blobs, writes)
+
+    def _index_thread_state(self, rows, blobs, writes):
+        by_id = {row["checkpoint_id"]: row for row in rows}
+        values = {
+            (b["channel"], str(b["version"])): b for b in blobs if b["type"] != "empty"
+        }
+        return by_id, values, self._group_writes(writes)
+
+    def _walk_delta_history(
+        self,
+        channels: Sequence[str],
+        start_parent: Optional[str],
+        by_id: Dict[str, Dict[str, Any]],
+        values: Dict[Any, Any],
+        writes_by_ckpt: Dict[str, List[Dict[str, Any]]],
+    ) -> Dict[str, Any]:
+        """Accumulate each channel's writes back to the ancestor that stores it.
+
+        The walk starts at the target's parent, so the target's own writes are not
+        included, and a channel with no storing ancestor gets no seed at all — the
+        caller reads that absence as "start empty".
+        """
+        collected: Dict[str, List[Any]] = {c: [] for c in channels}
+        seeds: Dict[str, Any] = {}
+        remaining = set(channels)
+        cursor = start_parent
+        while cursor is not None and remaining and cursor in by_id:
+            row = by_id[cursor]
+            pending = [
+                (w["task_id"], w["channel"], self._load(w["type"], w["value"]))
+                for w in writes_by_ckpt.get(cursor, [])
+            ]
+            for write in reversed(pending):
+                if write[1] in remaining:
+                    collected[write[1]].append(write)
+            checkpoint = self._load(row["checkpoint_type"], row["checkpoint"])
+            versions = checkpoint.get("channel_versions", {}) or {}
+            for channel in list(remaining):
+                blob = values.get((channel, str(versions.get(channel, ""))))
+                if blob is not None:
+                    seeds[channel] = self._load(blob["type"], blob["blob"])
+                    remaining.discard(channel)
+            cursor = row.get("parent_checkpoint_id")
+
+        history: Dict[str, Any] = {}
+        for channel in channels:
+            entry: Dict[str, Any] = {"writes": list(reversed(collected[channel]))}
+            if channel in seeds:
+                entry["seed"] = seeds[channel]
+            history[channel] = entry
+        return history
+
+    def _delta_start(
+        self, config: RunnableConfig, by_id: Dict[str, Dict[str, Any]]
+    ) -> Optional[str]:
+        _, _, checkpoint_id = self._keys(config)
+        if checkpoint_id is None:
+            checkpoint_id = max(by_id) if by_id else None
+        row = by_id.get(checkpoint_id) if checkpoint_id else None
+        return row.get("parent_checkpoint_id") if row else None
+
+    def get_delta_channel_history(
+        self, *, config: RunnableConfig, channels: Sequence[str]
+    ) -> Dict[str, Any]:
+        """Per-channel writes and seed, read in one pass over the thread.
+
+        The inherited implementation calls ``get_tuple`` once per ancestor, which is a
+        round trip each and reassembles a whole checkpoint to read one channel. The
+        thread's rows are fetched together instead and walked in memory.
+        """
+        if not channels:
+            return {}
+        thread_id, checkpoint_ns, _ = self._keys(config)
+        by_id, values, writes = self._thread_state(thread_id, checkpoint_ns)
+        return self._walk_delta_history(
+            channels, self._delta_start(config, by_id), by_id, values, writes
+        )
 
     # ---- async API ----
 
@@ -724,13 +881,33 @@ class AgensSaver(BaseCheckpointSaver):
         if strategy != "keep_latest":
             raise ValueError(f"Unsupported prune strategy: {strategy}")
         params: Dict[str, Any] = {}
+        predicate = self._value_predicate("thread_id", thread_ids, params)
         rows = await self._graph.aquery(
-            self._select_by_thread_cypher(
-                self._value_predicate("thread_id", thread_ids, params)
-            ),
-            params,
+            self._select_by_thread_cypher(predicate), params
         )
-        await self._adelete_checkpoints(self._superseded(rows))
+        blobs = await self._graph.aquery(
+            self._select_thread_blobs_cypher(predicate), params
+        )
+        await self._adelete_checkpoints(
+            self._superseded(rows, self._stored_index(blobs))
+        )
+
+    async def aget_delta_channel_history(
+        self, *, config: RunnableConfig, channels: Sequence[str]
+    ) -> Dict[str, Any]:
+        if not channels:
+            return {}
+        thread_id, checkpoint_ns, _ = self._keys(config)
+        params = {"tid": Jsonb(thread_id), "ns": Jsonb(checkpoint_ns)}
+        rows = await self._graph.aquery(
+            self._select_checkpoint_cypher(False, False, None), params
+        )
+        blobs = await self._graph.aquery(self._select_blobs_cypher(), params)
+        writes = await self._graph.aquery(self._select_all_writes_cypher(), params)
+        by_id, values, writes_by_ckpt = self._index_thread_state(rows, blobs, writes)
+        return self._walk_delta_history(
+            channels, self._delta_start(config, by_id), by_id, values, writes_by_ckpt
+        )
 
     # ---- param helper ----
 

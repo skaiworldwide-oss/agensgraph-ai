@@ -5,6 +5,8 @@ from typing import Annotated, TypedDict
 
 import pytest
 
+from langgraph.checkpoint.base import BaseCheckpointSaver
+
 from langchain_agensgraph import AgensGraph, AgensSaver
 
 
@@ -238,3 +240,113 @@ class TestPruneCopyAndRunDeletion:
         assert [t.checkpoint["id"] for t in saver.list(self._cfg("t9"))] == ["c2"]
         await saver.adelete_for_runs(["run-b"])
         assert list(saver.list(self._cfg("t1"))) == []
+
+
+class TestDeltaChannelHistory:
+    """A channel not stored at a checkpoint is rebuilt from ancestors' writes.
+
+    LangGraph's DeltaChannel keeps a channel out of `channel_values` between snapshots
+    and reconstructs it by walking ancestor writes back to one that does store it. These
+    tests use that shape directly rather than driving a real DeltaChannel, so they hold
+    whatever that beta API does next.
+    """
+
+    @staticmethod
+    def _cfg(thread_id: str, checkpoint_id: str | None = None):
+        cfg = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+        if checkpoint_id:
+            cfg["configurable"]["checkpoint_id"] = checkpoint_id
+        return cfg
+
+    def _chain(self, saver: AgensSaver, thread_id: str = "d1"):
+        """Snapshot at c1, then two steps that only write deltas."""
+        # c1 stores the channel: a seed the walk can stop at.
+        saver.put(
+            self._cfg(thread_id),
+            _empty_checkpoint("c1", {"delta": "SNAPSHOT"}, {"delta": "1"}),
+            {"source": "loop"},
+            {"delta": "1"},
+        )
+        saver.put_writes(self._cfg(thread_id, "c1"), [("delta", "w1")], "t1")
+        # c2 and c3 version the channel but store no value for it.
+        for cid, parent, version in (("c2", "c1", "2"), ("c3", "c2", "3")):
+            cfg = self._cfg(thread_id, parent)
+            saver.put(
+                cfg,
+                _empty_checkpoint(cid, {}, {"delta": version}),
+                {"source": "loop"},
+                {"delta": version},
+            )
+            saver.put_writes(
+                self._cfg(thread_id, cid), [("delta", f"w{cid}")], f"t{cid}"
+            )
+
+    def test_history_seeds_from_the_storing_ancestor(self, saver: AgensSaver):
+        self._chain(saver)
+        hist = saver.get_delta_channel_history(
+            config=self._cfg("d1", "c3"), channels=["delta"]
+        )
+        assert hist["delta"]["seed"] == "SNAPSHOT"
+        # the target's own writes are excluded; ancestors' arrive oldest first
+        got = [w[2] for w in hist["delta"]["writes"]]
+        assert got == ["w1", "wc2"], got
+
+    def test_history_matches_the_inherited_walk(self, saver: AgensSaver):
+        """The override must agree with the base implementation it replaces."""
+        self._chain(saver)
+        cfg = self._cfg("d1", "c3")
+        mine = saver.get_delta_channel_history(config=cfg, channels=["delta"])
+        base = BaseCheckpointSaver.get_delta_channel_history(
+            saver, config=cfg, channels=["delta"]
+        )
+        assert mine == base
+
+    def test_no_storing_ancestor_means_no_seed(self, saver: AgensSaver):
+        saver.put(
+            self._cfg("d2"),
+            _empty_checkpoint("c1", {}, {"delta": "1"}),
+            {"source": "loop"},
+            {"delta": "1"},
+        )
+        hist = saver.get_delta_channel_history(
+            config=self._cfg("d2", "c1"), channels=["delta"]
+        )
+        assert "seed" not in hist["delta"]
+
+    def test_empty_channels_is_an_empty_mapping(self, saver: AgensSaver):
+        empty = saver.get_delta_channel_history(config=self._cfg("d1"), channels=[])
+        assert empty == {}
+
+    def test_prune_keeps_the_ancestors_the_channel_needs(self, saver: AgensSaver):
+        """Regression: keep_latest must not sever the chain back to the seed.
+
+        Dropping every superseded checkpoint takes their writes with them, and the
+        channel then rebuilds short with no error raised.
+        """
+        self._chain(saver)
+        saver.prune(["d1"])
+        hist = saver.get_delta_channel_history(
+            config=self._cfg("d1", "c3"), channels=["delta"]
+        )
+        assert hist["delta"]["seed"] == "SNAPSHOT"
+        assert [w[2] for w in hist["delta"]["writes"]] == ["w1", "wc2"]
+
+    def test_prune_still_removes_unneeded_history(self, saver: AgensSaver):
+        """Ordinary checkpoints, every channel stored, are pruned to the newest."""
+        for cid in ("c1", "c2", "c3"):
+            saver.put(
+                self._cfg("d3"),
+                _empty_checkpoint(cid, {"messages": [cid]}, {"messages": "1"}),
+                {"source": "loop"},
+                {"messages": "1"},
+            )
+        saver.prune(["d3"])
+        assert [t.checkpoint["id"] for t in saver.list(self._cfg("d3"))] == ["c3"]
+
+    @pytest.mark.asyncio
+    async def test_async_history_matches_sync(self, saver: AgensSaver):
+        self._chain(saver)
+        cfg = self._cfg("d1", "c3")
+        assert await saver.aget_delta_channel_history(
+            config=cfg, channels=["delta"]
+        ) == saver.get_delta_channel_history(config=cfg, channels=["delta"])

@@ -40,6 +40,47 @@ The server offers these core tools:
    - No input required
    - Returns: JSON serialized list of node labels with two dictionaries: one for attributes and one for relationships
 
+#### ⚡ Performance Tools
+- `explain-agensgraph-cypher`
+   - Show how AgensGraph would run a Cypher statement. `EXPLAIN` accepts Cypher directly,
+     and without `analyze` the statement is only planned, never executed.
+   - Input:
+     - `query` (string): The Cypher statement to plan
+     - `analyze` (bool, optional): also run it and report actual timings. Refused in
+       read-only mode and for write statements, since it executes.
+   - Returns: the plan as JSON
+
+- `recommend-property-indexes`
+   - Suggest property indexes and rewrites for a query, from its plan and the label
+     catalogs. Reports DDL to consider; it never runs it.
+   - Input: `query` (string)
+   - Returns: `{ "findings": [...], "verified": false, "note": ..., "existing_indexes": [...] }`
+
+   Alongside missing indexes it flags two shapes that cannot reach an index at all:
+   `STARTS WITH`, which compiles to `string_starts_with` and reads the whole label
+   however selective the prefix is (AGV2-514), and the jsonb containment test an `IN`
+   list becomes once bound as a parameter (AGV2-515). Both are reported with the rewrite
+   that does use an index.
+
+   **Recommendations are reasoned, not measured**, and say so. A property index cannot be
+   costed before it is built: a hypothetical index has to be supplied as a plain
+   `CREATE INDEX`, and the expression a property index carries —
+   `properties.'key'::text` — cannot be written that way. An index written with the jsonb
+   operators instead is not the expression a Cypher filter matches, so the planner ignores
+   it. Build the index and compare `EXPLAIN` before and after to confirm.
+
+- `agensgraph-health`
+   - Cache hit ratio, unused indexes, vacuum backlog, connection use, `auto_gather_graphmeta`,
+     and which optional extensions are installed. Each check stands on its own — one whose
+     extension is absent reports that rather than failing the others.
+   - No input required
+
+- `top-cypher-queries`
+   - The Cypher statements costing the most total time, from `pg_stat_statements`. Literals
+     appear as parameters, since Cypher is normalised the same way SQL is.
+   - Input: `limit` (int, optional, default 20)
+   - Requires `pg_stat_statements`; reports how to enable it when absent.
+
 ### 🏷️ Namespacing
 
 The server supports namespacing to allow multiple Agensgraph MCP servers to be used simultaneously. When a namespace is provided, all tool names are prefixed with the namespace followed by a hyphen (e.g., `mydb-read-agensgraph-cypher`).

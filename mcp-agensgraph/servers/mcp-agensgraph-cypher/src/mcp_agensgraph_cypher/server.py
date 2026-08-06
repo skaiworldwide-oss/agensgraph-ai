@@ -36,6 +36,20 @@ from mcp_agensgraph_common.connection import (
 from mcp_agensgraph_common.safety import is_write_query, quote_identifiers, quote_label
 from mcp_agensgraph_common.transport import run_server
 
+from mcp_agensgraph_cypher.perf import (
+    analyze_plan,
+    existing_indexes_query,
+    explain_statement,
+    extensions_query,
+    format_findings,
+    health_queries,
+    indexed_properties,
+    label_stats_query,
+    missing_extension_note,
+    relname_to_label,
+    top_cypher_queries_query,
+)
+
 logger = logging.getLogger("mcp_agensgraph_cypher")
 
 # Default cap on nodes sampled *per label* when introspecting the schema (bounds cost on
@@ -404,6 +418,180 @@ def create_mcp_server(
         except Exception as e:
             logger.error("Error executing read query: %s\n%s\nparams=%s", e, query, params)
             raise ToolError("Read query failed. See server logs for details.")
+
+    @mcp.tool(
+        name=prefix + "explain_agensgraph_cypher",
+        annotations=ToolAnnotations(
+            title="Explain AgensGraph Cypher",
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+    )
+    async def explain_agensgraph_cypher(
+        query: str = Field(..., description="The Cypher statement to plan."),
+        analyze: bool = Field(
+            False,
+            description=(
+                "Run the statement and report actual timings. Refused in read-only mode "
+                "and for write statements, since it executes."
+            ),
+        ),
+    ) -> list[ToolResult]:
+        """Show how AgensGraph would run a Cypher statement.
+
+        Without `analyze` the statement is only planned, never executed. Use this to see
+        whether a query reaches an index before it is run against real data.
+        """
+        if analyze and (read_only or is_write_query(query)):
+            raise ToolError(
+                "analyze runs the statement. It is not available in read-only mode or "
+                "for a write."
+            )
+        try:
+            rows = await run_query(
+                pool,
+                graphname,
+                explain_statement(quote_identifiers(query), analyze).as_string(),
+                read_only=not analyze,
+                timeout=float(read_timeout),
+            )
+            plan = next(iter(rows[0].values())) if rows else None
+            return ToolResult(
+                content=[TextContent(type="text", text=json.dumps(plan, default=str))]
+            )
+        except ToolError:
+            raise
+        except Exception as e:
+            logger.error("Error explaining query: %s\n%s", e, query)
+            raise ToolError("Could not plan that statement. See server logs for details.")
+
+    @mcp.tool(
+        name=prefix + "recommend_property_indexes",
+        annotations=ToolAnnotations(
+            title="Recommend AgensGraph Property Indexes",
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+    )
+    async def recommend_property_indexes(
+        query: str = Field(..., description="The Cypher query to advise on."),
+    ) -> list[ToolResult]:
+        """Suggest property indexes and rewrites for a query, from its plan.
+
+        Reports the DDL to consider; it never runs it. Recommendations are reasoned from
+        the plan and the label catalogs rather than costed against a built index, and the
+        response says so.
+        """
+        try:
+            graph_param = {"graph": graphname}
+            plan_rows = await run_query(
+                pool,
+                graphname,
+                explain_statement(quote_identifiers(query), False).as_string(),
+                read_only=True,
+                timeout=float(read_timeout),
+            )
+            plan = next(iter(plan_rows[0].values()))
+            labels = await run_query(
+                pool, graphname, label_stats_query(), graph_param, read_only=True
+            )
+            indexes = await run_query(
+                pool, graphname, existing_indexes_query(), graph_param, read_only=True
+            )
+            findings = analyze_plan(
+                plan, relname_to_label(labels), indexed_properties(indexes)
+            )
+            payload = format_findings(findings)
+            payload["existing_indexes"] = indexes
+            return ToolResult(
+                content=[TextContent(type="text", text=json.dumps(payload, default=str))]
+            )
+        except Exception as e:
+            logger.error("Error advising on query: %s\n%s", e, query)
+            raise ToolError("Could not advise on that query. See server logs for details.")
+
+    @mcp.tool(
+        name=prefix + "agensgraph_health",
+        annotations=ToolAnnotations(
+            title="AgensGraph Health",
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+    )
+    async def agensgraph_health() -> list[ToolResult]:
+        """Report cache hit ratio, unused indexes, vacuum backlog and connection use.
+
+        Each check stands on its own: one that needs an extension the server does not have
+        reports that instead of failing the others.
+        """
+        report: Dict[str, Any] = {}
+        try:
+            extensions = await run_query(
+                pool,
+                graphname,
+                extensions_query(),
+                read_only=True,
+            )
+            report["extensions"] = {r["name"]: r["installed"] for r in extensions}
+        except Exception:
+            report["extensions"] = {}
+        for name, statement in health_queries().items():
+            try:
+                report[name] = await run_query(
+                    pool, graphname, statement, read_only=True
+                )
+            except Exception as e:
+                report[name] = {"error": str(e)}
+        for name in ("pgstattuple", "pg_buffercache"):
+            if not report.get("extensions", {}).get(name):
+                report[name] = missing_extension_note(name)
+        return ToolResult(
+            content=[TextContent(type="text", text=json.dumps(report, default=str))]
+        )
+
+    @mcp.tool(
+        name=prefix + "top_cypher_queries",
+        annotations=ToolAnnotations(
+            title="Top AgensGraph Cypher Queries",
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+    )
+    async def top_cypher_queries(
+        limit: int = Field(20, ge=1, le=200, description="How many statements to return."),
+    ) -> list[ToolResult]:
+        """The Cypher statements costing the most total time, from pg_stat_statements.
+
+        Literals appear as parameters because Cypher is normalised the same way SQL is.
+        """
+        try:
+            rows = await run_query(
+                pool,
+                graphname,
+                top_cypher_queries_query(),
+                {"limit": int(limit)},
+                read_only=True,
+            )
+            return ToolResult(
+                content=[TextContent(type="text", text=json.dumps(rows, default=str))]
+            )
+        except Exception:
+            return ToolResult(
+                content=[
+                    TextContent(
+                        type="text",
+                        text=json.dumps(missing_extension_note("pg_stat_statements")),
+                    )
+                ]
+            )
 
     # A read-only server does not register the write tool.
     if not read_only:

@@ -5,10 +5,10 @@ vertex that can be linked to other memories and to domain data with ordinary edg
 
     (:StoreItem {prefix, key, value, created_at, updated_at})
 
-``BaseStore`` declares only ``batch``/``abatch`` as abstract and derives ``get``, ``put``,
-``search``, ``delete`` and ``list_namespaces`` from them, so those two entry points carry
-the whole implementation. Each batch issues one statement per kind of operation it
-contains, whatever the number of items.
+``BaseStore`` declares only ``batch``/``abatch`` as abstract and derives ``get``,
+``put``, ``search``, ``delete`` and ``list_namespaces`` from them, so those two entry
+points carry the whole implementation. Each batch issues one statement per kind of
+operation it contains, whatever the number of items.
 
 A namespace tuple is stored as a ``.``-joined path, which LangGraph's own rejection of
 ``.`` inside a namespace label makes lossless and reversible by ``split``. A composite
@@ -144,8 +144,22 @@ class AgensStore(BaseStore):
             self._create_property_index_cypher(f"{self._label}_prefix", ("prefix",))
         )
         if self._index:
+            self._require_vector_extension()
             for stmt in self._create_vector_table_sql():
                 self._graph.query(stmt)
+
+    def _require_vector_extension(self) -> None:
+        """Semantic search needs pgvector, which AgensGraph does not bundle."""
+        rows = self._graph.query(
+            "SELECT count(*) AS n FROM pg_extension WHERE extname = 'vector'"
+        )
+        if not rows or int(next(iter(rows[0].values()))) == 0:
+            raise RuntimeError(
+                "AgensStore(index=...) needs the pgvector extension, which is not "
+                "installed in this database. Build it against this server's pg_config "
+                "and run CREATE EXTENSION vector, or omit `index` to use the store "
+                "without semantic search."
+            )
 
     def _create_label_cypher(self) -> sql.Composed:
         if self._promoted:
@@ -252,19 +266,109 @@ class AgensStore(BaseStore):
     ) -> sql.Composed:
         return self._namespace_predicate_named(prefix, params, suffix)
 
+    @staticmethod
+    def _value_path(path: Sequence[str]) -> sql.Composed:
+        """A property reference into ``value``, e.g. ``n.value.a.b``."""
+        return sql.SQL(".").join(
+            [sql.SQL("n"), sql.SQL("value")] + [sql.Identifier(p) for p in path]
+        )
+
     def _filter_predicate(
         self, flt: Dict[str, Any], params: Dict[str, Any]
     ) -> sql.Composed:
-        """Equality filters over keys inside ``value``."""
-        terms = []
-        for i, (field, want) in enumerate(flt.items()):
-            params[f"f{i}"] = Jsonb(want)
-            terms.append(
-                sql.SQL("n.value.{field} = %({v})s").format(
-                    field=sql.Identifier(field), v=sql.SQL(f"f{i}")
-                )
-            )
+        """Filters over ``value``, including comparison operators and nested keys.
+
+        A field maps to a scalar or list for equality, or to a map of ``$`` operators
+        (``$eq``, ``$ne``, ``$gt``, ``$gte``, ``$lt``, ``$lte``). A map without
+        operators descends into the nested key of the same name. Every form is
+        expressed in the query, so paging still happens in the database.
+        """
+        terms: List[sql.Composed] = []
+        counter = [0]
+
+        def emit(path: List[str], want: Any) -> None:
+            if isinstance(want, dict) and any(k.startswith("$") for k in want):
+                for op, operand in want.items():
+                    terms.append(
+                        self._operator_term(path, op, operand, params, counter)
+                    )
+                return
+            if isinstance(want, dict):
+                for key, nested in want.items():
+                    emit(path + [key], nested)
+                return
+            terms.append(self._operator_term(path, "$eq", want, params, counter))
+
+        for field, want in flt.items():
+            emit([field], want)
         return sql.SQL(" AND ").join(terms)
+
+    def _operator_term(
+        self,
+        path: List[str],
+        op: str,
+        operand: Any,
+        params: Dict[str, Any],
+        counter: List[int],
+    ) -> sql.Composed:
+        name = f"f{counter[0]}"
+        counter[0] += 1
+        params[name] = Jsonb(operand)
+        ref = self._value_path(path)
+        placeholder = sql.SQL(f"%({name})s")
+        if op == "$eq":
+            return sql.SQL("{ref} = {v}").format(ref=ref, v=placeholder)
+        if op == "$ne":
+            # An absent key is unequal to anything, so it satisfies $ne.
+            return sql.SQL("({ref} IS NULL OR {ref} <> {v})").format(
+                ref=ref, v=placeholder
+            )
+        comparison = {"$gt": ">", "$gte": ">=", "$lt": "<", "$lte": "<="}.get(op)
+        if comparison is None:
+            raise ValueError(f"Unsupported operator: {op}")
+        return sql.SQL("{ref} {cmp} {v}").format(
+            ref=ref, cmp=sql.SQL(comparison), v=placeholder
+        )
+
+    @classmethod
+    def _matches_filter(cls, value: Any, flt: Dict[str, Any]) -> bool:
+        """Evaluate a filter in Python, for rows already fetched by another path."""
+        return all(cls._compare(value.get(k) if isinstance(value, dict) else None, v)
+                   for k, v in flt.items())
+
+    @classmethod
+    def _compare(cls, value: Any, want: Any) -> bool:
+        if isinstance(want, dict):
+            if any(k.startswith("$") for k in want):
+                return all(cls._apply(value, op, o) for op, o in want.items())
+            if not isinstance(value, dict):
+                return False
+            return all(cls._compare(value.get(k), v) for k, v in want.items())
+        if isinstance(want, (list, tuple)):
+            return (
+                isinstance(value, (list, tuple))
+                and len(value) == len(want)
+                and all(cls._compare(v, w) for v, w in zip(value, want))
+            )
+        return value == want
+
+    @staticmethod
+    def _apply(value: Any, op: str, operand: Any) -> bool:
+        if op == "$eq":
+            return value == operand
+        if op == "$ne":
+            return value != operand
+        if op in ("$gt", "$gte", "$lt", "$lte"):
+            if value is None:
+                return False
+            left, right = float(value), float(operand)
+            return {
+                "$gt": left > right,
+                "$gte": left >= right,
+                "$lt": left < right,
+                "$lte": left <= right,
+            }[op]
+        raise ValueError(f"Unsupported operator: {op}")
 
     # ---- row <-> item ----
 
@@ -610,7 +714,7 @@ class AgensStore(BaseStore):
             value = row["value"]
             if isinstance(value, str):
                 value = json.loads(value)
-            if op.filter and any(value.get(k) != v for k, v in op.filter.items()):
+            if op.filter and not self._matches_filter(value, op.filter):
                 continue
             out.append(
                 self._row_to_item(
@@ -721,7 +825,7 @@ class AgensStore(BaseStore):
             value = row["value"]
             if isinstance(value, str):
                 value = json.loads(value)
-            if op.filter and any(value.get(k) != v for k, v in op.filter.items()):
+            if op.filter and not self._matches_filter(value, op.filter):
                 continue
             out.append(
                 self._row_to_item(

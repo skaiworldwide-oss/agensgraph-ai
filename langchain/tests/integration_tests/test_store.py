@@ -117,6 +117,43 @@ class TestNamespaces:
         hits = store.search(("users", "alice", "memories"), filter={"topic": "y"})
         assert [h.key for h in hits] == ["m2"]
 
+    def test_filter_operators(self, store):
+        for i, score in enumerate([1, 5, 10]):
+            store.put(NS, f"s{i}", {"score": score, "kind": "n"})
+        store.put(NS, "nokey", {"kind": "n"})
+
+        def keys(**kw):
+            return sorted(h.key for h in store.search(NS, **kw))
+
+        assert keys(filter={"score": {"$gt": 4}}) == ["s1", "s2"]
+        assert keys(filter={"score": {"$gte": 5}}) == ["s1", "s2"]
+        assert keys(filter={"score": {"$lt": 5}}) == ["s0"]
+        assert keys(filter={"score": {"$lte": 5}}) == ["s0", "s1"]
+        assert keys(filter={"score": {"$eq": 5}}) == ["s1"]
+        # an absent key is unequal to anything, so it satisfies $ne
+        assert keys(filter={"score": {"$ne": 5}}) == ["nokey", "s0", "s2"]
+        # operators combine, and combine with a plain equality on another field
+        assert keys(filter={"score": {"$gt": 1, "$lt": 10}}) == ["s1"]
+        assert keys(filter={"score": {"$gte": 5}, "kind": "n"}) == ["s1", "s2"]
+
+    def test_filter_on_a_nested_key(self, store):
+        store.put(NS, "a", {"meta": {"lang": "en", "n": 1}})
+        store.put(NS, "b", {"meta": {"lang": "ko", "n": 2}})
+        hits = store.search(NS, filter={"meta": {"lang": "ko"}})
+        assert [h.key for h in hits] == ["b"]
+        hits = store.search(NS, filter={"meta": {"n": {"$gt": 1}}})
+        assert [h.key for h in hits] == ["b"]
+
+    def test_filter_on_a_list_value(self, store):
+        store.put(NS, "a", {"tags": [1, 2]})
+        store.put(NS, "b", {"tags": [3]})
+        hits = store.search(NS, filter={"tags": [1, 2]})
+        assert [h.key for h in hits] == ["a"]
+
+    def test_unknown_operator_is_rejected(self, store):
+        with pytest.raises(ValueError):
+            store.search(NS, filter={"score": {"$regex": "x"}})
+
     def test_limit_and_offset(self, store):
         for i in range(5):
             store.put(NS, f"k{i}", {"i": i})
@@ -215,6 +252,14 @@ class TestSemanticSearch:
         vector_store.put(("docs", "b"), "d2", {"text": "beta"})
         hits = vector_store.search(("docs", "a"), query="beta", limit=5)
         assert all(h.namespace == ("docs", "a") for h in hits)
+
+    def test_semantic_search_applies_filter_operators(self, vector_store: AgensStore):
+        vector_store.put(("docs",), "d1", {"text": "alpha", "score": 1})
+        vector_store.put(("docs",), "d2", {"text": "beta", "score": 9})
+        hits = vector_store.search(
+            ("docs",), query="alpha", filter={"score": {"$gt": 5}}
+        )
+        assert [h.key for h in hits] == ["d2"]
 
     def test_embedding_row_is_removed_with_its_item(self, vector_store: AgensStore):
         """The side table's foreign key must cascade on a Cypher DETACH DELETE."""

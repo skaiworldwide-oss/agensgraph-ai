@@ -265,6 +265,27 @@ class AgensSaver(BaseCheckpointSaver):
             "       n.checkpoint_type AS checkpoint_type, n.checkpoint AS checkpoint"
         ).format(l=sql.Identifier(_CHECKPOINT_LABEL), pred=predicate)
 
+    def _select_writes_window_cypher(self):
+        """Pending writes for a contiguous span of checkpoints."""
+        return sql.SQL(
+            "MATCH (x:{wl}) WHERE x.thread_id = %(tid)s AND x.checkpoint_ns = %(ns)s "
+            "AND x.checkpoint_id >= %(lo)s AND x.checkpoint_id <= %(hi)s "
+            "RETURN x.checkpoint_id AS checkpoint_id, x.task_id AS task_id, "
+            "x.idx AS idx, x.channel AS channel, x.type AS type, x.value AS value "
+            "ORDER BY x.idx"
+        ).format(wl=sql.Identifier(_WRITE_LABEL))
+
+    def _select_ancestors_cypher(self, limit: int):
+        """A span of a thread's checkpoints at or below an id, newest first."""
+        return sql.SQL(
+            "MATCH (c:{cl}) WHERE c.thread_id = %(tid)s AND c.checkpoint_ns = %(ns)s "
+            "AND c.checkpoint_id <= %(hi)s "
+            "RETURN c.checkpoint_id AS checkpoint_id, "
+            "       c.parent_checkpoint_id AS parent_checkpoint_id, "
+            "       c.checkpoint_type AS checkpoint_type, c.checkpoint AS checkpoint "
+            "ORDER BY c.checkpoint_id DESC LIMIT {n}"
+        ).format(cl=sql.Identifier(_CHECKPOINT_LABEL), n=sql.SQL(str(int(limit))))
+
     def _select_thread_blobs_cypher(self, predicate):
         """Which channel values are stored, across every namespace of a thread."""
         return sql.SQL(
@@ -648,62 +669,64 @@ class AgensSaver(BaseCheckpointSaver):
 
     # ---- delta channel history ----
 
-    def _thread_state(
-        self, thread_id: str, checkpoint_ns: str
-    ) -> Tuple[
-        Dict[str, Dict[str, Any]], Dict[str, Any], Dict[str, List[Dict[str, Any]]]
-    ]:
-        """Every checkpoint, channel value and write of one thread namespace."""
-        params = {"tid": Jsonb(thread_id), "ns": Jsonb(checkpoint_ns)}
-        rows = self._graph.query(
-            self._select_checkpoint_cypher(False, False, None), params
-        )
-        blobs = self._graph.query(self._select_blobs_cypher(), params)
-        writes = self._graph.query(self._select_all_writes_cypher(), params)
-        return self._index_thread_state(rows, blobs, writes)
+    DELTA_WINDOW = 32
+    """Ancestors fetched per round when rebuilding a delta channel.
 
-    def _index_thread_state(self, rows, blobs, writes):
-        by_id = {row["checkpoint_id"]: row for row in rows}
-        values = {
-            (b["channel"], str(b["version"])): b for b in blobs if b["type"] != "empty"
-        }
-        return by_id, values, self._group_writes(writes)
+    The inherited walk asks for one ancestor at a time, a round trip each; reading the
+    whole thread instead is far better when the walk is long and worse when it is short,
+    because most of what it reads is then discarded. A window is a compromise that holds
+    at both ends: a walk that stops after a few ancestors touches one window, and a long
+    one costs a round trip per window rather than per ancestor.
+    """
 
-    def _walk_delta_history(
+    def _delta_seed(self, channel: str, row: Dict[str, Any], values: Dict[Any, Any]):
+        """The stored value of a channel at a checkpoint, if it holds one."""
+        checkpoint = self._load(row["checkpoint_type"], row["checkpoint"])
+        versions = checkpoint.get("channel_versions", {}) or {}
+        if channel not in versions:
+            return None
+        return values.get((channel, str(versions[channel])))
+
+    def _delta_walk(
         self,
         channels: Sequence[str],
-        start_parent: Optional[str],
-        by_id: Dict[str, Dict[str, Any]],
+        cursor: Optional[str],
         values: Dict[Any, Any],
-        writes_by_ckpt: Dict[str, List[Dict[str, Any]]],
+        fetch_window,
     ) -> Dict[str, Any]:
-        """Accumulate each channel's writes back to the ancestor that stores it.
+        """Collect each channel's writes back to the ancestor that stores it.
 
-        The walk starts at the target's parent, so the target's own writes are not
-        included, and a channel with no storing ancestor gets no seed at all — the
-        caller reads that absence as "start empty".
+        ``fetch_window`` returns the next span of ancestors and their writes, so one
+        walk serves both the sync and the async path.
         """
         collected: Dict[str, List[Any]] = {c: [] for c in channels}
         seeds: Dict[str, Any] = {}
         remaining = set(channels)
-        cursor = start_parent
-        while cursor is not None and remaining and cursor in by_id:
-            row = by_id[cursor]
-            pending = [
-                (w["task_id"], w["channel"], self._load(w["type"], w["value"]))
-                for w in writes_by_ckpt.get(cursor, [])
-            ]
-            for write in reversed(pending):
-                if write[1] in remaining:
-                    collected[write[1]].append(write)
-            checkpoint = self._load(row["checkpoint_type"], row["checkpoint"])
-            versions = checkpoint.get("channel_versions", {}) or {}
-            for channel in list(remaining):
-                blob = values.get((channel, str(versions.get(channel, ""))))
-                if blob is not None:
-                    seeds[channel] = self._load(blob["type"], blob["blob"])
-                    remaining.discard(channel)
-            cursor = row.get("parent_checkpoint_id")
+
+        while cursor is not None and remaining:
+            rows, writes_by_ckpt = fetch_window(cursor)
+            if not rows:
+                break
+            by_id = {row["checkpoint_id"]: row for row in rows}
+            advanced = False
+            while cursor is not None and remaining and cursor in by_id:
+                row = by_id[cursor]
+                advanced = True
+                pending = [
+                    (w["task_id"], w["channel"], self._load(w["type"], w["value"]))
+                    for w in writes_by_ckpt.get(cursor, [])
+                ]
+                for write in reversed(pending):
+                    if write[1] in remaining:
+                        collected[write[1]].append(write)
+                for channel in list(remaining):
+                    blob = self._delta_seed(channel, row, values)
+                    if blob is not None:
+                        seeds[channel] = self._load(blob["type"], blob["blob"])
+                        remaining.discard(channel)
+                cursor = row.get("parent_checkpoint_id")
+            if not advanced:
+                break
 
         history: Dict[str, Any] = {}
         for channel in channels:
@@ -713,30 +736,49 @@ class AgensSaver(BaseCheckpointSaver):
             history[channel] = entry
         return history
 
-    def _delta_start(
-        self, config: RunnableConfig, by_id: Dict[str, Dict[str, Any]]
-    ) -> Optional[str]:
-        _, _, checkpoint_id = self._keys(config)
-        if checkpoint_id is None:
-            checkpoint_id = max(by_id) if by_id else None
-        row = by_id.get(checkpoint_id) if checkpoint_id else None
-        return row.get("parent_checkpoint_id") if row else None
+    @staticmethod
+    def _values_index(blobs: List[Dict[str, Any]]) -> Dict[Any, Any]:
+        return {
+            (b["channel"], str(b["version"])): b for b in blobs if b["type"] != "empty"
+        }
+
+    def _parent_of(self, config: RunnableConfig) -> Optional[str]:
+        tuple_ = self.get_tuple(config)
+        if tuple_ is None or tuple_.parent_config is None:
+            return None
+        return get_checkpoint_id(tuple_.parent_config)
 
     def get_delta_channel_history(
         self, *, config: RunnableConfig, channels: Sequence[str]
     ) -> Dict[str, Any]:
-        """Per-channel writes and seed, read in one pass over the thread.
+        """Per-channel writes and seed, walked a window of ancestors at a time.
 
-        The inherited implementation calls ``get_tuple`` once per ancestor, which is a
-        round trip each and reassembles a whole checkpoint to read one channel. The
-        thread's rows are fetched together instead and walked in memory.
+        Starts at the target's parent, so the target's own writes are excluded, and
+        omits ``seed`` for a channel no ancestor stores — read as "start empty".
         """
         if not channels:
             return {}
         thread_id, checkpoint_ns, _ = self._keys(config)
-        by_id, values, writes = self._thread_state(thread_id, checkpoint_ns)
-        return self._walk_delta_history(
-            channels, self._delta_start(config, by_id), by_id, values, writes
+        base = {"tid": Jsonb(thread_id), "ns": Jsonb(checkpoint_ns)}
+        values = self._values_index(
+            self._graph.query(self._select_blobs_cypher(), base)
+        )
+
+        def fetch_window(cursor: str):
+            rows = self._graph.query(
+                self._select_ancestors_cypher(self.DELTA_WINDOW),
+                {**base, "hi": Jsonb(cursor)},
+            )
+            if not rows:
+                return [], {}
+            writes = self._graph.query(
+                self._select_writes_window_cypher(),
+                {**base, "lo": Jsonb(rows[-1]["checkpoint_id"]), "hi": Jsonb(cursor)},
+            )
+            return rows, self._group_writes(writes)
+
+        return self._delta_walk(
+            channels, self._parent_of(config), values, fetch_window
         )
 
     # ---- async API ----
@@ -898,16 +940,60 @@ class AgensSaver(BaseCheckpointSaver):
         if not channels:
             return {}
         thread_id, checkpoint_ns, _ = self._keys(config)
-        params = {"tid": Jsonb(thread_id), "ns": Jsonb(checkpoint_ns)}
-        rows = await self._graph.aquery(
-            self._select_checkpoint_cypher(False, False, None), params
+        base = {"tid": Jsonb(thread_id), "ns": Jsonb(checkpoint_ns)}
+        values = self._values_index(
+            await self._graph.aquery(self._select_blobs_cypher(), base)
         )
-        blobs = await self._graph.aquery(self._select_blobs_cypher(), params)
-        writes = await self._graph.aquery(self._select_all_writes_cypher(), params)
-        by_id, values, writes_by_ckpt = self._index_thread_state(rows, blobs, writes)
-        return self._walk_delta_history(
-            channels, self._delta_start(config, by_id), by_id, values, writes_by_ckpt
+        target = await self.aget_tuple(config)
+        cursor = (
+            get_checkpoint_id(target.parent_config)
+            if target is not None and target.parent_config is not None
+            else None
         )
+
+        collected: Dict[str, List[Any]] = {c: [] for c in channels}
+        seeds: Dict[str, Any] = {}
+        remaining = set(channels)
+        while cursor is not None and remaining:
+            rows = await self._graph.aquery(
+                self._select_ancestors_cypher(self.DELTA_WINDOW),
+                {**base, "hi": Jsonb(cursor)},
+            )
+            if not rows:
+                break
+            writes = await self._graph.aquery(
+                self._select_writes_window_cypher(),
+                {**base, "lo": Jsonb(rows[-1]["checkpoint_id"]), "hi": Jsonb(cursor)},
+            )
+            writes_by_ckpt = self._group_writes(writes)
+            by_id = {row["checkpoint_id"]: row for row in rows}
+            advanced = False
+            while cursor is not None and remaining and cursor in by_id:
+                row = by_id[cursor]
+                advanced = True
+                pending = [
+                    (w["task_id"], w["channel"], self._load(w["type"], w["value"]))
+                    for w in writes_by_ckpt.get(cursor, [])
+                ]
+                for write in reversed(pending):
+                    if write[1] in remaining:
+                        collected[write[1]].append(write)
+                for channel in list(remaining):
+                    blob = self._delta_seed(channel, row, values)
+                    if blob is not None:
+                        seeds[channel] = self._load(blob["type"], blob["blob"])
+                        remaining.discard(channel)
+                cursor = row.get("parent_checkpoint_id")
+            if not advanced:
+                break
+
+        history: Dict[str, Any] = {}
+        for channel in channels:
+            entry: Dict[str, Any] = {"writes": list(reversed(collected[channel]))}
+            if channel in seeds:
+                entry["seed"] = seeds[channel]
+            history[channel] = entry
+        return history
 
     # ---- param helper ----
 

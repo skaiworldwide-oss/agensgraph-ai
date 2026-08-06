@@ -166,6 +166,55 @@ Two notes on the storage layout:
   filter and sort results can legitimately differ from the default layout. Leave it unset unless
   you have measured a reason to set it.
 
+### Asking questions in plain language (text2cypher)
+
+`AgensCypherQAChain` turns a question into Cypher, runs it read-only, and answers from the
+rows. No Neo4j package required.
+
+```python
+from langchain_agensgraph import AgensCypherQAChain, AgensGraph
+
+graph = AgensGraph("my_graph", conf=conf)
+chain = AgensCypherQAChain.from_llm(llm, graph=graph)
+
+chain.invoke({"query": "Which people work at Acme?"})
+# {"query": "...", "result": "Alice and Bob."}
+
+# see what it ran
+chain = AgensCypherQAChain.from_llm(llm, graph=graph, return_intermediate_steps=True)
+out = chain.invoke({"query": "..."})
+out["intermediate_steps"]   # [{"query": "MATCH ..."}, {"context": [...]}]
+```
+
+The same pipeline as a tool for an agent:
+
+```python
+from langchain.agents import create_agent
+from langchain_agensgraph import create_cypher_tool
+
+agent = create_agent(llm, [create_cypher_tool(graph, llm)])
+
+# or hand the agent rows instead of prose, to combine with other sources
+tool = create_cypher_tool(graph, llm, answer=False)
+```
+
+Generated Cypher is not trusted. Writes are refused unless you pass
+`allow_dangerous_requests=True`, the query is checked with `EXPLAIN` before it runs so a
+malformed one fails without executing, and execution carries a `timeout`.
+
+**Why a dedicated prompt.** AgensGraph is not Neo4j, and a model writing Cypher from habit
+gets two things wrong. It uses constructs that do not exist here — pattern expressions like
+`size((n)--())`, `COUNT { }`, `EXISTS { }`, `CALL { }` subqueries, `apoc.*` — which fail
+loudly. And it leaves identifiers unquoted, which fails silently: AgensGraph folds an
+unquoted identifier to lower case, so `(n:Person)` matches nothing at all. The prompt rules
+the first out by name and requires quoting for the second.
+
+Because folding runs both ways, the repair pass is driven by your schema rather than by a
+rule of thumb. A property written as `{"firstName": ...}` is stored case-preserved and must
+be read as `n."firstName"`; the same property written as `{firstName: ...}` is stored as
+`firstname` and must be read bare. The chain quotes an identifier only when your graph
+actually holds that spelling, so it cannot turn a working query into a silent miss.
+
 ### Shared connection pool
 
 ```python

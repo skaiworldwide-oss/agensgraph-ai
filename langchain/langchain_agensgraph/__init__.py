@@ -1,5 +1,6 @@
 """LangChain integration for AgensGraph."""
 
+from langchain_agensgraph.chains import AgensCypherQAChain, create_cypher_tool
 from langchain_agensgraph.chat_message_histories import AgensChatMessageHistory
 from langchain_agensgraph.engine import AgensEngine
 from langchain_agensgraph.graph_transformers import LLMGraphTransformer
@@ -15,6 +16,7 @@ __version__ = "0.2.0"
 
 __all__ = [
     "AgensChatMessageHistory",
+    "AgensCypherQAChain",
     "AgensEngine",
     "AgensGraph",
     "AgensgraphVector",
@@ -22,6 +24,7 @@ __all__ = [
     "LLMGraphTransformer",
     "Node",
     "Relationship",
+    "create_cypher_tool",
     "__version__",
 ]
 

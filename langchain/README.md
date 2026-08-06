@@ -1,6 +1,6 @@
 # 🦜️🔗 LangChain AgensGraph
 
-LangChain integration for [AgensGraph](https://github.com/skaiworldwide-oss/agensgraph), Skai's PostgreSQL-based multi-model graph database. Ships a `GraphStore`, a pgvector-backed `VectorStore`, chat-message history, a LangGraph checkpointer, an LLM graph transformer, and a connection-pooling engine — with async variants throughout.
+LangChain integration for [AgensGraph](https://github.com/skaiworldwide-oss/agensgraph), Skai's PostgreSQL-based multi-model graph database. Ships a `GraphStore`, a pgvector-backed `VectorStore`, chat-message history, a LangGraph checkpointer, a LangGraph long-term memory store, an LLM graph transformer, and a connection-pooling engine — with async variants throughout.
 
 ## What's new in 0.2.0
 
@@ -112,6 +112,59 @@ hits = await db.asimilarity_search("...", k=10)
 await db.aadd_texts(["..."], batch_size=500)
 await db.aclose()
 ```
+
+### AgensStore (LangGraph long-term memory)
+
+`AgensSaver` persists a single thread's state; `AgensStore` is the other half — cross-thread
+long-term memory, implementing LangGraph's `BaseStore` (`get` / `put` / `search` / `delete` /
+`list_namespaces`, sync and async). Because items are ordinary vertices, a memory can be linked
+to other memories and to your domain data with ordinary edges — which is the thing LangGraph's
+stock `PostgresStore` cannot do.
+
+```python
+from langchain_agensgraph import AgensGraph, AgensStore
+
+graph = AgensGraph("memories", conf=conf, create=True)
+store = AgensStore(graph=graph)
+
+store.put(("users", "alice", "memories"), "m1", {"text": "prefers tea", "topic": "prefs"})
+item = store.get(("users", "alice", "memories"), "m1")
+
+# a namespace search also returns its descendants
+hits = store.search(("users", "alice"), filter={"topic": "prefs"}, limit=10)
+namespaces = store.list_namespaces(prefix=("users", "*", "memories"))
+
+# async throughout
+item = await store.aget(("users", "alice", "memories"), "m1")
+```
+
+Semantic search is opt-in and needs `pgvector`:
+
+```python
+from langchain_openai import OpenAIEmbeddings
+
+store = AgensStore(
+    graph=graph,
+    index={"dims": 1536, "embed": OpenAIEmbeddings(), "fields": ["text"]},
+)
+hits = store.search(("users", "alice"), query="what do they drink?", limit=5)
+```
+
+Embeddings are deliberately **not** stored as a property. A vector serialised into the jsonb
+property bag pushes the bag out of line, after which every property read on that row pays a
+detoast. They live instead in a narrow table in a companion schema (`<graph>_store`), keyed by
+graphid with an HNSW index, and a foreign key that cascades — so deleting a memory removes its
+embedding with it and searching never touches jsonb until the surviving rows are read back.
+
+Two notes on the storage layout:
+
+- **Namespaces** are flattened to a `.`-joined path. LangGraph already forbids `.` inside a
+  namespace label, so nothing is lost and no escaping is needed.
+- **`promoted=[...]`** is an opt-in tier that mirrors chosen properties into typed columns, so
+  filters and sorts compare in the column's native type rather than as jsonb. It is faster, but
+  it stores those values twice for now, and native comparison is not jsonb comparison — so
+  filter and sort results can legitimately differ from the default layout. Leave it unset unless
+  you have measured a reason to set it.
 
 ### Shared connection pool
 

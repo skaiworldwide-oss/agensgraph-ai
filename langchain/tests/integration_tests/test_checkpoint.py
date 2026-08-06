@@ -134,3 +134,107 @@ async def test_async_put_get(saver: AgensSaver):
     await saver.aput(cfg, _empty_checkpoint("c1", {"x": 9}, {"x": "1"}), {"step": 1}, {"x": "1"})
     tup = await saver.aget_tuple({"configurable": {"thread_id": "at1", "checkpoint_ns": "", "checkpoint_id": "c1"}})
     assert tup.checkpoint["channel_values"] == {"x": 9}
+
+
+class TestPruneCopyAndRunDeletion:
+    """The lifecycle operations BaseCheckpointSaver leaves to the implementation."""
+
+    @staticmethod
+    def _cfg(thread_id: str, checkpoint_id: str | None = None):
+        cfg = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ""}}
+        if checkpoint_id:
+            cfg["configurable"]["checkpoint_id"] = checkpoint_id
+        return cfg
+
+    def _write(self, saver: AgensSaver, thread_id: str, cid: str, run_id=None):
+        md = {"source": "loop", "step": 1}
+        if run_id:
+            md["run_id"] = run_id
+        ckpt = _empty_checkpoint(cid, {"messages": [cid]}, {"messages": "1"})
+        saver.put(self._cfg(thread_id), ckpt, md, {"messages": "1"})
+        saver.put_writes(self._cfg(thread_id, cid), [("messages", cid)], f"task-{cid}")
+
+    def test_prune_keep_latest_keeps_only_the_newest(self, saver: AgensSaver):
+        for cid in ("c1", "c2", "c3"):
+            self._write(saver, "t1", cid)
+        saver.prune(["t1"])
+        remaining = [t.checkpoint["id"] for t in saver.list(self._cfg("t1"))]
+        assert remaining == ["c3"]
+        # the surviving checkpoint is still readable in full
+        assert saver.get_tuple(self._cfg("t1")).checkpoint["id"] == "c3"
+
+    def test_prune_keep_latest_is_per_namespace(self, saver: AgensSaver):
+        for cid in ("c1", "c2"):
+            self._write(saver, "t1", cid)
+        cfg_ns = {"configurable": {"thread_id": "t1", "checkpoint_ns": "sub"}}
+        saver.put(cfg_ns, _empty_checkpoint("s1", {}, {}), {"source": "loop"}, {})
+        saver.put(cfg_ns, _empty_checkpoint("s2", {}, {}), {"source": "loop"}, {})
+        saver.prune(["t1"])
+        assert [t.checkpoint["id"] for t in saver.list(self._cfg("t1"))] == ["c2"]
+        assert [t.checkpoint["id"] for t in saver.list(cfg_ns)] == ["s2"]
+
+    def test_prune_delete_strategy_removes_everything(self, saver: AgensSaver):
+        for cid in ("c1", "c2"):
+            self._write(saver, "t1", cid)
+        saver.prune(["t1"], strategy="delete")
+        assert list(saver.list(self._cfg("t1"))) == []
+
+    def test_prune_rejects_an_unknown_strategy(self, saver: AgensSaver):
+        with pytest.raises(ValueError):
+            saver.prune(["t1"], strategy="keep_everything")
+
+    def test_prune_leaves_other_threads_alone(self, saver: AgensSaver):
+        self._write(saver, "t1", "c1")
+        self._write(saver, "t1", "c2")
+        self._write(saver, "t2", "d1")
+        saver.prune(["t1"])
+        assert [t.checkpoint["id"] for t in saver.list(self._cfg("t2"))] == ["d1"]
+
+    def test_copy_thread_carries_the_whole_chain(self, saver: AgensSaver):
+        for cid in ("c1", "c2", "c3"):
+            self._write(saver, "src", cid)
+        saver.copy_thread("src", "dst")
+        src = [t.checkpoint["id"] for t in saver.list(self._cfg("src"))]
+        dst = [t.checkpoint["id"] for t in saver.list(self._cfg("dst"))]
+        assert dst == src == ["c3", "c2", "c1"]
+        # the copy is independent of its source
+        saver.delete_thread("src")
+        assert [t.checkpoint["id"] for t in saver.list(self._cfg("dst"))] == dst
+
+    def test_copy_thread_carries_channel_values_and_writes(self, saver: AgensSaver):
+        self._write(saver, "src", "c1")
+        saver.copy_thread("src", "dst")
+        tup = saver.get_tuple(self._cfg("dst"))
+        assert tup.checkpoint["channel_values"] == {"messages": ["c1"]}
+        assert tup.pending_writes
+
+    def test_delete_for_runs_removes_only_that_run(self, saver: AgensSaver):
+        self._write(saver, "t1", "c1", run_id="run-a")
+        self._write(saver, "t1", "c2", run_id="run-b")
+        saver.delete_for_runs(["run-a"])
+        assert [t.checkpoint["id"] for t in saver.list(self._cfg("t1"))] == ["c2"]
+
+    def test_delete_for_runs_spans_threads(self, saver: AgensSaver):
+        self._write(saver, "t1", "c1", run_id="run-a")
+        self._write(saver, "t2", "d1", run_id="run-a")
+        self._write(saver, "t2", "d2", run_id="run-b")
+        saver.delete_for_runs(["run-a"])
+        assert list(saver.list(self._cfg("t1"))) == []
+        assert [t.checkpoint["id"] for t in saver.list(self._cfg("t2"))] == ["d2"]
+
+    def test_empty_inputs_are_no_ops(self, saver: AgensSaver):
+        self._write(saver, "t1", "c1")
+        saver.delete_for_runs([])
+        saver.prune([])
+        assert [t.checkpoint["id"] for t in saver.list(self._cfg("t1"))] == ["c1"]
+
+    @pytest.mark.asyncio
+    async def test_async_prune_copy_and_run_deletion(self, saver: AgensSaver):
+        self._write(saver, "t1", "c1", run_id="run-a")
+        self._write(saver, "t1", "c2", run_id="run-b")
+        await saver.aprune(["t1"])
+        assert [t.checkpoint["id"] for t in saver.list(self._cfg("t1"))] == ["c2"]
+        await saver.acopy_thread("t1", "t9")
+        assert [t.checkpoint["id"] for t in saver.list(self._cfg("t9"))] == ["c2"]
+        await saver.adelete_for_runs(["run-b"])
+        assert list(saver.list(self._cfg("t1"))) == []

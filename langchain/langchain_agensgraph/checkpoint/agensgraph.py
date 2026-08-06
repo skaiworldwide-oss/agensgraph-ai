@@ -77,17 +77,27 @@ class AgensSaver(BaseCheckpointSaver):
             )
         # All reads filter by thread (and namespace); without these composite
         # indexes every get/list/put is a seq scan over the whole label.
-        for label, props in (
-            (_CHECKPOINT_LABEL, ("thread_id", "checkpoint_ns", "checkpoint_id")),
-            (_BLOB_LABEL, ("thread_id", "checkpoint_ns")),
-            (_WRITE_LABEL, ("thread_id", "checkpoint_ns", "checkpoint_id")),
+        for name, label, props in (
+            (
+                f"{_CHECKPOINT_LABEL}_thread_idx",
+                _CHECKPOINT_LABEL,
+                ("thread_id", "checkpoint_ns", "checkpoint_id"),
+            ),
+            (f"{_BLOB_LABEL}_thread_idx", _BLOB_LABEL, ("thread_id", "checkpoint_ns")),
+            (
+                f"{_WRITE_LABEL}_thread_idx",
+                _WRITE_LABEL,
+                ("thread_id", "checkpoint_ns", "checkpoint_id"),
+            ),
+            # delete_for_runs selects by run, which no thread index covers.
+            (f"{_CHECKPOINT_LABEL}_run_idx", _CHECKPOINT_LABEL, ("run_id",)),
         ):
             cols = sql.SQL(", ").join(sql.Identifier(p) for p in props)
             self._graph.query(
                 sql.SQL(
                     "CREATE PROPERTY INDEX IF NOT EXISTS {name} ON {l} ({cols})"
                 ).format(
-                    name=sql.Identifier(f"{label}_thread_idx"),
+                    name=sql.Identifier(name),
                     l=sql.Identifier(label),
                     cols=cols,
                 )
@@ -126,7 +136,8 @@ class AgensSaver(BaseCheckpointSaver):
         c = dict(checkpoint)
         channel_values: Dict[str, Any] = c.pop("channel_values", {})  # type: ignore
         ck_type, ck_b64 = self._dump(c)
-        md_type, md_b64 = self._dump(get_checkpoint_metadata(config, metadata))
+        resolved_metadata = get_checkpoint_metadata(config, metadata)
+        md_type, md_b64 = self._dump(resolved_metadata)
         props = {
             "thread_id": thread_id,
             "checkpoint_ns": checkpoint_ns,
@@ -136,6 +147,9 @@ class AgensSaver(BaseCheckpointSaver):
             "checkpoint": ck_b64,
             "metadata_type": md_type,
             "metadata": md_b64,
+            # The serialized metadata is opaque to a query, so the run this checkpoint
+            # belongs to is kept as a property of its own for delete_for_runs.
+            "run_id": resolved_metadata.get("run_id"),
         }
         blobs = {k: self._dump(v) for k, v in channel_values.items()}
         return props, blobs
@@ -216,6 +230,85 @@ class AgensSaver(BaseCheckpointSaver):
         return sql.SQL(
             "MATCH (n:{l}) WHERE n.thread_id = %(tid)s DETACH DELETE n"
         ).format(l=sql.Identifier(label))
+
+    @staticmethod
+    def _value_predicate(prop: str, values: Sequence[str], params: Dict[str, Any]):
+        """An OR of equalities over one property.
+
+        Each term is an equality the property's index can answer; a bound list would
+        instead be tested for containment and read every row of the label.
+        """
+        terms = []
+        for i, value in enumerate(values):
+            params[f"v{i}"] = Jsonb(value)
+            terms.append(
+                sql.SQL("n.{p} = %({v})s").format(
+                    p=sql.Identifier(prop), v=sql.SQL(f"v{i}")
+                )
+            )
+        return sql.SQL(" OR ").join(terms)
+
+    def _select_by_run_cypher(self, predicate):
+        return sql.SQL(
+            "MATCH (n:{l}) WHERE {pred} "
+            "RETURN n.thread_id AS thread_id, n.checkpoint_ns AS checkpoint_ns, "
+            "       n.checkpoint_id AS checkpoint_id"
+        ).format(l=sql.Identifier(_CHECKPOINT_LABEL), pred=predicate)
+
+    def _select_by_thread_cypher(self, predicate):
+        return self._select_by_run_cypher(predicate)
+
+    def _copy_thread_cypher(self, label: str):
+        """Copy every row of a label from one thread to another.
+
+        Copying the whole thread carries the complete parent chain, which is what a
+        resumed thread needs to rebuild its state.
+        """
+        return sql.SQL(
+            "MATCH (c:{l}) WHERE c.thread_id = %(src)s "
+            "CREATE (n:{l}) SET n = properties(c), n.thread_id = %(tgt)s"
+        ).format(l=sql.Identifier(label))
+
+    def _delete_checkpoints_cypher(self, label: str, predicate):
+        return sql.SQL("MATCH (n:{l}) WHERE {pred} DETACH DELETE n").format(
+            l=sql.Identifier(label), pred=predicate
+        )
+
+    @staticmethod
+    def _triple_predicate(rows: List[Dict[str, Any]], params: Dict[str, Any]):
+        """Match specific (thread, namespace, checkpoint) rows."""
+        terms = []
+        for i, row in enumerate(rows):
+            params[f"t{i}"] = Jsonb(row["thread_id"])
+            params[f"n{i}"] = Jsonb(row["checkpoint_ns"])
+            params[f"c{i}"] = Jsonb(row["checkpoint_id"])
+            terms.append(
+                sql.SQL(
+                    "(n.thread_id = %({t})s AND n.checkpoint_ns = %({n})s "
+                    "AND n.checkpoint_id = %({c})s)"
+                ).format(
+                    t=sql.SQL(f"t{i}"), n=sql.SQL(f"n{i}"), c=sql.SQL(f"c{i}")
+                )
+            )
+        return sql.SQL(" OR ").join(terms)
+
+    @staticmethod
+    def _superseded(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Every checkpoint except the most recent of each thread and namespace.
+
+        Checkpoint ids sort in creation order, so the greatest id of a group is its
+        current state and the rest are history.
+        """
+        latest: Dict[Tuple[str, str], str] = {}
+        for row in rows:
+            group = (row["thread_id"], row["checkpoint_ns"])
+            if row["checkpoint_id"] > latest.get(group, ""):
+                latest[group] = row["checkpoint_id"]
+        return [
+            row
+            for row in rows
+            if latest[(row["thread_id"], row["checkpoint_ns"])] != row["checkpoint_id"]
+        ]
 
     # ---- assembly helpers (pure) ----
 
@@ -427,6 +520,68 @@ class AgensSaver(BaseCheckpointSaver):
                 self._delete_label_cypher(label), {"tid": Jsonb(thread_id)}
             )
 
+    def _delete_checkpoints(self, rows: List[Dict[str, Any]]) -> None:
+        """Remove the named checkpoints and the writes belonging to them.
+
+        Channel blobs are shared between the checkpoints of a thread by version, so they
+        are left for ``delete_thread`` rather than removed with one of their readers.
+        """
+        if not rows:
+            return
+        params: Dict[str, Any] = {}
+        predicate = self._triple_predicate(rows, params)
+        for label in (_WRITE_LABEL, _CHECKPOINT_LABEL):
+            self._graph.query(
+                self._delete_checkpoints_cypher(label, predicate), params
+            )
+
+    async def _adelete_checkpoints(self, rows: List[Dict[str, Any]]) -> None:
+        if not rows:
+            return
+        params: Dict[str, Any] = {}
+        predicate = self._triple_predicate(rows, params)
+        for label in (_WRITE_LABEL, _CHECKPOINT_LABEL):
+            await self._graph.aquery(
+                self._delete_checkpoints_cypher(label, predicate), params
+            )
+
+    def delete_for_runs(self, run_ids: Sequence[str]) -> None:
+        if not run_ids:
+            return
+        params: Dict[str, Any] = {}
+        rows = self._graph.query(
+            self._select_by_run_cypher(
+                self._value_predicate("run_id", run_ids, params)
+            ),
+            params,
+        )
+        self._delete_checkpoints(rows)
+
+    def copy_thread(self, source_thread_id: str, target_thread_id: str) -> None:
+        params = {"src": Jsonb(source_thread_id), "tgt": Jsonb(target_thread_id)}
+        for label in (_CHECKPOINT_LABEL, _BLOB_LABEL, _WRITE_LABEL):
+            self._graph.query(self._copy_thread_cypher(label), params)
+
+    def prune(
+        self, thread_ids: Sequence[str], *, strategy: str = "keep_latest"
+    ) -> None:
+        if not thread_ids:
+            return
+        if strategy == "delete":
+            for thread_id in thread_ids:
+                self.delete_thread(thread_id)
+            return
+        if strategy != "keep_latest":
+            raise ValueError(f"Unsupported prune strategy: {strategy}")
+        params: Dict[str, Any] = {}
+        rows = self._graph.query(
+            self._select_by_thread_cypher(
+                self._value_predicate("thread_id", thread_ids, params)
+            ),
+            params,
+        )
+        self._delete_checkpoints(self._superseded(rows))
+
     # ---- async API ----
 
     async def aput(
@@ -539,6 +694,43 @@ class AgensSaver(BaseCheckpointSaver):
             await self._graph.aquery(
                 self._delete_label_cypher(label), {"tid": Jsonb(thread_id)}
             )
+
+    async def adelete_for_runs(self, run_ids: Sequence[str]) -> None:
+        if not run_ids:
+            return
+        params: Dict[str, Any] = {}
+        rows = await self._graph.aquery(
+            self._select_by_run_cypher(
+                self._value_predicate("run_id", run_ids, params)
+            ),
+            params,
+        )
+        await self._adelete_checkpoints(rows)
+
+    async def acopy_thread(self, source_thread_id: str, target_thread_id: str) -> None:
+        params = {"src": Jsonb(source_thread_id), "tgt": Jsonb(target_thread_id)}
+        for label in (_CHECKPOINT_LABEL, _BLOB_LABEL, _WRITE_LABEL):
+            await self._graph.aquery(self._copy_thread_cypher(label), params)
+
+    async def aprune(
+        self, thread_ids: Sequence[str], *, strategy: str = "keep_latest"
+    ) -> None:
+        if not thread_ids:
+            return
+        if strategy == "delete":
+            for thread_id in thread_ids:
+                await self.adelete_thread(thread_id)
+            return
+        if strategy != "keep_latest":
+            raise ValueError(f"Unsupported prune strategy: {strategy}")
+        params: Dict[str, Any] = {}
+        rows = await self._graph.aquery(
+            self._select_by_thread_cypher(
+                self._value_predicate("thread_id", thread_ids, params)
+            ),
+            params,
+        )
+        await self._adelete_checkpoints(self._superseded(rows))
 
     # ---- param helper ----
 

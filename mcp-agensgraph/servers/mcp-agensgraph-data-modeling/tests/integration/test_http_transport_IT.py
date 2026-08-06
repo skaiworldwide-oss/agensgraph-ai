@@ -7,6 +7,11 @@ import pytest
 import pytest_asyncio
 
 
+async def _tools_by_name(server):
+    """Tools keyed by name."""
+    return {tool.name: tool for tool in await server.list_tools()}
+
+
 async def parse_sse_response(response: aiohttp.ClientResponse) -> dict:
     """Parse Server-Sent Events response from FastMCP 2.0."""
     content = await response.text()
@@ -25,7 +30,7 @@ async def parse_sse_response(response: aiohttp.ClientResponse) -> dict:
 async def test_http_transport_creation(mcp_server):
     """Test that HTTP transport can be created."""
     # Test that the server can be created
-    tools = await mcp_server.get_tools()
+    tools = await _tools_by_name(mcp_server)
     assert len(tools) > 0
 
 

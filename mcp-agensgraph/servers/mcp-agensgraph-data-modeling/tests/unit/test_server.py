@@ -2,13 +2,23 @@ import pytest
 from fastmcp.server import FastMCP
 
 
+async def _tools_by_name(server):
+    """Tools keyed by name."""
+    return {tool.name: tool for tool in await server.list_tools()}
+
+
+async def _resources_by_uri(server):
+    """Resources keyed by their URI string."""
+    return {str(resource.uri): resource for resource in await server.list_resources()}
+
+
 class TestServerTools:
     """Test server tools functionality."""
 
     @pytest.mark.asyncio
     async def test_list_example_data_models_tool(self, test_mcp_server: FastMCP):
         """Test the list_example_data_models tool."""
-        tools = await test_mcp_server.get_tools()
+        tools = await _tools_by_name(test_mcp_server)
         list_tool = tools.get("list_example_data_models")
 
         assert list_tool is not None
@@ -42,7 +52,7 @@ class TestServerTools:
         self, test_mcp_server: FastMCP
     ):
         """Test the get_example_data_model tool with all available examples."""
-        tools = await test_mcp_server.get_tools()
+        tools = await _tools_by_name(test_mcp_server)
         get_tool = tools.get("get_example_data_model")
 
         assert get_tool is not None
@@ -77,7 +87,7 @@ class TestServerTools:
         self, test_mcp_server: FastMCP
     ):
         """Test the get_example_data_model tool with invalid example name."""
-        tools = await test_mcp_server.get_tools()
+        tools = await _tools_by_name(test_mcp_server)
         get_tool = tools.get("get_example_data_model")
 
         assert get_tool is not None
@@ -92,7 +102,7 @@ class TestMCPResources:
     @pytest.mark.asyncio
     async def test_mcp_resources_schemas(self, test_mcp_server: FastMCP):
         """Test that schema resources return valid JSON schemas."""
-        resources = await test_mcp_server.get_resources()
+        resources = await _resources_by_uri(test_mcp_server)
 
         schema_resources = [
             "resource://schema/node",
@@ -111,7 +121,7 @@ class TestMCPResources:
     @pytest.mark.asyncio
     async def test_mcp_resources_example_models(self, test_mcp_server: FastMCP):
         """Test that example model resources return valid JSON strings."""
-        resources = await test_mcp_server.get_resources()
+        resources = await _resources_by_uri(test_mcp_server)
 
         example_resources = [
             "resource://examples/patient_journey_model",
@@ -140,7 +150,7 @@ class TestMCPResources:
         self, test_mcp_server: FastMCP
     ):
         """Test the AgensGraph data ingest process resource."""
-        resources = await test_mcp_server.get_resources()
+        resources = await _resources_by_uri(test_mcp_server)
         resource = resources.get("resource://static/agensgraph_data_ingest_process")
 
         assert resource is not None
@@ -153,7 +163,7 @@ class TestMCPResources:
     @pytest.mark.asyncio
     async def test_tool_validation_with_example_models(self, test_mcp_server: FastMCP):
         """Test that example models can be validated using the validation tools."""
-        tools = await test_mcp_server.get_tools()
+        tools = await _tools_by_name(test_mcp_server)
         get_tool = tools.get("get_example_data_model")
         validate_tool = tools.get("validate_data_model")
 
@@ -173,8 +183,8 @@ class TestMCPResources:
         self, test_mcp_server: FastMCP
     ):
         """Test that resources and tools return consistent data for the same models."""
-        tools = await test_mcp_server.get_tools()
-        resources = await test_mcp_server.get_resources()
+        tools = await _tools_by_name(test_mcp_server)
+        resources = await _resources_by_uri(test_mcp_server)
 
         get_tool = tools.get("get_example_data_model")
         patient_journey_resource = resources.get(
@@ -224,7 +234,7 @@ class TestNamespacing:
 
         # Test with namespace
         namespaced_server = create_mcp_server(namespace="test-ns")
-        tools = await namespaced_server.get_tools()
+        tools = await _tools_by_name(namespaced_server)
 
         expected_tools = [
             "test-ns-validate_node",
@@ -241,7 +251,7 @@ class TestNamespacing:
 
         # Test without namespace
         default_server = create_mcp_server()
-        default_tools = await default_server.get_tools()
+        default_tools = await _tools_by_name(default_server)
 
         expected_default_tools = [
             "validate_node",
@@ -264,7 +274,7 @@ class TestNamespacing:
 
         # Create server with namespace
         namespaced_server = create_mcp_server(namespace="test")
-        tools = await namespaced_server.get_tools()
+        tools = await _tools_by_name(namespaced_server)
 
         # Get the namespaced validate_node tool
         validate_tool = tools.get("test-validate_node")
@@ -294,8 +304,8 @@ class TestNamespacing:
         server_a = create_mcp_server(namespace="app-a")
         server_b = create_mcp_server(namespace="app-b")
 
-        tools_a = await server_a.get_tools()
-        tools_b = await server_b.get_tools()
+        tools_a = await _tools_by_name(server_a)
+        tools_b = await _tools_by_name(server_b)
 
         # Check that each server has its own prefixed tools
         assert "app-a-validate_node" in tools_a.keys()

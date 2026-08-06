@@ -7,6 +7,11 @@ from mcp_agensgraph_memory.server import create_mcp_server
 from mcp_agensgraph_memory.utils import format_namespace
 
 
+async def _tools_by_name(server):
+    """Tools keyed by name."""
+    return {tool.name: tool for tool in await server.list_tools()}
+
+
 class TestFormatNamespace:
     """Test the format_namespace function behavior."""
 
@@ -53,7 +58,7 @@ class TestNamespacing:
         """Test that tools are correctly prefixed with namespace."""
         # Test with namespace
         namespaced_server = create_mcp_server(mock_memory, namespace="test-ns")
-        tools = await namespaced_server.get_tools()
+        tools = await _tools_by_name(namespaced_server)
 
         expected_tools = [
             "test-ns-read_graph",
@@ -74,7 +79,7 @@ class TestNamespacing:
 
         # Test without namespace (default tools)
         default_server = create_mcp_server(mock_memory)
-        default_tools = await default_server.get_tools()
+        default_tools = await _tools_by_name(default_server)
 
         expected_default_tools = [
             "read_graph",
@@ -97,7 +102,7 @@ class TestNamespacing:
     async def test_namespace_tool_functionality(self, mock_memory):
         """Test that namespaced tools function correctly."""
         namespaced_server = create_mcp_server(mock_memory, namespace="test")
-        tools = await namespaced_server.get_tools()
+        tools = await _tools_by_name(namespaced_server)
 
         # Test that a namespaced tool exists and works
         read_tool = tools.get("test-read_graph")
@@ -113,8 +118,8 @@ class TestNamespacing:
         server_a = create_mcp_server(mock_memory, namespace="app-a")
         server_b = create_mcp_server(mock_memory, namespace="app-b")
 
-        tools_a = await server_a.get_tools()
-        tools_b = await server_b.get_tools()
+        tools_a = await _tools_by_name(server_a)
+        tools_b = await _tools_by_name(server_b)
 
         # Verify app-a tools exist in server_a but not server_b
         assert "app-a-read_graph" in tools_a.keys()
@@ -132,12 +137,12 @@ class TestNamespacing:
         """Test namespace hyphen handling edge cases."""
         # Namespace already ending with hyphen
         server_with_hyphen = create_mcp_server(mock_memory, namespace="myapp-")
-        tools_with_hyphen = await server_with_hyphen.get_tools()
+        tools_with_hyphen = await _tools_by_name(server_with_hyphen)
         assert "myapp-read_graph" in tools_with_hyphen.keys()
 
         # Namespace without hyphen
         server_without_hyphen = create_mcp_server(mock_memory, namespace="myapp")
-        tools_without_hyphen = await server_without_hyphen.get_tools()
+        tools_without_hyphen = await _tools_by_name(server_without_hyphen)
         assert "myapp-read_graph" in tools_without_hyphen.keys()
 
         # Both should result in identical tool names
@@ -155,7 +160,7 @@ class TestNamespacing:
 
         for namespace in complex_namespaces:
             server = create_mcp_server(mock_memory, namespace=namespace)
-            tools = await server.get_tools()
+            tools = await _tools_by_name(server)
 
             # Verify tools are properly prefixed
             expected_tool = f"{namespace}-read_graph"
@@ -169,8 +174,8 @@ class TestNamespacing:
         default_server = create_mcp_server(mock_memory)
         namespaced_server = create_mcp_server(mock_memory, namespace="test")
 
-        default_tools = await default_server.get_tools()
-        namespaced_tools = await namespaced_server.get_tools()
+        default_tools = await _tools_by_name(default_server)
+        namespaced_tools = await _tools_by_name(namespaced_server)
 
         # Should have the same number of tools
         assert len(default_tools) == len(namespaced_tools)

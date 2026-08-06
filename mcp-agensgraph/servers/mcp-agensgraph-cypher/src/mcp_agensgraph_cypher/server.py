@@ -405,34 +405,38 @@ def create_mcp_server(
             logger.error("Error executing read query: %s\n%s\nparams=%s", e, query, params)
             raise ToolError("Read query failed. See server logs for details.")
 
-    @mcp.tool(
-        name=prefix + "write_agensgraph_cypher",
-        annotations=ToolAnnotations(
-            title="Write AgensGraph Cypher",
-            readOnlyHint=False,
-            destructiveHint=True,
-            idempotentHint=False,
-            openWorldHint=True,
-        ),
-        enabled=not read_only,
-    )
-    async def write_agensgraph_cypher(
-        query: str = Field(..., description="The Cypher query to execute."),
-        params: Dict[str, Any] = Field(
-            default_factory=dict, description="Parameters to pass to the Cypher query."
-        ),
-    ) -> list[ToolResult]:
-        """Execute a write Cypher query (CREATE/MERGE/SET/DELETE/REMOVE) and return stats."""
-        if not is_write_query(query):
-            raise ToolError("This tool is for write queries; use the read tool for MATCH/RETURN.")
-        try:
-            stats = await _execute_write(pool, graphname, quote_identifiers(query), params)
-            return ToolResult(
-                content=[TextContent(type="text", text=json.dumps(stats, default=str))]
-            )
-        except Exception as e:
-            logger.error("Error executing write query: %s\n%s\nparams=%s", e, query, params)
-            raise ToolError("Write query failed. See server logs for details.")
+    # A read-only server does not register the write tool.
+    if not read_only:
+
+        @mcp.tool(
+            name=prefix + "write_agensgraph_cypher",
+            annotations=ToolAnnotations(
+                title="Write AgensGraph Cypher",
+                readOnlyHint=False,
+                destructiveHint=True,
+                idempotentHint=False,
+                openWorldHint=True,
+            ),
+        )
+        async def write_agensgraph_cypher(
+            query: str = Field(..., description="The Cypher query to execute."),
+            params: Dict[str, Any] = Field(
+                default_factory=dict, description="Parameters to pass to the Cypher query."
+            ),
+        ) -> list[ToolResult]:
+            """Execute a write Cypher query (CREATE/MERGE/SET/DELETE/REMOVE) and return stats."""
+            if not is_write_query(query):
+                raise ToolError(
+                    "This tool is for write queries; use the read tool for MATCH/RETURN."
+                )
+            try:
+                stats = await _execute_write(pool, graphname, quote_identifiers(query), params)
+                return ToolResult(
+                    content=[TextContent(type="text", text=json.dumps(stats, default=str))]
+                )
+            except Exception as e:
+                logger.error("Error executing write query: %s\n%s\nparams=%s", e, query, params)
+                raise ToolError("Write query failed. See server logs for details.")
 
     return mcp
 

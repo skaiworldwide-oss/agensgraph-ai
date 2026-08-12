@@ -193,7 +193,10 @@ def create_mcp_server(namespace: str = "") -> FastMCP:
         """
         Get the Cypher query to ingest a list of Node records into a AgensGraph database.
         This should be used to ingest data into a AgensGraph database.
-        This is a parameterized Cypher query that takes a list of records as input to the $records parameter.
+        This is a parameterized Cypher query. The list of records is bound to the parameter
+        named `records`, and the placeholder in the query is written `%(records)s` -- that is the
+        form the database driver binds. `$records` is not rewritten by anything and reaches the
+        server as written, where it is a syntax error.
         """
         logger.info(
             f"Getting the Cypher query to ingest a list of Node records into a AgensGraph database for node {node.label}."
@@ -218,7 +221,10 @@ def create_mcp_server(namespace: str = "") -> FastMCP:
         """
         Get the Cypher query to ingest a list of Relationship records into a AgensGraph database.
         This should be used to ingest data into a AgensGraph database.
-        This is a parameterized Cypher query that takes a list of records as input to the $records parameter.
+        This is a parameterized Cypher query. The list of records is bound to the parameter
+        named `records`, and the placeholder in the query is written `%(records)s` -- that is the
+        form the database driver binds. `$records` is not rewritten by anything and reaches the
+        server as written, where it is a syntax error.
         The records must contain the Relationship properties, if any, as well as the sourceId and targetId properties of the start and end nodes respectively.
         """
         logger.info(

@@ -137,8 +137,6 @@ Add the server to your `claude_desktop_config.json`:
       "postgresql://localhost:5432",
       "--username",
       "<your-username>",
-      "--password",
-      "<your-password>",
       "--database",
       "<your-database>",
       "--graphname",
@@ -147,6 +145,11 @@ Add the server to your `claude_desktop_config.json`:
   }
 }
 ```
+
+There is no `--password` here on purpose: a password on the command line is readable by every
+process on the machine through `ps`. Leave it out and libpq resolves it — `PGPASSWORD`,
+`.pgpass`, `PGSERVICE`, or an authentication method that needs none — or pass it in the
+environment as below.
 
 Alternatively, you can set environment variables:
 
@@ -280,8 +283,8 @@ uv sync
 | --------------------------------------- | --------------------------------------- | -------------------------------------------------- |
 | `AGENSGRAPH_URL`                        | `postgresql://localhost:5432`           | AgensGraph connection URL (host:port only)         |
 | `AGENSGRAPH_USERNAME`                   | `agens`                                 | AgensGraph username                                |
-| `AGENSGRAPH_PASSWORD`                   | `agens`                                 | AgensGraph password                                |
-| `AGENSGRAPH_DB`                         | `agens`                                 | AgensGraph database name                           |
+| `AGENSGRAPH_PASSWORD`                   | _(unset — libpq resolves it)_           | AgensGraph password                                |
+| `AGENSGRAPH_DATABASE`                   | `agens`                                 | AgensGraph database name (`AGENSGRAPH_DB` also read) |
 | `AGENSGRAPH_GRAPH_NAME`                 | `memory`                                | AgensGraph graph name                              |
 | `AGENSGRAPH_TRANSPORT`                  | `stdio` (local), `http` (remote)        | Transport protocol (`stdio`, `http`, or `sse`)     |
 | `AGENSGRAPH_MCP_SERVER_HOST`            | `127.0.0.1` (local)                     | Host to bind to                                    |
@@ -291,6 +294,13 @@ uv sync
 | `AGENSGRAPH_MCP_SERVER_ALLOWED_HOSTS`   | `localhost,127.0.0.1`                   | Comma-separated list of allowed hosts (DNS rebinding protection) |
 | `AGENSGRAPH_NAMESPACE`                  | _(empty - no prefix)_                   | Namespace prefix for tool names (e.g., `myapp-read_graph`) |
 | `AGENSGRAPH_MEMORY_LIMIT`               | `1000`                                  | Default entities per read, bounded by the same ceiling |
+| `AGENSGRAPH_ALLOW_SERVER_PROGRAMS`      | `false`                                 | Serve as a role that can run a command on the server's host |
+
+Leaving `AGENSGRAPH_PASSWORD` unset is the useful default rather than an omission: an empty
+password is not sent as an empty one, so libpq resolves it the way it resolves everything else
+— `PGPASSWORD`, `.pgpass`, `PGSERVICE`, or an authentication method that needs none. A password
+passed as `--password` on the command line is readable by every process on the machine through
+`ps`; the environment variable or `.pgpass` is not.
 
 ## 📄 License
 

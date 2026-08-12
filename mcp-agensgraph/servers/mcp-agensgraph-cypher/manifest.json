@@ -2,11 +2,23 @@
   "dxt_version": "0.1",
   "name": "mcp-agensgraph-cypher",
   "display_name": "Agensgraph Cypher MCP Server",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Execute read and write Cypher queries on your Agensgraph database.",
   "long_description": "A Model Context Protocol (MCP) server that provides tools for interacting with Agensgraph database using Cypher queries. Supports both read and write operations with proper validation and error handling.",
-  "keywords": ["agensgraph", "cypher", "graph", "database", "mcp", "ai", "llm"],
-  "categories": ["database", "graph", "query"],
+  "keywords": [
+    "agensgraph",
+    "cypher",
+    "graph",
+    "database",
+    "mcp",
+    "ai",
+    "llm"
+  ],
+  "categories": [
+    "database",
+    "graph",
+    "query"
+  ],
   "repository": {
     "type": "git",
     "url": "https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/mcp-agensgraph/servers/mcp-agensgraph-cypher"
@@ -18,16 +30,18 @@
     "entry_point": "src/mcp_agensgraph_cypher/__init__.py",
     "mcp_config": {
       "command": "uvx",
-      "args": ["mcp-agensgraph-cypher"],
+      "args": [
+        "mcp-agensgraph-cypher"
+      ],
       "env": {
-        "AGENSGRAPH_DB": "${user_config.agensgraph_db}",
+        "AGENSGRAPH_URL": "${user_config.agensgraph_url}",
+        "AGENSGRAPH_DATABASE": "${user_config.agensgraph_database}",
         "AGENSGRAPH_USERNAME": "${user_config.agensgraph_username}",
         "AGENSGRAPH_PASSWORD": "${user_config.agensgraph_password}",
-        "AGENSGRAPH_HOST": "${user_config.agensgraph_host}",
-        "AGENSGRAPH_PORT": "${user_config.agensgraph_port}",
-        "AGENSGRAPH_GRAPH_NAME": "${user_config.agensgraph_graph_name}",
+        "AGENSGRAPH_GRAPHNAME": "${user_config.agensgraph_graphname}",
         "AGENSGRAPH_TRANSPORT": "${user_config.transport}",
         "AGENSGRAPH_NAMESPACE": "${user_config.agensgraph_namespace}",
+        "AGENSGRAPH_READ_ONLY": "${user_config.read_only}",
         "AGENSGRAPH_MCP_SERVER_HOST": "${user_config.mcp_server_host}",
         "AGENSGRAPH_MCP_SERVER_PORT": "${user_config.mcp_server_port}"
       }
@@ -36,66 +50,74 @@
   "tools": [
     {
       "name": "get_agensgraph_schema",
-      "description": "Retrieve the schema of the Agensgraph graph database, including node labels, properties, and relationships"
+      "description": "What is in the graph: one entry per node label, with its exact node count, its properties, and the relationship types leaving it"
     },
     {
       "name": "read_agensgraph_cypher",
-      "description": "Execute read-only Cypher queries (MATCH, RETURN, etc.) on the Agensgraph database"
+      "description": "Run a read Cypher query in a read-only transaction, one page at a time, with params bound as %(name)s"
+    },
+    {
+      "name": "explain_agensgraph_cypher",
+      "description": "Show how AgensGraph would run a Cypher statement, optionally executing it for real timings inside a read-only transaction"
+    },
+    {
+      "name": "recommend_property_indexes",
+      "description": "Suggest property indexes and rewrites for a query, from its plan and the label catalogs; it never runs the DDL it reports"
+    },
+    {
+      "name": "agensgraph_health",
+      "description": "Cache hit ratio, unused indexes, vacuum backlog, connection use, auto_gather_graphmeta, and which optional extensions are installed"
+    },
+    {
+      "name": "top_cypher_queries",
+      "description": "The Cypher statements costing the most total time, from pg_stat_statements"
     },
     {
       "name": "write_agensgraph_cypher",
-      "description": "Execute write Cypher queries (CREATE, MERGE, SET, DELETE, etc.) on the Agensgraph database"
+      "description": "Run an updating Cypher query and report the five write counters; withheld when the server runs read-only"
     }
   ],
   "prompts": [],
   "tools_generated": false,
-  "license": "MIT",
+  "license": "Apache-2.0",
   "user_config": {
-    "agensgraph_db": {
+    "agensgraph_url": {
       "type": "string",
-      "title": "Agensgraph Database",
-      "description": "The name of the Agensgraph database to connect to",
-      "default": "agensgraph",
+      "title": "AgensGraph URL",
+      "description": "Where the database is, as a connection URL. Everything it carries is kept, including sslmode.",
+      "default": "postgresql://localhost:5432",
+      "required": true,
+      "sensitive": false
+    },
+    "agensgraph_database": {
+      "type": "string",
+      "title": "AgensGraph Database",
+      "description": "The name of the AgensGraph database to connect to",
+      "default": "agens",
       "required": true,
       "sensitive": false
     },
     "agensgraph_username": {
       "type": "string",
-      "title": "Agensgraph Username",
-      "description": "The username for connecting to the Agensgraph database",
-      "default": "agensgraph",
+      "title": "AgensGraph Username",
+      "description": "The username for connecting to the AgensGraph database",
+      "default": "agens",
       "required": true,
-      "sensitive": true
+      "sensitive": false
     },
     "agensgraph_password": {
       "type": "string",
-      "title": "Agensgraph Password",
-      "description": "The password for connecting to the Agensgraph database",
+      "title": "AgensGraph Password",
+      "description": "Left empty, libpq resolves it: PGPASSWORD, .pgpass, PGSERVICE, or an authentication method that needs none.",
       "default": "",
-      "required": true,
+      "required": false,
       "sensitive": true
     },
-    "agensgraph_host": {
+    "agensgraph_graphname": {
       "type": "string",
-      "title": "Agensgraph Host",
-      "description": "The host for the Agensgraph database, defaults to localhost",
-      "default": "localhost",
-      "required": false,
-      "sensitive": false
-    },
-    "agensgraph_port": {
-      "type": "number",
-      "title": "Agensgraph Port",
-      "description": "The port for the Agensgraph database, defaults to 5432",
-      "default": 5432,
-      "required": false,
-      "sensitive": false
-    },
-    "agensgraph_graph_name": {
-      "type": "string",
-      "title": "Agensgraph Graph Name",
-      "description": "The name of the graph in the Agensgraph database, defaults to 'graph'",
-      "default": "graph",
+      "title": "AgensGraph Graph Name",
+      "description": "The name of the graph in the AgensGraph database",
+      "default": "agens",
       "required": false,
       "sensitive": false
     },
@@ -104,6 +126,14 @@
       "title": "Namespace",
       "description": "An optional namespace for the MCP server tools",
       "default": "",
+      "required": false,
+      "sensitive": false
+    },
+    "read_only": {
+      "type": "boolean",
+      "title": "Read-only",
+      "description": "Withhold the write tool. The six remaining tools run their statements in a read-only transaction, and the graph is not created if it is missing.",
+      "default": false,
       "required": false,
       "sensitive": false
     },

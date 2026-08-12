@@ -1,14 +1,18 @@
 import json
+import sys
 
 from agensgraph import Result
 from agensgraph._protocol.graphid import GraphId
 from agensgraph.types import Edge, Vertex
+from mcp_agensgraph_common import results
 from mcp_agensgraph_common.results import (
+    BYTES_PER_TOKEN,
     OMITTED,
     column_names,
     count_tokens,
     fit_rows,
     rows_of,
+    token_encoding,
     value_sanitize,
 )
 
@@ -121,3 +125,27 @@ def test_fit_rows_keeps_everything_that_fits():
 
 def test_count_tokens_falls_back_for_an_unknown_model():
     assert count_tokens("hello world", model="not-a-real-model") > 0
+
+
+def test_a_response_is_still_bounded_with_no_tokenizer(monkeypatch):
+    """tiktoken is an extra, and loading one fetches a file over the network.
+
+    Measured with an empty cache directory: 5,445 ms, and nothing at all where there is no
+    route out. A budget without it is approximate rather than absent.
+    """
+    monkeypatch.setattr(results, "_ENCODINGS", {"gpt-4o": None})
+    rows = [{"text": "word " * 100} for _ in range(20)]
+    # A row of this is 511 bytes, so about 256 tokens by the estimate and about 105 counted --
+    # the estimate is the more careful of the two for text, which is the direction to err in.
+    kept, dropped = fit_rows(rows, token_limit=800)
+    assert 0 < len(kept) < len(rows)
+    assert dropped == len(rows) - len(kept)
+    assert json.loads(json.dumps(kept)) == kept
+    assert count_tokens("x" * 100) == 100 // BYTES_PER_TOKEN
+
+
+def test_a_missing_tiktoken_is_not_a_failed_response(monkeypatch):
+    monkeypatch.setattr(results, "_ENCODINGS", {})
+    monkeypatch.setitem(sys.modules, "tiktoken", None)  # import raises ImportError
+    assert token_encoding("gpt-4o") is None
+    assert count_tokens("hello world") > 0

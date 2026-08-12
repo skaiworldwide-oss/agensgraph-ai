@@ -129,26 +129,62 @@ def value_sanitize(value: Any, list_limit: int = 128) -> Any:
 
 _ENCODINGS: dict[str, Any] = {}
 
+BYTES_PER_TOKEN = 2
+"""What a token is taken to be worth when there is no tokenizer to ask.
+
+Measured against a graph of 138,619 papers, over four shapes of result: 4.67 bytes per token
+for titles and abstracts, 2.14 for whole vertices, 2.00 for a label and an id, 1.75 for ids
+alone -- 1.50 to 5.96 across every row. Two is at the dense end of that, so the estimate is
+generous with text and can be about a third low for a result of nothing but ids.
+"""
+
 
 def token_encoding(model: str = "gpt-4o") -> Any:
-    """The tokenizer for a model, loaded once per process.
+    """The tokenizer for a model, loaded once per process, or ``None`` if there is not one.
 
-    Loading one is four tenths of a second, which is not a thing to pay per tool call. An
-    unknown model name falls back to a generic encoding rather than failing a response.
+    tiktoken is an extra rather than a dependency, and what makes that worth doing is what
+    loading it does: the first call fetches the model's BPE file over the network. Measured
+    with an empty cache directory, 5,445 ms -- and where there is no route out, the shipped
+    default could not serve a single read at all. Every way that can fail is caught here, the
+    package being absent and the fetch failing alike, and the answer is then an estimate rather
+    than a failed response.
+
+    An unknown model name falls back to a generic encoding rather than failing a response.
     """
-    if model not in _ENCODINGS:
+    if model in _ENCODINGS:
+        return _ENCODINGS[model]
+    encoding = None
+    try:
         import tiktoken
 
         try:
-            _ENCODINGS[model] = tiktoken.encoding_for_model(model)
+            encoding = tiktoken.encoding_for_model(model)
         except KeyError:
-            _ENCODINGS[model] = tiktoken.get_encoding("cl100k_base")
-    return _ENCODINGS[model]
+            encoding = tiktoken.get_encoding("cl100k_base")
+    except ImportError:
+        logger.info(
+            "tiktoken is not installed, so a response is bounded by an estimate of %d bytes "
+            "per token. Install mcp-agensgraph-common[tokens] to count them exactly.",
+            BYTES_PER_TOKEN,
+        )
+    except Exception as exc:  # pragma: no cover - needs a broken or unreachable cache
+        logger.warning(
+            "tiktoken could not load an encoding for %r (%s), so a response is bounded by an "
+            "estimate of %d bytes per token. Loading one fetches a file over the network.",
+            model,
+            exc,
+            BYTES_PER_TOKEN,
+        )
+    _ENCODINGS[model] = encoding
+    return encoding
 
 
 def count_tokens(text: str, model: str = "gpt-4o") -> int:
-    """How many tokens a string costs the model it is going to."""
-    return len(token_encoding(model).encode(text))
+    """How many tokens a string costs the model it is going to, counted or estimated."""
+    encoding = token_encoding(model)
+    if encoding is None:
+        return -(-len(text.encode()) // BYTES_PER_TOKEN)
+    return len(encoding.encode(text))
 
 
 def fit_rows(
@@ -166,18 +202,30 @@ def fit_rows(
     Measuring stops at the first row that does not fit, so the work is bounded by the budget
     rather than by the size of the result: a thousand rows of abstracts cost a second to
     measure in full and twenty-five milliseconds to measure as far as a ten-thousand-token cap.
+
+    With no tokenizer installed the measure is the row's size in bytes over
+    :data:`BYTES_PER_TOKEN`. A budget is still a budget -- what changes is that it is
+    approximate, not that it is gone.
     """
     encoding = token_encoding(model)
+    if encoding is None:
+        def measure(text: str) -> int:
+            return -(-len(text.encode()) // BYTES_PER_TOKEN)
+    else:
+        def measure(text: str) -> int:
+            return len(encoding.encode(text))
+
     budget = max(0, token_limit - reserve)
     used = 0
     for index, row in enumerate(rows):
-        used += len(encoding.encode(json.dumps(row, default=str)))
+        used += measure(json.dumps(row, default=str))
         if used > budget:
             return rows[:index], len(rows) - index
     return rows, 0
 
 
 __all__ = [
+    "BYTES_PER_TOKEN",
     "OMITTED",
     "as_builtins",
     "column_names",

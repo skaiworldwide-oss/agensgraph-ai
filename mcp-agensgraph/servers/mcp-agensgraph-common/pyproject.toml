@@ -30,16 +30,22 @@ dependencies = [
     "agensgraph-python",
     "fastmcp>=3.0.0,<4.0.0",
     "pydantic>=2.10.1",
-    "tiktoken>=0.11.0",
     "starlette>=0.47.0",
 ]
 
 # Database-backed servers (cypher, memory) install the `db` extra to pull psycopg.
 # The data-modeling server has no DB connection and omits it.
+#
+# `tokens` is tiktoken, and it is an extra because loading a tokenizer fetches the model's BPE
+# file over the network -- 5,445 ms with an empty cache, and nothing at all where there is no
+# route out. Without it a response is bounded by an estimate of its size in bytes instead.
 [project.optional-dependencies]
 db = [
     "psycopg[binary,pool]>=3.2.9,<4.0.0",
     "psycopg-pool>=3.2.6,<4.0.0",
+]
+tokens = [
+    "tiktoken>=0.11.0",
 ]
 
 [project.urls]

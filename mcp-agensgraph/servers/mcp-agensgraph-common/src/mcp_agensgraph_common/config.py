@@ -141,6 +141,13 @@ def transport_config(args: argparse.Namespace) -> dict[str, Any]:
     return cfg
 
 
+# What one tool result may cost the model reading it. On by default: an unbounded read of a
+# graph holding text returns whatever the rows hold, and `RETURN n.title, n.abstract` over a
+# thousand papers came to 874,043 bytes -- around 217,000 tokens -- in a single result.
+# ``0`` turns the bound off for a caller who means to take everything.
+DEFAULT_TOKEN_LIMIT = 10_000
+
+
 def read_controls(args: argparse.Namespace) -> dict[str, Any]:
     """Read-query controls (cypher server): timeout, token limit, read-only."""
     cfg: dict[str, Any] = {}
@@ -153,9 +160,20 @@ def read_controls(args: argparse.Namespace) -> dict[str, Any]:
         cfg["read_timeout"] = 30
 
     token_limit = _pick(
-        getattr(args, "token_limit", None), "AGENSGRAPH_RESPONSE_TOKEN_LIMIT"
+        getattr(args, "token_limit", None),
+        "AGENSGRAPH_RESPONSE_TOKEN_LIMIT",
+        default=DEFAULT_TOKEN_LIMIT,
     )
-    cfg["token_limit"] = int(token_limit) if token_limit is not None else None
+    try:
+        limit = int(token_limit)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Invalid response token limit %r; using default %d",
+            token_limit,
+            DEFAULT_TOKEN_LIMIT,
+        )
+        limit = DEFAULT_TOKEN_LIMIT
+    cfg["token_limit"] = limit if limit > 0 else None
 
     if getattr(args, "read_only", False):
         cfg["read_only"] = True

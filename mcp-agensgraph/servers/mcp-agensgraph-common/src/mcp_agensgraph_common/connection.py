@@ -18,7 +18,9 @@ import re
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 
+import agensgraph
 import psycopg
+from agensgraph.cypher import without_literals
 from psycopg import sql
 from psycopg.conninfo import make_conninfo
 from psycopg.rows import namedtuple_row
@@ -26,13 +28,33 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
 from .results import record_to_dict
-from .safety import strip_comments_and_strings
 
 logger = logging.getLogger("mcp_agensgraph_common")
 
 # Paging clauses the caller ended their own query with. Cypher takes one set of them per
-# query part, so ours cannot follow theirs (see ``run_paginated_query``).
-_TRAILING_PAGING = re.compile(r"\b(?:SKIP|LIMIT)\s+\S+\s*$", re.IGNORECASE)
+# query part, so ours cannot follow theirs (see ``run_paginated_query``). ``OFFSET`` is
+# ``SKIP`` under another name, so a query ending in one takes the same shape as a query
+# ending in the other: appending to `... OFFSET 5` produces `... OFFSET 5 SKIP 0 LIMIT 101`,
+# which the server rejects with "Cypher query must end with RETURN, FINISH or update clause".
+_TRAILING_PAGING = re.compile(r"\b(?:SKIP|OFFSET|LIMIT)\s+\S+\s*$", re.IGNORECASE)
+
+# Clauses the grammar keeps for the top of a statement. `SELECT * FROM (<cypher>) AS _page`
+# routes the query through the read-clause continuation set instead, which holds
+# MATCH/WITH/LET/LOAD/UNWIND/FOR/CALL{} and none of these -- so wrapping one is a syntax
+# error at the word, not a slower plan. Measured: `... FILTER n.t IS NOT NULL RETURN n`,
+# `... NEXT RETURN t` and `... CALL jsonb_each(...) YIELD key RETURN key` each come back
+# `ERROR: syntax error at or near "FILTER" / "NEXT" / "CALL"`.
+_TOP_LEVEL_ONLY = re.compile(r"(?<![A-Za-z0-9_.\"])(FILTER|NEXT|YIELD)(?![A-Za-z0-9_])", re.IGNORECASE)
+
+
+def unwrappable_clause(query: str) -> Optional[str]:
+    """The clause in this query that cannot be read as a subquery, if there is one.
+
+    Located against the statement with its strings and comments blanked, so a property named
+    ``next`` and the word ``FILTER`` inside a quoted value are not read as clauses.
+    """
+    found = _TOP_LEVEL_ONLY.search(without_literals(query))
+    return found.group(1).upper() if found else None
 
 
 def jsonb_params(params: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
@@ -76,8 +98,21 @@ def build_dsn(db_url: str, username: str, password: str, database: str) -> str:
 
 
 def create_pool(dsn: str, **kwargs: Any) -> AsyncConnectionPool:
-    """Create a (not-yet-opened) async connection pool."""
-    return AsyncConnectionPool(dsn, open=False, **kwargs)
+    """Create a (not-yet-opened) async connection pool of graph connections.
+
+    The connection class is the driver's, which is what makes a vertex arrive as a vertex.
+    Read over a plain psycopg connection, a graph value is the text the server printed and has
+    to be matched with a regular expression; the endpoints of an edge are two identities that
+    expression cannot resolve, so ``MATCH ()-[r]->() RETURN r`` reported an empty map at each
+    end. The driver decodes the wire form, so both ends are named whether or not the query
+    also returned the vertices.
+
+    It also refuses a server it cannot read at connect time, from the version in the startup
+    packet, rather than at whichever later statement first wants a catalog that is not there.
+    """
+    return AsyncConnectionPool(
+        dsn, open=False, connection_class=agensgraph.AsyncConnection, **kwargs
+    )
 
 
 @asynccontextmanager
@@ -231,8 +266,12 @@ async def run_paginated_query(
     extra row is fetched to detect whether more results exist beyond this page.
 
     Cypher's ``SKIP``/``LIMIT`` carries the page. A query the caller already ended with
-    paging clauses takes another set only from outside, wrapped as
-    ``SELECT * FROM (<cypher>) AS _page``.
+    paging clauses -- ``SKIP``, its GQL spelling ``OFFSET``, or ``LIMIT`` -- takes another set
+    only from outside, wrapped as ``SELECT * FROM (<cypher>) AS _page``.
+
+    Neither shape fits a query that both ends in paging and holds a clause the grammar keeps
+    for the top of a statement, so that is refused here in terms the caller can act on rather
+    than sent to produce a syntax error naming a word they did not write.
 
     Vertex/edge values survive both forms, so the normal parsing still applies.
 
@@ -241,12 +280,24 @@ async def run_paginated_query(
     limit = max(1, int(limit))
     offset = max(0, int(offset))
     inner = query.rstrip().rstrip(";").rstrip()
+    # Located against the statement with its strings and comments blanked, so that a property
+    # named `next` and the word LIMIT inside a quoted value are not read as clauses.
+    blanked = without_literals(inner)
     # limit/offset are validated ints, so inlining them is injection-safe (and both
     # forms accept binds, but the caller's query owns the param namespace).
-    if _TRAILING_PAGING.search(strip_comments_and_strings(inner)):
-        paged = f"SELECT * FROM (\n{inner}\n) AS _page LIMIT {limit + 1} OFFSET {offset}"
-    else:
+    if not _TRAILING_PAGING.search(blanked):
         paged = f"{inner}\nSKIP {offset} LIMIT {limit + 1}"
+    elif (clause := unwrappable_clause(inner)) is not None:
+        raise ValueError(
+            f"this query ends with its own paging clause and also uses {clause}, which the "
+            f"grammar accepts only at the top of a statement. A page can be taken by appending "
+            f"SKIP and LIMIT, which cannot follow the paging already there, or by reading the "
+            f"query as a subquery, which {clause} cannot be part of. Take the page in the query "
+            f"itself -- write the SKIP and LIMIT you want -- and ask for it with limit and "
+            f"offset left alone."
+        )
+    else:
+        paged = f"SELECT * FROM (\n{inner}\n) AS _page LIMIT {limit + 1} OFFSET {offset}"
     rows = await run_query(
         pool, graphname, paged, params, read_only=read_only, timeout=timeout
     )

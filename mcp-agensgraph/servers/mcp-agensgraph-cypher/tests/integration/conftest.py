@@ -7,13 +7,12 @@ import pytest
 import pytest_asyncio
 
 from mcp_agensgraph_cypher.server import (
-    _ensure_helper_functions,
     create_mcp_server,
+    create_pool,
     get_pool_connection,
 )
 from mcp_agensgraph_common.safety import quote_identifiers as _quote_identifiers
 from psycopg.rows import namedtuple_row  # type: ignore
-from psycopg_pool import AsyncConnectionPool, PoolTimeout  # type: ignore
 
 
 async def _wait_for_port_free(port: int, timeout: float = 30.0) -> None:
@@ -97,7 +96,7 @@ async def setup(graphname):
         )
 
     db_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
-    agensgraph_driver = AsyncConnectionPool(db_url, open=False)
+    agensgraph_driver = create_pool(db_url)
 
     await agensgraph_driver.open()
 
@@ -106,10 +105,6 @@ async def setup(graphname):
         async with conn.cursor(row_factory=namedtuple_row) as cursor:
             await cursor.execute(f"CREATE GRAPH IF NOT EXISTS {graphname}")
             await conn.commit()
-
-    # The schema tool's helper is an ordinary function the server installs at startup,
-    # not a built-in.
-    await _ensure_helper_functions(agensgraph_driver, graphname)
 
     yield agensgraph_driver
 

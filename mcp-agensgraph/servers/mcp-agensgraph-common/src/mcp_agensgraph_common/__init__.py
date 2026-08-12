@@ -6,10 +6,11 @@ and the transport bootstrap.
 """
 
 from .results import (
-    EDGE_REGEX,
-    VERTEX_REGEX,
+    OMITTED,
+    as_builtins,
+    count_tokens,
+    fit_rows,
     record_to_dict,
-    truncate_to_tokens,
     value_sanitize,
 )
 from .config import (
@@ -39,12 +40,13 @@ __all__ = [
     "quote_label",
     "is_write_query",
     "strip_comments_and_strings",
-    # results (vertex/edge parsing + shaping)
+    # results (graph value shaping + bounding)
     "record_to_dict",
+    "as_builtins",
     "value_sanitize",
-    "truncate_to_tokens",
-    "VERTEX_REGEX",
-    "EDGE_REGEX",
+    "count_tokens",
+    "fit_rows",
+    "OMITTED",
     # transport
     "run_server",
     "build_middleware",

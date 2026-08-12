@@ -14,7 +14,6 @@ extensions it would like are not part of AgensGraph.
 
 from __future__ import annotations
 
-import json
 import re
 from typing import Any, Dict, List
 
@@ -164,6 +163,21 @@ def _predicates(node: Dict[str, Any]) -> str:
     )
 
 
+def _prefix_properties(predicates: str) -> set[str]:
+    """The properties tested with ``STARTS WITH``, whose only answer is not an index.
+
+    Confirmed against a built index: with ``CREATE PROPERTY INDEX`` in place the same query
+    still plans ``Seq Scan ... Filter: string_starts_with(...)``. So a property that appears
+    only in a prefix test must not also be recommended an index -- the two pieces of advice
+    contradict each other, and the one telling the caller to build an index is the wrong one.
+    """
+    return {
+        name
+        for argument in _STARTS_WITH.findall(predicates)
+        for name in _PROPERTY_REF.findall(argument)
+    }
+
+
 def analyze_plan(
     plan_json: Any,
     label_rows: Dict[str, int],
@@ -183,12 +197,17 @@ def analyze_plan(
         relation = node.get("Relation Name")
         predicates = _predicates(node)
         properties = _PROPERTY_REF.findall(predicates)
+        prefix_only = _prefix_properties(predicates)
 
         if node.get("Node Type") == "Seq Scan" and relation:
             rows = label_rows.get(relation, 0)
             if rows >= min_rows and properties:
                 already = indexed.get(relation, [])
-                missing = [p for p in dict.fromkeys(properties) if p not in already]
+                missing = [
+                    p
+                    for p in dict.fromkeys(properties)
+                    if p not in already and p not in prefix_only
+                ]
                 if missing:
                     findings.append(
                         {
@@ -212,6 +231,7 @@ def analyze_plan(
                 {
                     "kind": "starts_with_not_indexable",
                     "label": relation,
+                    "properties": sorted(prefix_only),
                     "detail": (
                         "STARTS WITH compiles to string_starts_with, which no btree can "
                         "serve, so this reads the whole label however selective the "
@@ -277,10 +297,6 @@ def indexed_properties(rows: List[Dict[str, Any]]) -> Dict[str, List[str]]:
     return out
 
 
-def as_json(payload: Any) -> str:
-    return json.dumps(payload, default=str)
-
-
 def relname_to_label(rows: List[Dict[str, Any]]) -> Dict[str, int]:
     """Row counts keyed by the relation name a plan reports."""
     return {row["relname"]: int(row["approx_rows"] or 0) for row in rows}
@@ -299,7 +315,6 @@ def missing_extension_note(name: str) -> Dict[str, Any]:
 __all__ = [
     "OPTIONAL_EXTENSIONS",
     "analyze_plan",
-    "as_json",
     "existing_indexes_query",
     "explain_statement",
     "extensions_query",

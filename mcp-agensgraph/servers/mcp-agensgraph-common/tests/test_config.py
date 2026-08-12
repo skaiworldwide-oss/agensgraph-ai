@@ -3,6 +3,7 @@ import argparse
 import pytest
 
 from mcp_agensgraph_common.config import (
+    DEFAULT_TOKEN_LIMIT,
     connection_config,
     format_namespace,
     parse_boolean_safely,
@@ -85,9 +86,20 @@ def test_transport_csv_parsing():
 
 
 def test_read_controls_defaults_and_cli():
-    assert read_controls(ns()) == {"read_timeout": 30, "token_limit": None, "read_only": False}
+    assert read_controls(ns()) == {
+        "read_timeout": 30,
+        "token_limit": DEFAULT_TOKEN_LIMIT,
+        "read_only": False,
+    }
     cfg = read_controls(ns(read_timeout=10, token_limit=500, read_only=True))
     assert cfg == {"read_timeout": 10, "token_limit": 500, "read_only": True}
+
+
+def test_read_controls_token_limit_is_bounded_unless_turned_off():
+    """A result is bounded unless a caller asks for it not to be."""
+    assert read_controls(ns())["token_limit"] == DEFAULT_TOKEN_LIMIT
+    assert read_controls(ns(token_limit=0))["token_limit"] is None
+    assert read_controls(ns(token_limit=-1))["token_limit"] is None
 
 
 def test_read_controls_env(monkeypatch):

@@ -109,6 +109,45 @@ class TestKnownAntiPatterns:
         assert "starts_with_not_indexable" in kinds
         assert "AGV2-514" in findings[kinds.index("starts_with_not_indexable")]["suggestion"]
 
+    def test_a_prefix_test_is_not_also_told_to_build_an_index(self):
+        """The two pieces of advice would contradict each other, and one of them is wrong.
+
+        Confirmed against a built index: with ``CREATE PROPERTY INDEX`` in place the same query
+        still plans ``Seq Scan ... Filter: string_starts_with(...)``.
+        """
+        findings = analyze_plan(
+            plan(
+                {
+                    "Node Type": "Seq Scan",
+                    "Relation Name": "item",
+                    "Filter": "string_starts_with(properties.'k'::text, '\"a\"'::jsonb)",
+                }
+            ),
+            {"item": 50000},
+            {},
+        )
+        assert [f["kind"] for f in findings] == ["starts_with_not_indexable"]
+        assert findings[0]["properties"] == ["k"]
+
+    def test_another_property_in_the_same_filter_still_gets_its_index(self):
+        findings = analyze_plan(
+            plan(
+                {
+                    "Node Type": "Seq Scan",
+                    "Relation Name": "item",
+                    "Filter": (
+                        "(string_starts_with(properties.'k'::text, '\"a\"'::jsonb) AND "
+                        "(properties.'y'::text = '2007'::jsonb))"
+                    ),
+                }
+            ),
+            {"item": 50000},
+            {},
+        )
+        by_kind = {f["kind"]: f for f in findings}
+        assert set(by_kind) == {"missing_index", "starts_with_not_indexable"}
+        assert by_kind["missing_index"]["properties"] == ["y"]
+
     def test_a_jsonb_containment_test_is_flagged(self):
         findings = analyze_plan(
             plan(

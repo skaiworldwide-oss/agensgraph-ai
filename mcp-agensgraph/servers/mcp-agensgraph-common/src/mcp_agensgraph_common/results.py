@@ -1,125 +1,140 @@
-"""Parse AgensGraph query results into JSON-friendly Python values.
+"""Turn AgensGraph query results into JSON-friendly Python values.
 
-AgensGraph's graph values come back (via psycopg) as ``vertex`` / ``edge`` typed
-strings:
+The driver decodes a vertex, an edge and a path into types of its own, so a row becomes a
+dict by asking the driver for the JSON shape of each value rather than by matching the text
+the server printed. An edge carries both of its endpoint identities, so an edge read on its
+own reports them: ``MATCH ()-[r]->() RETURN r`` names what is at each end instead of two
+empty maps.
 
-    vertex: ``label[gid]{...json props...}``
-    edge:   ``label[gid][start_gid, end_gid]{...json props...}``
+A list too long to be worth a model's context is replaced by a marker saying how many items
+it held, so a suppressed value cannot be read as an absent one.
 
-plus ordinary scalars. These helpers turn a psycopg ``namedtuple`` row into a plain
-dict, sanitize oversized lists (e.g. embeddings) that waste LLM context, and truncate
-a serialized response to a token budget.
+A response is bounded by whole rows. Rows are measured one at a time and only the ones that
+fit are kept, so what reaches the model is JSON it can parse.
 """
 
 from __future__ import annotations
 
 import json
 import logging
-import re
-from typing import Any, NamedTuple, Optional, Pattern
+from typing import Any, NamedTuple
+
+from agensgraph import to_builtins
 
 logger = logging.getLogger("mcp_agensgraph_common")
 
-VERTEX_REGEX: Pattern = re.compile(r"(\w+)\[(\d+\.\d+)\](\{.*\})")
-EDGE_REGEX: Pattern = re.compile(
-    r"(\w+)\[(\d+\.\d+)\]\[(\d+\.\d+),\s*(\d+\.\d+)\](\{.*\})"
-)
+# Values that are already JSON, checked by exact type so the common case costs one lookup.
+_PLAIN = (str, int, float, bool, type(None))
+
+# What a list dropped for its size leaves behind. A model reading a result has to be able to
+# tell a value that was suppressed from one that was not there.
+OMITTED = "<omitted: list of {count} items>"
 
 
-def _loads(properties: str) -> Any:
-    """json.loads that degrades to the raw string instead of crashing the query."""
+def as_builtins(value: Any) -> Any:
+    """A query value as dicts, lists and scalars, graph values included.
+
+    Containers are walked, because a vertex can arrive inside a list or a map -- ``collect(n)``
+    and ``{a: n}`` both do it -- and the driver's own conversion takes one value at a time.
+    """
+    kind = type(value)
+    if kind in _PLAIN:
+        return value
+    if kind is dict:
+        return {key: as_builtins(item) for key, item in value.items()}
+    if kind is list or kind is tuple:
+        return [as_builtins(item) for item in value]
     try:
-        return json.loads(properties)
-    except (json.JSONDecodeError, TypeError):
-        logger.debug("Could not JSON-decode vertex/edge properties: %.80s", properties)
-        return properties
+        return to_builtins(value)
+    except TypeError:
+        # Not a graph value: a date, a decimal, anything else the server sends. Left as it is
+        # for the serializer to render.
+        return value
 
 
 def record_to_dict(record: NamedTuple) -> dict[str, Any]:
-    """Convert an AgensGraph result row (namedtuple) to a dict.
-
-    Vertices become their property maps; edges become a
-    ``(start_props, type, end_props)`` triple, resolving endpoints against the
-    vertices seen in the same row.
-    """
-    result: dict[str, Any] = {}
-    vertices: dict[str, Any] = {}
-
-    for field_name in record._fields:
-        value = getattr(record, field_name)
-        if isinstance(value, str):
-            vertex_match = VERTEX_REGEX.match(value)
-            if vertex_match:
-                _, vertex_id, properties = vertex_match.groups()
-                vertices[str(vertex_id)] = _loads(properties)
-
-    for field_name in record._fields:
-        value = getattr(record, field_name)
-        if isinstance(value, str):
-            vertex_match = VERTEX_REGEX.match(value)
-            edge_match = EDGE_REGEX.match(value)
-            if vertex_match:
-                result[field_name] = _loads(vertex_match.group(3))
-            elif edge_match:
-                label, _eid, start_id, end_id, _props = edge_match.groups()
-                result[field_name] = (
-                    vertices.get(start_id, {}),
-                    label,
-                    vertices.get(end_id, {}),
-                )
-            else:
-                result[field_name] = value
-        else:
-            result[field_name] = value
-    return result
+    """Convert an AgensGraph result row (namedtuple) to a dict."""
+    return {name: as_builtins(getattr(record, name)) for name in record._fields}
 
 
 def value_sanitize(value: Any, list_limit: int = 128) -> Any:
-    """Drop oversized lists (e.g. embeddings) that bloat LLM context.
+    """Replace lists too long for a model's context with a marker naming their length.
 
-    Adapted from neo4j-graphrag-python's schema sanitizer.
+    An embedding is the case this exists for: a thousand-odd floats cost more context than the
+    whole rest of the answer and say nothing a model can act on. What it must not do is delete
+    the key, which reads exactly like the property not being there -- a model asking for
+    ``n.embedding`` and receiving ``{}`` cannot tell that it asked for something and got it.
     """
     if isinstance(value, dict):
-        out: dict[str, Any] = {}
-        for key, val in value.items():
-            if isinstance(val, dict):
-                sanitized = value_sanitize(val, list_limit)
-                if sanitized is not None:
-                    out[key] = sanitized
-            elif isinstance(val, list):
-                if len(val) < list_limit:
-                    sanitized = value_sanitize(val, list_limit)
-                    if sanitized is not None:
-                        out[key] = sanitized
-                # oversized list: drop the key
-            else:
-                out[key] = val
-        return out
+        return {
+            key: OMITTED.format(count=len(item))
+            if isinstance(item, list) and len(item) >= list_limit
+            else value_sanitize(item, list_limit)
+            for key, item in value.items()
+        }
     if isinstance(value, list):
-        if len(value) < list_limit:
-            return [
-                value_sanitize(item, list_limit)
-                for item in value
-                if value_sanitize(item, list_limit) is not None
-            ]
-        return None
+        if len(value) >= list_limit:
+            return OMITTED.format(count=len(value))
+        return [value_sanitize(item, list_limit) for item in value]
     return value
 
 
-def truncate_to_tokens(text: str, token_limit: int, model: str = "gpt-4o") -> str:
-    """Truncate ``text`` to at most ``token_limit`` tokens for the given model.
+_ENCODINGS: dict[str, Any] = {}
 
-    Falls back to a generic encoding for unknown models so an unusual model name
-    never crashes a response.
+
+def token_encoding(model: str = "gpt-4o") -> Any:
+    """The tokenizer for a model, loaded once per process.
+
+    Loading one is four tenths of a second, which is not a thing to pay per tool call. An
+    unknown model name falls back to a generic encoding rather than failing a response.
     """
-    import tiktoken
+    if model not in _ENCODINGS:
+        import tiktoken
 
-    try:
-        encoding = tiktoken.encoding_for_model(model)
-    except KeyError:
-        encoding = tiktoken.get_encoding("cl100k_base")
+        try:
+            _ENCODINGS[model] = tiktoken.encoding_for_model(model)
+        except KeyError:
+            _ENCODINGS[model] = tiktoken.get_encoding("cl100k_base")
+    return _ENCODINGS[model]
 
-    tokens = encoding.encode(text)
-    if len(tokens) <= token_limit:
-        return text
-    return encoding.decode(tokens[:token_limit])
+
+def count_tokens(text: str, model: str = "gpt-4o") -> int:
+    """How many tokens a string costs the model it is going to."""
+    return len(token_encoding(model).encode(text))
+
+
+def fit_rows(
+    rows: list[Any], token_limit: int, *, reserve: int = 0, model: str = "gpt-4o"
+) -> tuple[list[Any], int]:
+    """The rows that fit a token budget, and how many were left out.
+
+    Whole rows, measured before anything is serialized as one document. Cutting the serialized
+    document instead ends it in the middle of a string or a brace, and a model handed JSON it
+    cannot parse has been given nothing -- it cannot even see which rows it received.
+
+    *reserve* is what the envelope around the rows costs, so the budget the rows are measured
+    against is what is left after it.
+
+    Measuring stops at the first row that does not fit, so the work is bounded by the budget
+    rather than by the size of the result: a thousand rows of abstracts cost a second to
+    measure in full and twenty-five milliseconds to measure as far as a ten-thousand-token cap.
+    """
+    encoding = token_encoding(model)
+    budget = max(0, token_limit - reserve)
+    used = 0
+    for index, row in enumerate(rows):
+        used += len(encoding.encode(json.dumps(row, default=str)))
+        if used > budget:
+            return rows[:index], len(rows) - index
+    return rows, 0
+
+
+__all__ = [
+    "OMITTED",
+    "as_builtins",
+    "count_tokens",
+    "fit_rows",
+    "record_to_dict",
+    "token_encoding",
+    "value_sanitize",
+]

@@ -113,21 +113,14 @@ async def main() -> None:
             conn.execute(f'DROP GRAPH IF EXISTS "{GRAPH}" CASCADE')
 
     async with clients.cypher_client(DB, GRAPH) as cy:
-        # Apply constraints — but SKIP the relationship UNIQUE constraint: a route key
-        # (airline) is unique *within* an endpoint pair, not globally, so asserting
-        # global uniqueness would reject the 2nd route any airline flies. The generated
-        # `CREATE CONSTRAINT` also lacks IF NOT EXISTS, so re-runs are tolerated here.
-        console.sub("applying constraints (skipping the global rel-key UNIQUE — see README)")
-        for stmt in (s.strip() for c in constraints for s in c.split(";")):
-            if not stmt:
-                continue
-            if stmt.upper().startswith("CREATE CONSTRAINT") and "ROUTE" in stmt:
-                console.kv("skipped (global rel-key UNIQUE)", stmt[:50] + " …")
-                continue
-            try:
-                await cy.call_tool("write_agensgraph_cypher", {"query": stmt})
-            except Exception:
-                console.kv("already applied", stmt[:50] + " …")
+        # Each item the generator returns is one whole statement, and it is run as one. It is
+        # a list for exactly this reason: a label may hold whatever a label holds, including
+        # the separator a joined script would be split on, and splitting there hands the tail
+        # of a name to the server as though it were code.
+        console.sub("applying the generated constraints (each item is one statement)")
+        for stmt in constraints:
+            await cy.call_tool("write_agensgraph_cypher", {"query": stmt})
+            console.kv("applied", stmt)
 
         with console.timer("load airports") as t:
             for chunk in _batches(airports, BATCH):

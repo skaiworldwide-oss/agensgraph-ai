@@ -88,23 +88,25 @@ async def main() -> None:
 
         # ---- read-only enforcement ----
         console.section("Read-only enforcement")
-        try:
-            await cy.call_tool("read_agensgraph_cypher",
-                               {"query": 'CREATE (:"Airport" {iata: \'XXX\'})'})
-            console.kv("write via read tool", "ALLOWED (unexpected!)")
-        except Exception as e:
-            console.kv("write via read tool", f"rejected ({type(e).__name__})")
+        with console.expecting_refusal():
+            try:
+                await cy.call_tool("read_agensgraph_cypher",
+                                   {"query": 'CREATE (:"Airport" {iata: \'XXX\'})'})
+                console.kv("write via read tool", "ALLOWED (unexpected!)")
+            except Exception as e:
+                console.kv("write via read tool", f"rejected ({type(e).__name__})")
 
     # ---- knobs: read timeout + token limit (fresh clients) ----
     console.section("Knobs — read_timeout and token_limit")
     async with clients.cypher_client(DB, GRAPH, read_timeout=1) as cy:
-        try:
-            # a deliberately heavy cartesian product to trip the 1s timeout
-            await cy.call_tool("read_agensgraph_cypher",
-                               {"query": 'MATCH (a:"Airport"),(b:"Airport"),(c:"Airport") RETURN count(*) AS n'})
-            console.kv("heavy query @1s timeout", "completed (small graph)")
-        except Exception as e:
-            console.kv("heavy query @1s timeout", f"timed out ({type(e).__name__})")
+        with console.expecting_refusal():
+            try:
+                # a deliberately heavy cartesian product to trip the 1s timeout
+                await cy.call_tool("read_agensgraph_cypher",
+                                   {"query": 'MATCH (a:"Airport"),(b:"Airport"),(c:"Airport") RETURN count(*) AS n'})
+                console.kv("heavy query @1s timeout", "completed (small graph)")
+            except Exception as e:
+                console.kv("heavy query @1s timeout", f"timed out ({type(e).__name__})")
     async with clients.cypher_client(DB, GRAPH, token_limit=40) as cy:
         r = await cy.call_tool("read_agensgraph_cypher",
                                {"query": 'MATCH (a:"Airport") RETURN a.iata AS iata, a.name AS name', "limit": 200})

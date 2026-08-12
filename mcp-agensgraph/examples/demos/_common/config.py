@@ -33,8 +33,31 @@ def dsn(database: str) -> str:
     return build_dsn(f"postgresql://{HOST}:{PORT}", USER, PASSWORD, database)
 
 
+def role_can_run_programs(database: str) -> bool:
+    """Whether the demo's role could run a command on the server's host through ``COPY``.
+
+    A server started as such a role refuses to serve, because a read-only tool would not be a
+    boundary for it -- ``COPY ... TO PROGRAM`` takes rows out rather than putting any in, so a
+    read-only transaction has no write to refuse. The demos connect to a local dev instance as
+    its owner, which is a superuser, so the refusal is the normal case here rather than the
+    exception, and a demo that did not say so simply died on the first real server process.
+    """
+    import psycopg
+
+    with psycopg.connect(dsn(database), autocommit=True) as conn:
+        row = conn.execute(
+            "SELECT rolsuper OR pg_has_role(current_user, 'pg_execute_server_program', "
+            "'member') FROM pg_roles WHERE rolname = current_user"
+        ).fetchone()
+    return bool(row and row[0])
+
+
 def server_env(database: str, graphname: str) -> dict[str, str]:
-    """Env vars to launch an MCP server (stdio/HTTP) against ``database``/``graphname``."""
+    """Env vars to launch an MCP server (stdio/HTTP) against ``database``/``graphname``.
+
+    Accepting the privileged role out loud when the demo holds one, which is what the server
+    asks for. Nothing is loosened for a role that does not hold it.
+    """
     env = {
         "AGENSGRAPH_URL": f"postgresql://{HOST}:{PORT}",
         "AGENSGRAPH_USERNAME": USER,
@@ -42,7 +65,8 @@ def server_env(database: str, graphname: str) -> dict[str, str]:
         "AGENSGRAPH_DATABASE": database,
         "AGENSGRAPH_GRAPHNAME": graphname,
     }
-    return {k: v for k, v in env.items() if v != ""} | {"AGENSGRAPH_PASSWORD": PASSWORD}
+    accepted = {"AGENSGRAPH_ALLOW_SERVER_PROGRAMS": "true"} if role_can_run_programs(database) else {}
+    return {k: v for k, v in env.items() if v != ""} | {"AGENSGRAPH_PASSWORD": PASSWORD} | accepted
 
 
 def ensure_db(database: str) -> None:

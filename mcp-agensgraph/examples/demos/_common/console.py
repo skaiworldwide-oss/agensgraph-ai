@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import logging
 import time
 from contextlib import contextmanager
 from typing import Iterator, Optional, Sequence
+
+# Every server logs a refused tool call at ERROR with its traceback, and so does FastMCP.
+# That is right for a server and wrong for a demo whose whole point is the refusal: the
+# traceback lands ahead of the section that explains it, and in a notebook it lands in a
+# separate stream from the line it belongs to.
+_NOISY = ("fastmcp", "mcp_agensgraph_cypher", "mcp_agensgraph_common", "mcp_agensgraph_memory")
 
 
 def section(title: str) -> None:
@@ -39,6 +46,19 @@ def timer(label: str) -> Iterator[_Timer]:
     finally:
         t.seconds = time.perf_counter() - start
         print(f"  ⏱  {label}: {t.seconds:.2f}s")
+
+
+@contextmanager
+def expecting_refusal() -> Iterator[None]:
+    """Quiet the servers' own logging around a call the demo means to be refused."""
+    raised = [(logging.getLogger(name), logging.getLogger(name).level) for name in _NOISY]
+    for log, _ in raised:
+        log.setLevel(logging.CRITICAL)
+    try:
+        yield
+    finally:
+        for log, level in raised:
+            log.setLevel(level)
 
 
 def table(rows: Sequence[Sequence[object]], headers: Optional[Sequence[str]] = None) -> None:

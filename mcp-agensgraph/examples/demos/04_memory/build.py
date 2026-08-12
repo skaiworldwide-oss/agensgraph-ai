@@ -20,29 +20,10 @@ import sys
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
 from _common import clients, config, console
+from _common.memory_seed import ENTITIES, RELATIONS
 
 DB = os.getenv("MEM_DB", "mcp_memory")
 GRAPH = os.getenv("MEM_GRAPH", "memory")
-
-ENTITIES = [
-    {"name": "Alex Kim", "type": "person",
-     "observations": ["Frequent flyer", "Based in Seoul", "Prefers window seats"]},
-    {"name": "Korean Air", "type": "airline",
-     "observations": ["SkyTeam member", "Hub at Incheon"]},
-    {"name": "Incheon International", "type": "airport",
-     "observations": ["IATA code ICN", "Serves Seoul"]},
-    {"name": "Tokyo Haneda", "type": "airport",
-     "observations": ["IATA code HND"]},
-    {"name": "Tokyo Trip 2026", "type": "trip",
-     "observations": ["Business trip", "Planned for March 2026"]},
-]
-RELATIONS = [
-    {"source": "Alex Kim", "target": "Incheon International", "relationType": "LIVES_NEAR"},
-    {"source": "Alex Kim", "target": "Korean Air", "relationType": "FLIES_WITH"},
-    {"source": "Korean Air", "target": "Incheon International", "relationType": "HUB_AT"},
-    {"source": "Tokyo Trip 2026", "target": "Incheon International", "relationType": "DEPARTS_FROM"},
-    {"source": "Tokyo Trip 2026", "target": "Tokyo Haneda", "relationType": "ARRIVES_AT"},
-]
 
 
 async def main() -> None:
@@ -57,8 +38,11 @@ async def main() -> None:
     async with clients.memory_client(DB, GRAPH) as mem:
         created = clients.data(await mem.call_tool("create_entities", {"entities": ENTITIES}))
         console.kv("entities created", len(created))
+        # create_relations answers `{"created": [...], "skipped": [...]}`, so the count of
+        # relationships is the length of one of those and not of the reply.
         rels = clients.data(await mem.call_tool("create_relations", {"relations": RELATIONS}))
-        console.kv("relations created", len(rels))
+        console.kv("relations created", len(rels["created"]))
+        console.kv("relations skipped", len(rels["skipped"]))
 
         graph = clients.data(await mem.call_tool("read_graph", {}))
         console.kv("memory now", f"{len(graph['entities'])} entities, {len(graph['relations'])} relations")

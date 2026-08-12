@@ -30,9 +30,12 @@ that [01_model_and_load](../01_model_and_load) built (~6k airports / ~67k routes
 ```python
 async with clients.cypher_client("mcp_flights", "flights", read_timeout=1, token_limit=40) as cy:
     await cy.call_tool("get_agensgraph_schema", {})
-    await cy.call_tool("read_agensgraph_cypher", {"query": "...", "limit": 5000, "offset": 10000})
+    await cy.call_tool("read_agensgraph_cypher", {"query": "...", "limit": 1000, "offset": 10000})
 ```
 
 The `limit`/`offset` page through the full edge set; `has_more`/`next_offset` in each
-response tell the client when to stop. The cypher server is read-only here by
-construction (the read tool runs in a `READ ONLY` transaction).
+response tell the client when to stop. `limit` is clamped to the server's maximum — 1000 by
+default, `AGENSGRAPH_MAX_PAGE_SIZE` — and the response echoes the limit that was applied, so
+asking for more than the ceiling is answered rather than refused. The read tool runs in a
+`READ ONLY` transaction whatever the server's mode, so the database refuses a write through
+it even where the write tool is exposed.

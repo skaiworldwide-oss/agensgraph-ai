@@ -29,6 +29,13 @@ DB, GRAPH = "mcp_flights", "flights"
 SERVER = str(pathlib.Path(sys.executable).parent / "mcp-agensgraph-cypher")
 
 
+def _free_port() -> int:
+    """A port the kernel chose, so two demo runs do not fight over one written down here."""
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        return int(taken.getsockname()[1])
+
+
 def _wait_port(host: str, port: int, timeout: float = 15.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -70,6 +77,11 @@ async def main() -> None:
     # ---- real transports: same tools over stdio and Streamable HTTP ----
     console.section("Transport: stdio (spawns the real server process)")
     env = config.server_env(DB, GRAPH)
+    if env.get("AGENSGRAPH_ALLOW_SERVER_PROGRAMS"):
+        console.kv("privileged role accepted",
+                   "this role could run a command on the server's host through COPY, which a "
+                   "read-only transaction does not stop, so the server refuses to start as it "
+                   "unless told to accept it")
     async with clients.stdio_client(SERVER, ["--transport", "stdio"], env) as cy:
         schema = clients.data(await cy.call_tool("get_agensgraph_schema", {}))
         console.kv("stdio get_schema → labels", list(schema))
@@ -78,7 +90,7 @@ async def main() -> None:
         console.kv("stdio read (page)", [r["iata"] for r in page["rows"]])
 
     console.section("Transport: Streamable HTTP (real server on a port, CORS + host middleware)")
-    host, port = "127.0.0.1", 8769
+    host, port = "127.0.0.1", _free_port()
     proc = subprocess.Popen(
         [SERVER, "--transport", "http", "--server-host", host, "--server-port", str(port),
          "--allow-origins", "https://example.com", "--allowed-hosts", "127.0.0.1,localhost"],

@@ -35,23 +35,27 @@ await dm.call_tool("get_mermaid_config_str", {"data_model": DATA_MODEL})
 await dm.call_tool("get_constraints_cypher_queries", {"data_model": DATA_MODEL})
 node_q = await dm.call_tool("get_node_cypher_ingest_query", {"node": AIRPORT})
 
-# cypher server — run the generated ingest Cypher with a JSONB $records batch
+# cypher server — run the generated ingest Cypher with a JSONB records batch
 await cy.call_tool("write_agensgraph_cypher", {"query": node_q, "params": {"records": batch}})
 ```
 
-The generated ingest query is `UNWIND $records ... MERGE ...`, and the records batch is a
-JSON array — exactly what an MCP agent would pass. (This end-to-end path needed a fix in
-the cypher server so list/dict params are bound as JSONB; see the findings log.)
+The generated ingest query is `UNWIND %(records)s ... MERGE ...`, and the records batch is a
+JSON array — exactly what an MCP agent would pass. The placeholder is the database driver's
+`%(name)s`, not `$name`: `$records` is not rewritten by anything and reaches the server as a
+syntax error. A list bound this way arrives as JSONB, which is what `UNWIND` expects.
 
 ## Notes
 
-- **Relationship key constraint is skipped on purpose.** `get_constraints_cypher_queries`
-  emits `CREATE CONSTRAINT ... ON "ROUTE" ASSERT airline IS UNIQUE` for the relationship's
-  key property — but a route's `airline` is unique *within* an endpoint pair, not globally
-  (an airline flies many routes). Applying it would reject the second route any airline
-  flies, so the demo keeps the `VLABEL`/`ELABEL` creates + the **Airport** key constraint
-  and skips the relationship one.
-- **Throughput** (local AgensGraph): ~6k airports + ~67k routes load in ~3s through the
-  MCP write tool (batched `UNWIND`, ~25k rows/s) — wall-clock is the DB, not the protocol.
-- Re-running is safe: `FLIGHTS_RESET=1` drops the graph first; constraint re-creation is
-  tolerated.
+- **Each generated statement is run whole.** `get_constraints_cypher_queries` answers with a
+  list, one statement per item, and the demo runs each item as it stands. It does not join
+  them and split the result: a label may hold whatever a label holds, including the separator
+  it would be split on, and splitting there hands the tail of a name to the server as code.
+- **No uniqueness is asserted on the relationship.** A route's `airline` is unique *within* an
+  endpoint pair, not globally — an airline flies many routes — so the generator emits the
+  label declaration alone for it, and the ingest merges on the endpoints *and* the key. The
+  **Airport** key does get a unique property index.
+- **Throughput** (local AgensGraph, 6,072 airports + 66,934 routes through the MCP write tool,
+  batched `UNWIND`): 0.48 s for the airports and 3.95 s for the routes, 4.43 s in all, about
+  16,500 rows/s. Wall-clock is the database, not the protocol.
+- Re-running is safe: every generated statement carries `IF NOT EXISTS`, and
+  `FLIGHTS_RESET=1` drops the graph first for a clean rebuild.

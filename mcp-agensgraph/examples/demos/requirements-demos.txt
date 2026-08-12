@@ -1,18 +1,35 @@
 # Demo extras. The three MCP servers (+ shared core) are installed editable from
-# ../../servers/* and bring fastmcp + psycopg + pydantic with them. Set up the venv:
+# ../../servers/*, and the driver from beside this repository. Set up the venv:
 #
 #   cd mcp-agensgraph/examples/demos
 #   uv venv .venv
 #   uv pip install --python .venv/bin/python \
+#       -e ../../../../agensgraph-python \
 #       -e ../../servers/mcp-agensgraph-common \
 #       -e ../../servers/mcp-agensgraph-cypher \
 #       -e ../../servers/mcp-agensgraph-memory \
 #       -e ../../servers/mcp-agensgraph-data-modeling \
 #       -r requirements-demos.txt
 #
+# Then register the kernel the notebooks name, or none of them will execute:
+#
+#   .venv/bin/python -m ipykernel install --user \
+#       --name mcp-agensgraph-demos --display-name mcp-agensgraph-demos
+#
 # (No OpenAI/Anthropic key needed — the MCP servers are pure tools.)
+
+# The servers bring this in themselves, and it is named here anyway. A venv built before the
+# servers moved to FastMCP 3 keeps whatever it resolved -- this venv held 2.14.7 while every
+# server declared >=3.0.0, so everything checked in it was checked against a framework none of
+# them supports. Naming the floor here means `uv pip install -r` upgrades it rather than
+# leaving it.
+fastmcp>=3.0.0,<4.0.0
+
 python-dotenv>=1.0
 tqdm>=4.66
+
+# The notebooks. `nbconvert --execute` is how they are re-run, so their committed output is
+# what this code actually printed rather than what it printed some months ago.
 jupyter>=1.0
 ipykernel>=6.29
 nbconvert>=7.16

@@ -29,8 +29,17 @@ uv pip install --python .venv/bin/python \
 ```
 
 Connection defaults to the local AgensGraph (`127.0.0.1:55432`, trust auth); override via
-`AGENS_HOST/PORT/USER/PASSWORD` or a `.env` (copy `.env.example`). Each demo uses its own
-database (`mcp_flights`, `mcp_memory`), so nothing collides with other suites.
+`AGENS_HOST/PORT/USER/PASSWORD` or a `.env` (copy `.env.example`). Demos 01–04 use their own
+databases (`mcp_flights`, `mcp_memory`), so nothing collides with other suites. Demo 05 is the
+exception on purpose: it reads the shared `agensgraph_demos` database, which is what makes it a
+demo of pointing the server at a graph it did not build. It creates nothing there.
+
+To run the notebooks, register the kernel they name:
+
+```bash
+.venv/bin/python -m ipykernel install --user \
+    --name mcp-agensgraph-demos --display-name mcp-agensgraph-demos
+```
 
 ## Quickstart
 
@@ -46,8 +55,8 @@ database (`mcp_flights`, `mcp_memory`), so nothing collides with other suites.
 | [**01_model_and_load**](01_model_and_load) | data-modeling → cypher | design Airports/ROUTEs, generate ingest Cypher, load ~67k OpenFlights routes through the write tool | `build.py` |
 | [**02_cypher_query**](02_cypher_query) | cypher | schema introspection, multi-hop reads, vertex/edge parsing, pagination, read-only, timeout/token-limit | `ask.py` |
 | [**03_cypher_operate**](03_cypher_operate) | cypher | write + stats, read-only mode, namespacing, real **stdio + Streamable HTTP** transports + CORS | `ask.py` |
-| [**04_memory**](04_memory) | memory | entities/relations/observations, search, find-by-name, `read_graph` limit/`truncated`, deletes | `build.py` → `ask.py` |
-| [**05_cypher_scale**](05_cypher_scale) | cypher | read-only schema + aggregations + pagination on a pre-existing ~150k-node graph | `ask.py` |
+| [**04_memory**](04_memory) | memory | entities/relations/observations, search, find-by-name, `read_graph` limit/`truncated`, deletes — and `ask.py` puts back what it forgets, so it runs the same every time | `build.py` → `ask.py` |
+| [**05_cypher_scale**](05_cypher_scale) | cypher | read-only schema, aggregations, plans, index advice, health, top statements and pagination on a pre-existing graph it did not build | `ask.py` |
 
 Each folder has a README and a **pre-executed notebook** (real outputs, no setup needed).
 Track B — [`claude_desktop/`](./claude_desktop) — wires all three servers into Claude

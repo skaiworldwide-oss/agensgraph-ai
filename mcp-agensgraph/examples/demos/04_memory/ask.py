@@ -9,7 +9,8 @@ of the memory MCP server.
     .venv/bin/python 04_memory/build.py    # seed first
     .venv/bin/python 04_memory/ask.py
 
-(ask.py mutates the memory at the end to show deletes — re-run build.py to reset.)
+This ends by forgetting an observation, a relationship and an entity, so it puts the seed
+back before it starts. Run it as many times as you like: every run shows the same thing.
 """
 
 from __future__ import annotations
@@ -21,7 +22,7 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from _common import clients, console
+from _common import clients, console, memory_seed
 
 DB = os.getenv("MEM_DB", "mcp_memory")
 GRAPH = os.getenv("MEM_GRAPH", "memory")
@@ -33,6 +34,12 @@ def _names(graph):
 
 async def main() -> None:
     async with clients.memory_client(DB, GRAPH) as mem:
+        # ---- start from the seed, whatever a previous run left ----
+        console.section("Restoring the seed this demo consumes")
+        await memory_seed.restore(mem)
+        console.kv("restored", "the entity, relationship and observation the deletes below "
+                               "remove, and the fact the demo goes on to learn")
+
         # ---- read the whole memory ----
         console.section("read_graph — the whole memory")
         g = clients.data(await mem.call_tool("read_graph", {}))

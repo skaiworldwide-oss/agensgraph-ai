@@ -39,13 +39,16 @@ def test_process_config_has_all_sections():
         "db_url", "username", "password", "database", "graphname",
         "namespace", "transport", "host", "port", "path",
         "allow_origins", "allowed_hosts",
-        "read_timeout", "token_limit", "read_only",
+        "read_timeout", "token_limit", "read_only", "allow_server_programs",
+        "pool_min_size", "pool_max_size",
     ):
         assert key in cfg, f"missing {key}"
     assert cfg["graphname"] == "agens"  # cypher default
     assert cfg["transport"] == "stdio"
     assert cfg["read_only"] is False
     assert cfg["read_timeout"] == 30
+    # Both ends, because a pool told only its lower bound is that wide at the top as well.
+    assert cfg["pool_max_size"] > cfg["pool_min_size"]
 
 
 def test_process_config_read_only_via_cli():

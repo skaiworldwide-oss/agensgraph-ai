@@ -10,8 +10,22 @@ The MCP server leverages AgensGraph's graph database capabilities to create an i
 
 ### 🕸️ Graph Schema
 
-* `Memory` - A node representing an entity with a name, type, and observations.
-* `Relationship` - A relationship between two entities with a type.
+* `Memory` - a vertex label holding an entity's `name`, `type` and `observations`.
+  A **unique** property index on `name` is what makes an entity's name identify one
+  vertex, so two callers writing the same entity write one.
+* One edge label per relationship type, named by the type upper-cased — `WORKS_AT`,
+  `LIVES_IN`. A type given in any other case names the same relationship. Each label
+  carries a unique index on the pair of ends it joins, so one relationship of a type
+  between two entities is one edge.
+* A GIN index over `to_tsvector('english', ...)` of the name, type and observations,
+  which `search_memories` reads. It is built out of PostgreSQL's own functions; the
+  server installs nothing in the database.
+
+All of these are made at startup and checked afterwards. Starting up over a store
+written before they existed merges entities that share a name (unioning their
+observations and keeping their relationships), moves relationships off a miscased
+type, collapses duplicate relationships onto the one written first, and rebuilds the
+full-text index. What it collapsed is written to the log.
 
 ## 📦 Components
 
@@ -21,67 +35,77 @@ The server offers these core tools:
 
 #### 🔎 Query Tools
 - `read_graph`
-   - Read the knowledge graph
+   - Read a page of the knowledge graph
    - Input:
-     - `limit` (int, optional): max entities to return (default 1000). Relations
-       reference entities by name, so the result stays coherent when capped.
-   - Returns: `{ "entities": [...], "relations": [...], "truncated": bool }`. When
-     `truncated` is true the memory has more — narrow with `search_memories` or raise
-     the limit. (Default cap configurable via `AGENSGRAPH_MEMORY_LIMIT`.)
+     - `limit` (int, optional): max entities to return (default 1000, most 1000)
+   - Returns: `{ "entities": [...], "relations": [...], "truncated": bool }`. The page is
+     the first `limit` entities by name, and the relations are those whose **both** ends
+     are on it — nothing in the result names an entity the result does not contain. When
+     `truncated` is true the memory has more; narrow with `search_memories`. (The default
+     is configurable via `AGENSGRAPH_MEMORY_LIMIT`, up to the same ceiling.)
 
 - `search_memories`
-   - Search for nodes based on a query
+   - Find entities by words in their name, type or observations
    - Input:
-     - `query` (string): Search query matching names, types, observations
-     - `limit` (int, optional): max matching entities to return (default 1000)
+     - `query` (string): words to search for. **Every** word must match — they are joined
+       with AND, not OR — and they are stemmed rather than matched as prefixes, so
+       `engineers` finds `engineering` but `eng` finds neither. A query of only stop words
+       matches nothing. `"*"` asks for everything, which is `read_graph` by another name.
+     - `limit` (int, optional): max matching entities to return (default 1000, most 1000)
    - Returns: matching subgraph as `{ "entities", "relations", "truncated" }`
 
 - `find_memories_by_name`
-   - Find specific nodes by name
+   - Find entities by their exact names, with what they are connected to
    - Input:
-     - `names` (array of strings): Entity names to retrieve
-   - Returns: Subgraph with specified nodes
+     - `names` (array of strings): entity names to retrieve
+     - `limit` (int, optional): max names to look up (default 1000, most 1000)
+   - Returns: the named entities, every relationship touching them in either direction,
+     and the entities at the other end of those relationships
 
 #### ♟️ Entity Management Tools
 - `create_entities`
-   - Create multiple new entities in the knowledge graph
+   - Write entities, merging into any whose name is already in the memory
    - Input:
      - `entities`: Array of objects with:
        - `name` (string): Name of the entity
        - `type` (string): Type of the entity
-       - `observations` (array of strings): Initial observations about the entity
-   - Returns: Created entities
+       - `observations` (array of strings): Observations about the entity
+   - An entity already in the memory **keeps its observations and gains the ones given**;
+     its type is set to the one given.
+   - Returns: the entities as they now stand, read back from the memory
 
 - `delete_entities`
-   - Delete multiple entities and their associated relations
+   - Delete entities and every relationship they take part in
    - Input:
      - `entityNames` (array of strings): Names of entities to delete
-   - Returns: Success confirmation
+   - Returns: `{ "deleted": [...], "notFound": [...], "deletedRelations": int }`
 
 #### 🔗 Relation Management Tools
 - `create_relations`
-   - Create multiple new relations between entities
+   - Write relationships between entities that are already in the memory
    - Input:
      - `relations`: Array of objects with:
        - `source` (string): Name of source entity
        - `target` (string): Name of target entity
-       - `relationType` (string): Type of relation
-   - Returns: Created relations
+       - `relationType` (string): Type of relation, stored upper-cased
+   - A relationship whose source or target is not in the memory is not written.
+   - Returns: `{ "created": [...], "skipped": [...] }`
 
 - `delete_relations`
-   - Delete multiple relations from the graph
+   - Delete relationships, keeping the entities
    - Input:
-     - `relations`: Array of objects with same schema as create_relations
-   - Returns: Success confirmation
+     - `relations`: Array of objects with the same schema as create_relations
+   - Returns: `{ "requested": int, "deletedRelations": int }`
 
 #### 📝 Observation Management Tools
 - `add_observations`
-   - Add new observations to existing entities
+   - Add observations to entities already in the memory
    - Input:
      - `observations`: Array of objects with:
        - `entityName` (string): Entity to add to
-       - `contents` (array of strings): Observations to add
-   - Returns: Added observation details
+       - `observations` (array of strings): Observations to add
+   - An observation the entity already holds is not stored again.
+   - Returns: per entity, `{ "entityName", "addedObservations", "found" }`
 
 - `delete_observations`
    - Delete specific observations from entities
@@ -89,7 +113,7 @@ The server offers these core tools:
      - `deletions`: Array of objects with:
        - `entityName` (string): Entity to delete from
        - `observations` (array of strings): Observations to remove
-   - Returns: Success confirmation
+   - Returns: per entity, `{ "entityName", "deletedObservations", "found" }`
 
 ## 🔧 Usage with Claude Desktop
 
@@ -266,7 +290,8 @@ uv sync
 | `AGENSGRAPH_MCP_SERVER_ALLOW_ORIGINS`   | _(empty - secure by default)_           | Comma-separated list of allowed CORS origins       |
 | `AGENSGRAPH_MCP_SERVER_ALLOWED_HOSTS`   | `localhost,127.0.0.1`                   | Comma-separated list of allowed hosts (DNS rebinding protection) |
 | `AGENSGRAPH_NAMESPACE`                  | _(empty - no prefix)_                   | Namespace prefix for tool names (e.g., `myapp-read_graph`) |
+| `AGENSGRAPH_MEMORY_LIMIT`               | `1000`                                  | Default entities per read, bounded by the same ceiling |
 
 ## 📄 License
 
-This MCP server is licensed under the MIT License. This means you are free to use, modify, and distribute the software, subject to the terms and conditions of the MIT License. For more details, please see the LICENSE file in the project repository.
+This MCP server is licensed under the Apache License 2.0, which is what `LICENSE`, `NOTICE` and the package metadata declare. You are free to use, modify and distribute it subject to that licence; see `LICENSE` for the terms.

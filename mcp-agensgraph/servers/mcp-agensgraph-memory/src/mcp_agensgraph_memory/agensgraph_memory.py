@@ -1,18 +1,95 @@
-import logging
-from typing import Any, Dict, List
+"""The knowledge-graph memory itself: entities, relationships and observations.
 
-from psycopg import AsyncConnection, sql
-from psycopg.rows import namedtuple_row
+Every tool call is one connection out of a pool that is already reading the memory graph, and
+every operation over a batch is one statement rather than one statement per item. Both are
+measured: selecting the graph per statement doubled the round trips, and reading a list into
+Python to filter it and write the whole list back lost seven of eight concurrent deletions.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+import re
+from typing import Any, Dict, Iterable, List, Optional, Sequence
+
+import agensgraph
+from agensgraph import AsyncConnection, AsyncConnectionPool, RetryPolicy, TokenBucket
+from agensgraph.cypher import quote_identifier
 from psycopg.types.json import Jsonb
-from psycopg_pool import AsyncConnectionPool
 from pydantic import BaseModel, Field
 
-from mcp_agensgraph_common.connection import get_pool_connection
-from mcp_agensgraph_common.safety import quote_label
+from .bootstrap import (
+    MEMORY_LABEL,
+    RELATION_VOCABULARY,
+    BootstrapReport,
+    ensure_edge_uniqueness,
+    fulltext_expression,
+)
 
-# Set up logging
 logger = logging.getLogger("mcp_agensgraph_memory")
 logger.setLevel(logging.INFO)
+
+MEMORY = quote_identifier(MEMORY_LABEL)
+
+MAX_LIMIT = 1000
+"""The most entities any read returns.
+
+An unbounded one was measured returning 20,100 entities as 3.8 MB of JSON, which is about a
+million tokens of a caller's context spent on a single call.
+"""
+
+MERGE_ATTEMPTS = 8
+"""How many times a write that only makes what is missing is tried.
+
+A caller that loses the race writes nothing and has to run again, so the number of attempts
+has to cover the number of callers that can be writing the same names at once, not a fixed
+small number: eight callers over twenty-five shared names were measured needing more than
+four.
+"""
+
+MERGE_ALLOWANCE = 2000
+"""The size of this server's retry allowance.
+
+A merge conflict is another caller having succeeded, which is contention rather than a server
+in trouble, and the driver's default allowance is drained by about four of them.
+"""
+
+_RELATION_TYPE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def canonical_relation_type(relation_type: str) -> str:
+    """One spelling of a relationship type, whatever case it was written in.
+
+    A label is quoted, so ``WORKS_AT``, ``Works_At`` and ``works_at`` would otherwise be three
+    labels backed by three tables -- and a delete naming the case the caller did not write
+    matches nothing and reports success. Upper case is the spelling the tools document and the
+    one every example uses.
+    """
+    if not isinstance(relation_type, str) or not _RELATION_TYPE.match(relation_type):
+        raise ValueError(
+            f"a relationship type is a letter or underscore followed by letters, digits and "
+            f"underscores, not {relation_type!r}"
+        )
+    return relation_type.upper()
+
+
+UNTYPED = "unknown"
+"""What an element with no type of its own is read as.
+
+An entity is written with one, but a graph can hold an element that has none -- one written by
+something other than these tools, or one merged out of copies that all lacked it. A read that
+refused such an element would refuse the whole page it is on, so one element with no type would
+be a memory that cannot be read at all.
+"""
+
+
+def _unique(values: Iterable[str]) -> list[str]:
+    """The values, each kept once, in the order they were given."""
+    seen: dict[str, None] = {}
+    for value in values:
+        seen.setdefault(value, None)
+    return list(seen)
 
 
 # Models for our knowledge graph
@@ -68,7 +145,11 @@ class Relation(BaseModel):
         examples=["SKAI Worldwide Inc", "San Francisco"],
     )
     relationType: str = Field(
-        description="Type of relationship between source and target. Use descriptive, uppercase names with underscores.",
+        description=(
+            "Type of relationship between source and target, as letters, digits and "
+            "underscores. It is stored upper-cased, so a type given in any other case names "
+            "the same relationship."
+        ),
         min_length=1,
         examples=["WORKS_AT", "LIVES_IN", "MANAGES", "COLLABORATES_WITH", "LOCATED_IN"],
     )
@@ -134,413 +215,477 @@ class ObservationDeletion(BaseModel):
     )
 
 
+def _entity(row: Sequence[Any]) -> Entity:
+    """An entity out of a name, a type and a list of observations."""
+    return Entity(name=row[0], type=row[1] or UNTYPED, observations=row[2] or [])
+
+
+ENTITIES_BY_NAME = f"""
+    UNWIND %(names)s AS nm
+    MATCH (e:{MEMORY} {{name: nm}})
+    RETURN e.name AS name, e.type AS type, e.observations AS observations
+"""
+
+RELATIONS_WITHIN = f"""
+    UNWIND %(names)s AS nm
+    MATCH (source:{MEMORY} {{name: nm}})-[r]->(target:{MEMORY})
+    WHERE target.name IN %(names)s
+    RETURN source.name AS source, target.name AS target, label(r) AS "relationType"
+"""
+
+RELATIONS_OUT = f"""
+    UNWIND %(names)s AS nm
+    MATCH (source:{MEMORY} {{name: nm}})-[r]->(target:{MEMORY})
+    RETURN source.name AS source, target.name AS target, label(r) AS "relationType",
+           target.name AS other, target.type AS "otherType",
+           target.observations AS "otherObservations"
+"""
+
+RELATIONS_IN = f"""
+    UNWIND %(names)s AS nm
+    MATCH (source:{MEMORY})-[r]->(target:{MEMORY} {{name: nm}})
+    RETURN source.name AS source, target.name AS target, label(r) AS "relationType",
+           source.name AS other, source.type AS "otherType",
+           source.observations AS "otherObservations"
+"""
+
+ADD_OBSERVATIONS = f"""
+    UNWIND %(batch)s AS row
+    MATCH (e:{MEMORY} {{name: row.name}})
+    WITH e, row, [o IN row.observations WHERE NOT o IN coalesce(e.observations, [])] AS added
+    SET e.observations = coalesce(e.observations, []) + added
+    RETURN row.name AS name, added
+"""
+
+DELETE_OBSERVATIONS = f"""
+    UNWIND %(batch)s AS row
+    MATCH (e:{MEMORY} {{name: row.name}})
+    WITH e, row,
+         [o IN coalesce(e.observations, []) WHERE o IN row.observations] AS removed,
+         [o IN coalesce(e.observations, []) WHERE NOT o IN row.observations] AS kept
+    SET e.observations = kept
+    RETURN row.name AS name, removed
+"""
+
+DELETE_ENTITIES = f"""
+    UNWIND %(names)s AS nm
+    MATCH (e:{MEMORY} {{name: nm}})
+    DETACH DELETE e
+"""
+
+
+def _merge_edges(relation_type: str) -> str:
+    """Write the relationships of one type that are not there, and say which ones matched."""
+    return f"""
+        UNWIND %(pairs)s AS p
+        MATCH (s:{MEMORY} {{name: p.source}})
+        MATCH (t:{MEMORY} {{name: p.target}})
+        MERGE (s)-[:{quote_identifier(relation_type)}]->(t)
+        RETURN p.source AS source, p.target AS target
+    """
+
+
+def _delete_edges(relation_type: str) -> str:
+    """Remove the relationships of one type between the pairs given."""
+    return f"""
+        UNWIND %(pairs)s AS p
+        MATCH (s:{MEMORY} {{name: p.source}})-[r:{quote_identifier(relation_type)}]->
+              (t:{MEMORY} {{name: p.target}})
+        DELETE r
+    """
+
+
 class AgensGraphMemory:
-    def __init__(self, connection_pool: AsyncConnectionPool, graphname: str):
+    """The memory, over a pool whose connections already read the memory graph."""
+
+    def __init__(
+        self,
+        connection_pool: AsyncConnectionPool,
+        graphname: str,
+        *,
+        max_limit: int = MAX_LIMIT,
+    ) -> None:
         self.pool = connection_pool
         self.graphname = graphname
+        self.max_limit = max(1, int(max_limit))
+        # An allowance of this server's own, and a large one. The driver's default is shared by
+        # every policy in the process that does not ask for one, is spent by about four
+        # failures, and is refilled a token at a time -- so a server sharing it stops retrying
+        # after the first burst of contention and does not start again. Measured with the
+        # default: eight callers writing twenty-five shared names left three of them raising a
+        # duplicate key for work that had been done.
+        self._allowance = TokenBucket(capacity=MERGE_ALLOWANCE)
+        self._declared = set(RELATION_VOCABULARY)
 
-    async def _execute_cypher(
-        self, conn: AsyncConnection, cypher_query: str, params: dict = None
-    ):
-        """Execute a Cypher query within AgensGraph."""
-        async with conn.cursor(row_factory=namedtuple_row) as cursor:
-            # Set graph path
-            await cursor.execute(
-                sql.SQL("SET graph_path = {}").format(sql.Identifier(self.graphname))
-            )
+    def _page(self, limit: Optional[int]) -> int:
+        """How many entities a read may return, whatever it asked for."""
+        if limit is None:
+            return self.max_limit
+        return max(1, min(int(limit), self.max_limit))
 
-            # Execute the Cypher query
-            if params:
-                await cursor.execute(cypher_query, params)
-            else:
-                await cursor.execute(cypher_query)
+    async def _read(self, statement: str, params: Optional[dict] = None) -> list[Any]:
+        """Run one read and return its rows.
 
-            # Try to fetch results
-            try:
-                results = await cursor.fetchall()
-                return results
-            except Exception:
-                # Query might not return results (INSERT, DELETE, etc.)
-                return []
-
-    async def create_fulltext_index(self):
-        """Create a fulltext search index for entities if it doesn't exist.
-
-        Uses PostgreSQL's text search (tsvector) for fulltext search capabilities.
-        Creates a GIN property index on the tsvector for efficient searching.
-        Also ensures the Memory VLABEL exists.
+        A read ends by rolling back rather than committing: it wrote nothing, and a connection
+        going back to the pool with an open transaction holds a snapshot for whoever borrows it
+        next.
         """
-        try:
-            async with get_pool_connection(self.pool) as conn:
-                async with conn.cursor(row_factory=namedtuple_row) as cursor:
-                    # Set graph path
-                    await cursor.execute(
-                sql.SQL("SET graph_path = {}").format(sql.Identifier(self.graphname))
-            )
+        async with self.pool.connection() as conn:
+            result = await conn.execute_query(statement, params)
+            await conn.rollback()
+            return result.records
 
-                    # Ensure Memory VLABEL exists
-                    await cursor.execute('CREATE VLABEL IF NOT EXISTS "Memory"')
+    async def _write(self, work: Any, *, merging: bool = False) -> Any:
+        """Run a write, and run it again when another writer got there first.
 
-                    # Create GIN property index on tsvector for fulltext search
-                    # This indexes name, type, and all observations combined
-                    await cursor.execute("""
-                        CREATE PROPERTY INDEX IF NOT EXISTS memory_fulltext_idx
-                        ON "Memory"
-                        USING gin
-                        (
-                            (
-                                setweight(to_tsvector('english', coalesce(name, '')), 'A') ||
-                                setweight(to_tsvector('english', coalesce(type, '')), 'B') ||
-                                setweight(to_tsvector('english', coalesce(jsonb_to_string(observations, ' '), '')), 'C')
-                            )
-                        )
-                    """)
+        ``merging`` says the statements only make what is missing, which is what turns a
+        duplicate key or a label another writer created underneath this one from a failure into
+        a reason to look again: eight writers over twenty-five shared names were measured
+        reporting seven failures for work that had in fact been done.
+
+        Re-selecting the graph after the rollback is not optional. Selecting one is a statement
+        inside the transaction, so rolling back returns the session to wherever it was and the
+        next statement fails with no graph path at all.
+        """
+        policy = RetryPolicy(attempts=MERGE_ATTEMPTS if merging else 3, bucket=self._allowance)
+        number = 1
+        async with self.pool.connection() as conn:
+            while True:
+                try:
+                    outcome = await work(conn)
                     await conn.commit()
-            logger.info(
-                "Created Memory VLABEL and fulltext search property index using tsvector"
-            )
-        except Exception as e:
-            # Index might already exist, which is fine
-            logger.debug(f"Fulltext property index creation: {e}")
+                    policy.succeeded()
+                    return outcome
+                except Exception as exc:
+                    await conn.rollback()
+                    await conn.graph(self.graphname)
+                    attempt = policy.decide(exc, number=number, wrote=True, merging=merging)
+                    if not attempt.retry:
+                        raise
+                    logger.info("Retrying a memory write: %s", attempt.reason)
+                    await asyncio.sleep(attempt.delay)
+                    number += 1
 
-    async def load_graph(self, filter_query: str = None, limit: int = None):
-        """Load the knowledge graph from AgensGraph.
+    # -- reads ---------------------------------------------------------------------------
 
-        If ``limit`` is set, at most that many entities are returned (capped at the
-        database with ``LIMIT`` so a large memory can't flood the caller's context);
-        the returned graph's ``truncated`` flag indicates whether more exist.
-        Relations reference entities by name, so the capped graph stays coherent.
+    async def load_graph(
+        self, filter_query: Optional[str] = None, limit: Optional[int] = None
+    ) -> KnowledgeGraph:
+        """A page of the memory: entities, and the relationships between them.
+
+        ``filter_query`` is a full-text search over name, type and observations. Everything is
+        matched, not any -- ``plainto_tsquery`` joins the words with AND -- and the words are
+        stemmed, so ``engineers`` finds ``engineering`` but ``eng`` finds neither. A stop word on
+        its own matches nothing, since the dictionary drops it.
+
+        ``"*"`` asks for everything rather than for a word, and is the same as reading without
+        a search at all.
+
+        The page is the first ``limit`` entities by name, and the relationships returned are
+        those whose **both** ends are on the page. Anything else would name entities the caller
+        was not given: reading with a cap of 100 was measured returning 193 relationships of
+        which 186 pointed outside it.
         """
-        logger.info("Loading knowledge graph from AgensGraph")
+        page = self._page(limit)
+        params: dict[str, Any] = {}
+        condition = ""
+        if filter_query and filter_query != "*":
+            condition = f"WHERE ({fulltext_expression('entity')}) @@ plainto_tsquery('english', %(query)s)"
+            params["query"] = filter_query
+        # One more than the page, so that a full page can be told from a page with more behind
+        # it. The limit is an int this class bounded, so writing it into the statement binds
+        # nothing a caller chose.
+        rows = await self._read(
+            f"""
+            MATCH (entity:{MEMORY})
+            {condition}
+            RETURN entity.name AS name, entity.type AS type,
+                   entity.observations AS observations
+            ORDER BY entity.name LIMIT {page + 1}
+            """,
+            params or None,
+        )
+        truncated = len(rows) > page
+        rows = rows[:page]
+        entities = [_entity(row) for row in rows]
+        names = [entity.name for entity in entities]
+        relations: list[Relation] = []
+        if names:
+            found = await self._read(RELATIONS_WITHIN, {"names": Jsonb(names)})
+            relations = [
+                Relation(source=row[0], target=row[1], relationType=row[2]) for row in found
+            ]
+        logger.info(
+            "Read %d entities and %d relations%s",
+            len(entities),
+            len(relations),
+            " (more remain)" if truncated else "",
+        )
+        return KnowledgeGraph(entities=entities, relations=relations, truncated=truncated)
 
-        async with get_pool_connection(self.pool) as conn:
-            # Build the filter condition using PostgreSQL fulltext search
-            if filter_query and filter_query != "*":
-                # Use tsvector and tsquery for fulltext search
-                # Searches across name, type, and observations with weights
-                filter_condition = """
-                    WHERE (
-                        setweight(to_tsvector('english', coalesce(entity.name, '')), 'A') ||
-                        setweight(to_tsvector('english', coalesce(entity.type, '')), 'B') ||
-                        setweight(to_tsvector('english', coalesce(jsonb_to_string(entity.observations, ' '), '')), 'C')
-                    ) @@ plainto_tsquery('english', %(query)s)
-                """
-                params = {"query": filter_query}
-            else:
-                filter_condition = ""
-                params = {}
+    async def read_graph(self, limit: Optional[int] = None) -> KnowledgeGraph:
+        """A page of the memory, by name."""
+        return await self.load_graph(limit=limit)
 
-            # Fetch one extra row to detect truncation when a limit is applied.
-            # limit is a validated int, so inlining it is injection-safe.
-            limit_clause = ""
-            if limit is not None:
-                limit = max(1, int(limit))
-                limit_clause = f"ORDER BY entity.name LIMIT {limit + 1}"
+    async def search_memories(
+        self, query: str, limit: Optional[int] = None
+    ) -> KnowledgeGraph:
+        """The entities a full-text search matches, and the relationships among them."""
+        logger.info("Searching memories")
+        return await self.load_graph(query, limit=limit)
 
-            entity_query = f"""
-                MATCH (entity:"Memory")
-                {filter_condition}
-                RETURN entity.name AS name, entity.type AS type, entity.observations AS observations
-                {limit_clause}
-            """
-            entities_data = await self._execute_cypher(conn, entity_query, params)
+    async def _entities_named(self, names: Sequence[str]) -> list[Entity]:
+        """The entities with exactly these names, each found through the unique index."""
+        rows = await self._read(ENTITIES_BY_NAME, {"names": Jsonb(list(names))})
+        return [_entity(row) for row in rows]
 
-            truncated = limit is not None and len(entities_data) > limit
-            if truncated:
-                entities_data = entities_data[:limit]
+    async def find_memories_by_name(
+        self, names: List[str], limit: Optional[int] = None
+    ) -> KnowledgeGraph:
+        """The named entities, the ones they are connected to, and the relationships.
 
-            entities = []
-            entity_names = []
-            for record in entities_data:
-                entities.append(
-                    Entity(
-                        name=record.name,
-                        type=record.type,
-                        observations=record.observations or [],
-                    )
+        The connected entities are returned as well as named, so that no relationship points at
+        an entity the caller was not given. Each name is looked up through the unique index
+        rather than by testing a list against every entity: five names cost 5 index probes
+        rather than a scan of the whole label.
+        """
+        wanted = _unique(names)[: self._page(limit)]
+        if not wanted:
+            return KnowledgeGraph()
+        bound = {"names": Jsonb(wanted)}
+        entities = {
+            entity.name: entity for entity in await self._entities_named(wanted)
+        }
+        relations: dict[tuple[str, str, str], Relation] = {}
+        for statement in (RELATIONS_OUT, RELATIONS_IN):
+            for row in await self._read(statement, bound):
+                relations[(row[0], row[1], row[2])] = Relation(
+                    source=row[0], target=row[1], relationType=row[2]
                 )
-                entity_names.append(record.name)
+                if row[3] not in entities:
+                    entities[row[3]] = _entity(row[3:])
+        logger.info("Found %d entities and %d relations", len(entities), len(relations))
+        return KnowledgeGraph(
+            entities=list(entities.values()), relations=list(relations.values())
+        )
 
-            # Query to get all relationships for these entities
-            relations = []
-            if entity_names:
-                rel_query = """
-                    MATCH (source:"Memory")-[r]->(target:"Memory")
-                    WHERE source.name IN %(names)s OR target.name IN %(names)s
-                    RETURN source.name AS source, target.name AS target, label(r) AS "relationType"
-                """
-
-                relations_data = await self._execute_cypher(
-                    conn, rel_query, {"names": Jsonb(entity_names)}
-                )
-
-                for record in relations_data:
-                    relations.append(
-                        Relation(
-                            source=record.source,
-                            target=record.target,
-                            relationType=record.relationType,
-                        )
-                    )
-
-            await conn.commit()
-
-            logger.debug(f"Loaded entities: {entities}")
-            logger.debug(f"Loaded relations: {relations}")
-
-            return KnowledgeGraph(
-                entities=entities, relations=relations, truncated=truncated
-            )
+    # -- writes --------------------------------------------------------------------------
 
     async def create_entities(self, entities: List[Entity]) -> List[Entity]:
-        """Create multiple new entities in the knowledge graph."""
-        logger.info(f"Creating {len(entities)} entities")
+        """Write the entities that are not there and merge into the ones that are.
 
-        async with get_pool_connection(self.pool) as conn:
-            for entity in entities:
-                # Create/update the entity
-                # Note: We store the type as a property, not as a separate label
-                query = """
-                    MERGE (e:"Memory" {name: %(name)s})
-                    SET e.type = %(type)s, e.observations = %(observations)s
-                """
+        An entity already in the memory keeps its observations and gains the ones given, which
+        is what "create" has to mean for a store a model writes to repeatedly: replacing them
+        loses whatever it recorded on an earlier turn.
 
-                await self._execute_cypher(
-                    conn,
-                    query,
-                    {
-                        "name": Jsonb(entity.name),
-                        "type": Jsonb(entity.type),
-                        "observations": Jsonb(entity.observations),
-                    },
+        Returns the entities as they now stand, read back, rather than the request.
+        """
+        wanted = list(entities)
+        if not wanted:
+            return []
+        logger.info("Writing %d entities", len(wanted))
+        rows = [{"name": entity.name, "type": entity.type} for entity in wanted]
+        batch = [
+            {"name": entity.name, "observations": _unique(entity.observations)}
+            for entity in wanted
+        ]
+
+        async def work(conn: AsyncConnection) -> None:
+            # The type is written by the upsert and the observations by the statement after it,
+            # because the upsert would set the property to the list given and the contract is
+            # to add to it.
+            await conn.upsert_vertices(MEMORY_LABEL, "name", rows, on_existing="update")
+            await conn.execute_query(ADD_OBSERVATIONS, {"batch": Jsonb(batch)})
+
+        await self._write(work, merging=True)
+        return await self._entities_named([entity.name for entity in wanted])
+
+    async def create_relations(self, relations: List[Relation]) -> Dict[str, Any]:
+        """Write the relationships whose two entities are both there.
+
+        A relationship whose source or target is missing is not written, and is reported as
+        such: writing one to a graph that held neither end returned the request as though it had
+        been stored.
+
+        Returns ``{"created": [...], "skipped": [...]}``.
+        """
+        wanted = [
+            Relation(
+                source=relation.source,
+                target=relation.target,
+                relationType=canonical_relation_type(relation.relationType),
+            )
+            for relation in relations
+        ]
+        if not wanted:
+            return {"created": [], "skipped": []}
+        logger.info("Writing %d relations", len(wanted))
+        by_type: dict[str, list[dict[str, str]]] = {}
+        for relation in wanted:
+            pairs = by_type.setdefault(relation.relationType, [])
+            pair = {"source": relation.source, "target": relation.target}
+            if pair not in pairs:
+                pairs.append(pair)
+        await self._declare(list(by_type))
+
+        async def work(conn: AsyncConnection) -> set[tuple[str, str, str]]:
+            written: set[tuple[str, str, str]] = set()
+            for relation_type, pairs in by_type.items():
+                result = await conn.execute_query(
+                    _merge_edges(relation_type), {"pairs": Jsonb(pairs)}
                 )
+                written.update((row[0], row[1], relation_type) for row in result.records)
+            return written
 
-            await conn.commit()
+        written = await self._write(work, merging=True)
+        created = [r for r in wanted if (r.source, r.target, r.relationType) in written]
+        skipped = [r for r in wanted if (r.source, r.target, r.relationType) not in written]
+        if skipped:
+            logger.info("%d relations name an entity that is not in the memory", len(skipped))
+        return {"created": created, "skipped": skipped}
 
-        return entities
+    async def _declare(self, relation_types: Sequence[str]) -> None:
+        """Make sure a relationship label exists before a write needs it.
 
-    async def create_relations(self, relations: List[Relation]) -> List[Relation]:
-        """Create multiple new relations between entities."""
-        logger.info(f"Creating {len(relations)} relations")
+        Writing to a label that is not there makes one, which is DDL inside the write's own
+        transaction, and two callers arriving together each see the other's label appear
+        underneath them: eight concurrent writers were measured failing six times with
+        ``42P07`` before the labels were declared. This runs in a transaction of its own, so
+        the write that follows carries no DDL.
+        """
+        missing = [name for name in relation_types if name not in self._declared]
+        if not missing:
+            return
 
-        async with get_pool_connection(self.pool) as conn:
-            for relation in relations:
-                # create the relationship
-                # Relationship types cannot be parameterized in Cypher, so the
-                # (client-supplied) type is validated + identifier-quoted rather
-                # than interpolated raw.
-                rel_type = quote_label(relation.relationType)
-                query = f"""
-                    MATCH (fromNode:"Memory"), (toNode:"Memory")
-                    WHERE fromNode.name = %(source)s AND toNode.name = %(target)s
-                    MERGE (fromNode)-[r:{rel_type}]->(toNode)
-                """
+        async def work(conn: AsyncConnection) -> None:
+            await conn.ensure_labels([agensgraph.DesiredLabel(name, "e") for name in missing])
+            # And the index that keeps one relationship of this type between any two entities,
+            # which a fresh label has nothing to collapse first.
+            await ensure_edge_uniqueness(conn, self.graphname, missing, BootstrapReport())
 
-                await self._execute_cypher(
-                    conn,
-                    query,
-                    {
-                        "source": Jsonb(relation.source),
-                        "target": Jsonb(relation.target),
-                    },
-                )
-
-            await conn.commit()
-
-        return relations
+        # Two callers naming the same new type declare it together, and the one that arrives
+        # second is told the label it was about to make is already there. That is the label
+        # existing, which is what was asked for, so it is run again and finds nothing to do.
+        await self._write(work, merging=True)
+        self._declared.update(missing)
 
     async def add_observations(
         self, observations: List[ObservationAddition]
     ) -> List[Dict[str, Any]]:
-        """Add new observations to existing entities."""
-        logger.info(f"Adding observations to {len(observations)} entities")
+        """Add observations to entities already in the memory, in one statement.
 
-        results = []
-        async with get_pool_connection(self.pool) as conn:
-            for obs in observations:
-                # Get existing observations
-                get_query = """
-                    MATCH (e:"Memory" {name: %(name)s})
-                    RETURN e.observations AS observations
-                """
+        Which of them are new is decided by the server as it writes, not read into Python
+        first: eight callers adding the same observation at once against a list they had each
+        read beforehand stored eight copies of it.
+        """
+        batch = [
+            {"name": item.entityName, "observations": _unique(item.observations)}
+            for item in observations
+        ]
+        if not batch:
+            return []
+        logger.info("Adding observations to %d entities", len(batch))
 
-                existing_data = await self._execute_cypher(
-                    conn, get_query, {"name": Jsonb(obs.entityName)}
+        async def work(conn: AsyncConnection) -> list[Any]:
+            result = await conn.execute_query(ADD_OBSERVATIONS, {"batch": Jsonb(batch)})
+            return result.records
+
+        rows = await self._write(work)
+        added = {row[0]: row[1] for row in rows}
+        return [
+            {
+                "entityName": item["name"],
+                "addedObservations": added.get(item["name"], []),
+                "found": item["name"] in added,
+            }
+            for item in batch
+        ]
+
+    async def delete_observations(
+        self, deletions: List[ObservationDeletion]
+    ) -> List[Dict[str, Any]]:
+        """Remove observations from entities, in one statement.
+
+        The list is filtered where it is stored. Reading it, filtering it in Python and writing
+        the whole list back is a lost update: eight callers each removing a different
+        observation left seven of them in place and told all eight it had worked.
+        """
+        batch = [
+            {"name": item.entityName, "observations": _unique(item.observations)}
+            for item in deletions
+        ]
+        if not batch:
+            return []
+        logger.info("Deleting observations from %d entities", len(batch))
+
+        async def work(conn: AsyncConnection) -> list[Any]:
+            result = await conn.execute_query(DELETE_OBSERVATIONS, {"batch": Jsonb(batch)})
+            return result.records
+
+        rows = await self._write(work)
+        removed = {row[0]: row[1] for row in rows}
+        return [
+            {
+                "entityName": item["name"],
+                "deletedObservations": removed.get(item["name"], []),
+                "found": item["name"] in removed,
+            }
+            for item in batch
+        ]
+
+    async def delete_entities(self, entity_names: List[str]) -> Dict[str, Any]:
+        """Remove entities and everything joined to them, in one statement.
+
+        Returns which names were there and which were not, since a name that is not in the
+        memory is not an error and is not a deletion either.
+        """
+        wanted = _unique(entity_names)
+        if not wanted:
+            return {"deleted": [], "notFound": [], "deletedRelations": 0}
+        logger.info("Deleting %d entities", len(wanted))
+        bound = {"names": Jsonb(wanted)}
+
+        async def work(conn: AsyncConnection) -> tuple[list[str], int]:
+            rows = await conn.execute_query(ENTITIES_BY_NAME, bound)
+            present = [row[0] for row in rows.records]
+            result = await conn.execute_query(DELETE_ENTITIES, bound, counts_=True)
+            return present, result.counts.deleted_edges or 0
+
+        present, edges = await self._write(work)
+        return {
+            "deleted": present,
+            "notFound": [name for name in wanted if name not in set(present)],
+            "deletedRelations": edges,
+        }
+
+    async def delete_relations(self, relations: List[Relation]) -> Dict[str, Any]:
+        """Remove the relationships named, and report how many there were.
+
+        The type is upper-cased first, so a delete written in another case reaches the
+        relationship it names rather than reporting success against a label that does not
+        exist.
+        """
+        by_type: dict[str, list[dict[str, str]]] = {}
+        for relation in relations:
+            relation_type = canonical_relation_type(relation.relationType)
+            pairs = by_type.setdefault(relation_type, [])
+            pair = {"source": relation.source, "target": relation.target}
+            if pair not in pairs:
+                pairs.append(pair)
+        requested = sum(len(pairs) for pairs in by_type.values())
+        if not by_type:
+            return {"requested": 0, "deletedRelations": 0}
+        logger.info("Deleting relations of %d types", len(by_type))
+
+        async def work(conn: AsyncConnection) -> int:
+            deleted = 0
+            for relation_type, pairs in by_type.items():
+                # A pattern naming a label the graph does not have matches nothing and raises
+                # nothing, so a type nobody ever wrote costs one statement and deletes none.
+                result = await conn.execute_query(
+                    _delete_edges(relation_type), {"pairs": Jsonb(pairs)}, counts_=True
                 )
+                deleted += result.counts.deleted_edges or 0
+            return deleted
 
-                if existing_data:
-                    existing_obs = existing_data[0].observations or []
-                    # Filter out observations that already exist
-                    new_obs = [o for o in obs.observations if o not in existing_obs]
-
-                    if new_obs:
-                        # Update with new observations using Cypher list concatenation
-                        update_query = """
-                            MATCH (e:"Memory" {name: %(name)s})
-                            SET e.observations = coalesce(e.observations, []) + %(new_obs)s
-                        """
-
-                        await self._execute_cypher(
-                            conn,
-                            update_query,
-                            {"name": Jsonb(obs.entityName), "new_obs": Jsonb(new_obs)},
-                        )
-
-                        results.append(
-                            {"entityName": obs.entityName, "addedObservations": new_obs}
-                        )
-                    else:
-                        results.append(
-                            {"entityName": obs.entityName, "addedObservations": []}
-                        )
-
-            await conn.commit()
-
-        return results
-
-    async def delete_entities(self, entity_names: List[str]) -> None:
-        """Delete multiple entities and their associated relations."""
-        logger.info(f"Deleting {len(entity_names)} entities")
-
-        async with get_pool_connection(self.pool) as conn:
-            for name in entity_names:
-                query = """
-                    MATCH (e:"Memory" {name: %(name)s})
-                    DETACH DELETE e
-                """
-
-                await self._execute_cypher(conn, query, {"name": Jsonb(name)})
-
-            await conn.commit()
-
-        logger.info(f"Successfully deleted {len(entity_names)} entities")
-
-    async def delete_observations(self, deletions: List[ObservationDeletion]) -> None:
-        """Delete specific observations from entities."""
-        logger.info(f"Deleting observations from {len(deletions)} entities")
-
-        async with get_pool_connection(self.pool) as conn:
-            for deletion in deletions:
-                # Get existing observations
-                get_query = """
-                    MATCH (e:"Memory" {name: %(name)s})
-                    RETURN e.observations AS observations
-                """
-
-                existing_data = await self._execute_cypher(
-                    conn, get_query, {"name": Jsonb(deletion.entityName)}
-                )
-
-                if existing_data:
-                    existing_obs = existing_data[0].observations or []
-                    # Filter out observations to delete
-                    remaining_obs = [
-                        o for o in existing_obs if o not in deletion.observations
-                    ]
-
-                    # Update with remaining observations (no casting needed in Cypher)
-                    update_query = """
-                        MATCH (e:"Memory" {name: %(name)s})
-                        SET e.observations = %(remaining_obs)s
-                    """
-
-                    await self._execute_cypher(
-                        conn,
-                        update_query,
-                        {
-                            "name": Jsonb(deletion.entityName),
-                            "remaining_obs": Jsonb(remaining_obs),
-                        },
-                    )
-
-            await conn.commit()
-
-        logger.info(f"Successfully deleted observations from {len(deletions)} entities")
-
-    async def delete_relations(self, relations: List[Relation]) -> None:
-        """Delete multiple relations from the graph."""
-        logger.info(f"Deleting {len(relations)} relations")
-
-        async with get_pool_connection(self.pool) as conn:
-            for relation in relations:
-                rel_type = quote_label(relation.relationType)
-                query = f"""
-                    MATCH (source:"Memory")-[r:{rel_type}]->(target:"Memory")
-                    WHERE source.name = %(source)s AND target.name = %(target)s
-                    DELETE r
-                """
-
-                await self._execute_cypher(
-                    conn,
-                    query,
-                    {
-                        "source": Jsonb(relation.source),
-                        "target": Jsonb(relation.target),
-                    },
-                )
-
-            await conn.commit()
-
-        logger.info(f"Successfully deleted {len(relations)} relations")
-
-    async def read_graph(self, limit: int = None) -> KnowledgeGraph:
-        """Read the knowledge graph (up to ``limit`` entities)."""
-        return await self.load_graph(limit=limit)
-
-    async def search_memories(self, query: str, limit: int = None) -> KnowledgeGraph:
-        """Search for memories based on a query (up to ``limit`` entities)."""
-        logger.info(f"Searching for memories with query: '{query}'")
-        return await self.load_graph(query, limit=limit)
-
-    async def find_memories_by_name(self, names: List[str]) -> KnowledgeGraph:
-        """Find specific memories by their names."""
-        logger.info(f"Finding {len(names)} memories by name")
-
-        async with get_pool_connection(self.pool) as conn:
-            # Get entities
-            entity_query = """
-                MATCH (e:"Memory")
-                WHERE e.name IN %(names)s
-                RETURN e.name AS name, e.type AS type, e.observations AS observations
-            """
-
-            entities_data = await self._execute_cypher(
-                conn, entity_query, {"names": Jsonb(names)}
-            )
-
-            entities = []
-            for record in entities_data:
-                entities.append(
-                    Entity(
-                        name=record.name,
-                        type=record.type,
-                        observations=record.observations or [],
-                    )
-                )
-
-            # Get relations for found entities
-            relations = []
-            if entities:
-                rel_query = """
-                    MATCH (source:"Memory")-[r]->(target:"Memory")
-                    WHERE source.name IN %(names)s OR target.name IN %(names)s
-                    RETURN source.name AS source, target.name AS target, label(r) AS "relationType"
-                """
-
-                relations_data = await self._execute_cypher(
-                    conn, rel_query, {"names": Jsonb(names)}
-                )
-
-                for record in relations_data:
-                    relations.append(
-                        Relation(
-                            source=record.source,
-                            target=record.target,
-                            relationType=record.relationType,
-                        )
-                    )
-
-            await conn.commit()
-
-        logger.info(f"Found {len(entities)} entities and {len(relations)} relations")
-        return KnowledgeGraph(entities=entities, relations=relations)
+        return {"requested": requested, "deletedRelations": await self._write(work)}

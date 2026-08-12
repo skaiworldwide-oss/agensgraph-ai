@@ -57,7 +57,8 @@ async def test_create_and_read_relations(memory: AgensGraphMemory):
 
     # Create relation in the graph
     created_relations = await memory.create_relations(test_relations)
-    assert len(created_relations) == 1
+    assert len(created_relations["created"]) == 1
+    assert created_relations["skipped"] == []
 
     # Read the graph
     graph: KnowledgeGraph = await memory.read_graph()
@@ -243,7 +244,7 @@ async def test_read_graph_limit_and_truncation(memory: AgensGraphMemory):
     assert len(capped.entities) == 2
     assert capped.truncated is True
 
-    full = await memory.read_graph()  # class default is unbounded
+    full = await memory.read_graph()  # the class default is its cap
     assert len(full.entities) == 4
     assert full.truncated is False
     assert any(r.relationType == "LINKS" for r in full.relations)

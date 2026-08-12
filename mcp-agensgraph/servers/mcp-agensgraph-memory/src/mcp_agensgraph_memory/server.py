@@ -7,25 +7,21 @@ from fastmcp.exceptions import ToolError
 from fastmcp.server import FastMCP
 from fastmcp.tools.tool import ToolResult
 from mcp.types import TextContent, ToolAnnotations
-from psycopg import sql
 from pydantic import Field
 
-from mcp_agensgraph_common.connection import (
-    build_dsn,
-    create_pool,
-    ensure_graph,
-    get_pool_connection,
-)
 from mcp_agensgraph_common.config import format_namespace
+from mcp_agensgraph_common.connection import build_dsn
 from mcp_agensgraph_common.transport import run_server
 
 from .agensgraph_memory import (
+    MAX_LIMIT,
     AgensGraphMemory,
     Entity,
     ObservationAddition,
     ObservationDeletion,
     Relation,
 )
+from .bootstrap import bootstrap, ensure_graph, make_pool
 
 # Set up logging
 logger = logging.getLogger("mcp_agensgraph_memory")
@@ -33,26 +29,43 @@ logger.setLevel(logging.INFO)
 
 # Default cap on entities returned by read_graph / search_memories, so a memory that
 # has grown large can't flood the caller's context. Overridable via
-# AGENSGRAPH_MEMORY_LIMIT; the response's `truncated` flag signals when it bit.
+# AGENSGRAPH_MEMORY_LIMIT up to MAX_LIMIT; the response's `truncated` flag signals when it bit.
 DEFAULT_MEMORY_LIMIT = 1000
 
-jsonb_to_string = r"""
-    CREATE OR REPLACE FUNCTION jsonb_to_string(j jsonb, sep text DEFAULT ', ')
-    RETURNS text AS $$
-    SELECT                           
-    CASE                   
-        WHEN jsonb_typeof(j) = 'array' THEN (
-        SELECT string_agg(value::text, sep)
-        FROM jsonb_array_elements_text(j)
-        )                                                                                                                   
-        WHEN jsonb_typeof(j) = 'object' THEN (
-        SELECT string_agg(key || '=' || value, sep)
-        FROM jsonb_each_text(j)
-        )
-        ELSE j::text
-    END;
-    $$ LANGUAGE sql IMMUTABLE
-"""
+
+def memory_limit_from_env(default: int = DEFAULT_MEMORY_LIMIT) -> int:
+    """The configured page size, bounded, and unaffected by a value that is not a number."""
+    given = os.getenv("AGENSGRAPH_MEMORY_LIMIT")
+    if given is None:
+        return default
+    try:
+        return max(1, min(int(given), MAX_LIMIT))
+    except ValueError:
+        logger.warning("AGENSGRAPH_MEMORY_LIMIT is not a number; using %d", default)
+        return default
+
+
+def tool_error(doing: str, exc: Exception) -> ToolError:
+    """What a caller is told when something failed, and what the log is told.
+
+    A database failure's own message is not passed on. PostgreSQL puts row data in a failure's
+    DETAIL -- a uniqueness failure names the value, a type failure quotes the parameter -- and
+    a tool result goes to a model and from there wherever the conversation goes. The SQLSTATE
+    is passed on, because it says what kind of failure it was and carries nothing else.
+
+    The log gets everything, including the DETAIL the driver keeps off the message.
+    """
+    if isinstance(exc, ValueError):
+        # This server's own reading of the request. Saying what was wrong with it is how the
+        # caller writes a call that works.
+        logger.info("Refused a %s request: %s", doing, exc)
+        return ToolError(f"{doing}: {exc}")
+    detail = getattr(getattr(exc, "diag", None), "message_detail", None)
+    logger.error("Error while %s: %s%s", doing, exc, f" DETAIL: {detail}" if detail else "")
+    sqlstate = getattr(exc, "sqlstate", None)
+    if sqlstate:
+        return ToolError(f"{doing} failed on the database (SQLSTATE {sqlstate}).")
+    return ToolError(f"{doing} failed. The server log has the detail.")
 
 
 def create_mcp_server(
@@ -64,7 +77,7 @@ def create_mcp_server(
 
     namespace_prefix = format_namespace(namespace)
     mcp: FastMCP = FastMCP("mcp-agensgraph-memory")
-    default_limit = max(1, int(memory_limit))
+    default_limit = max(1, min(int(memory_limit), MAX_LIMIT))
 
     @mcp.tool(
         name=namespace_prefix + "read_graph",
@@ -80,18 +93,19 @@ def create_mcp_server(
         limit: int = Field(
             default_limit,
             ge=1,
+            le=MAX_LIMIT,
             description=(
-                f"Max entities to return (default {default_limit}). If the memory has "
-                "more, the response's `truncated` flag is set — narrow with "
-                "search_memories. Relations reference entities by name, so the result "
-                "stays coherent even when capped."
+                f"Max entities to return (default {default_limit}, most {MAX_LIMIT}). If "
+                "the memory has more, the response's `truncated` flag is set — narrow with "
+                "search_memories."
             ),
         ),
     ) -> ToolResult:
-        """Read the knowledge graph (entities + relationships) from memory.
+        """Read a page of the knowledge graph (entities + relationships) from memory.
 
-        Returns up to `limit` entities and the relationships touching them. Use this
-        for an overview; for a large memory, prefer search_memories to narrow.
+        Returns the first `limit` entities by name, and the relationships whose **both** ends
+        are among them — so no relationship names an entity that is not in the response. Use
+        this for an overview; for a large memory, prefer search_memories to narrow.
 
         Returns:
             KnowledgeGraph: { "entities": [...], "relations": [...], "truncated": bool }
@@ -110,14 +124,13 @@ def create_mcp_server(
         """
         logger.info("MCP tool: read_graph")
         try:
-            result = await memory.read_graph(limit=max(1, int(limit)))
+            result = await memory.read_graph(limit=limit)
             return ToolResult(
                 content=[TextContent(type="text", text=result.model_dump_json())],
                 structured_content=result,
             )
         except Exception as e:
-            logger.error(f"Error reading full knowledge graph: {e}")
-            raise ToolError(f"Error reading full knowledge graph: {e}")
+            raise tool_error("reading the knowledge graph", e) from e
 
     @mcp.tool(
         name=namespace_prefix + "create_entities",
@@ -135,14 +148,14 @@ def create_mcp_server(
             description="List of entities to create with name, type, and observations",
         ),
     ) -> ToolResult:
-        """Create multiple new entities in the knowledge graph.
+        """Create entities in the knowledge graph, merging into any that already exist.
 
-        Creates new memory entities with their associated observations. If an entity with the same name
-        already exists, this operation will merge the observations with existing ones.
-
+        An entity whose name is already in the memory keeps its observations and gains the ones
+        given; its type is set to the one given. Calling this twice with the same entity leaves
+        one entity holding both sets of observations.
 
         Returns:
-            list[Entity]: The created entities with their final state
+            list[Entity]: the entities as they now stand, read back from the memory
 
         Example call:
         {
@@ -173,8 +186,7 @@ def create_mcp_server(
                 structured_content={"result": result},
             )
         except Exception as e:
-            logger.error(f"Error creating entities: {e}")
-            raise ToolError(f"Error creating entities: {e}")
+            raise tool_error("creating entities", e) from e
 
     @mcp.tool(
         name=namespace_prefix + "create_relations",
@@ -191,13 +203,14 @@ def create_mcp_server(
             ..., description="List of relations to create between existing entities"
         ),
     ) -> ToolResult:
-        """Create multiple new relationships between existing entities in the knowledge graph.
+        """Create directed relationships between entities that are already in the memory.
 
-        Creates directed relationships between entities that already exist. Both source and target
-        entities must already be present in the graph. Use descriptive relationship types.
+        A relationship whose source or target is not in the memory is not written and comes
+        back under `skipped`; create the entities first. The type is stored upper-cased, so
+        `works_at` and `WORKS_AT` name the same relationship.
 
         Returns:
-            list[Relation]: The created relationships
+            dict: { "created": [Relation, ...], "skipped": [Relation, ...] }
 
         Example call:
         {
@@ -221,17 +234,15 @@ def create_mcp_server(
                 Relation.model_validate(relation) for relation in relations
             ]
             result = await memory.create_relations(relation_objects)
+            payload = {
+                key: [r.model_dump() for r in value] for key, value in result.items()
+            }
             return ToolResult(
-                content=[
-                    TextContent(
-                        type="text", text=json.dumps([r.model_dump() for r in result])
-                    )
-                ],
-                structured_content={"result": result},
+                content=[TextContent(type="text", text=json.dumps(payload))],
+                structured_content={"result": payload},
             )
         except Exception as e:
-            logger.error(f"Error creating relations: {e}")
-            raise ToolError(f"Error creating relations: {e}")
+            raise tool_error("creating relations", e) from e
 
     @mcp.tool(
         name=namespace_prefix + "add_observations",
@@ -248,13 +259,14 @@ def create_mcp_server(
             ..., description="List of observations to add to existing entities"
         ),
     ) -> ToolResult:
-        """Add new observations/facts to existing entities in the knowledge graph.
+        """Add observations to entities that are already in the knowledge graph.
 
-        Appends new observations to entities that already exist. The entity must be present
-        in the graph before adding observations. Each observation should be a distinct fact.
+        An observation the entity already holds is not stored again, and an entity that is not
+        in the memory comes back with `found` false — create it first. Each observation should
+        be a distinct, standalone fact.
 
         Returns:
-            list[dict]: Details about the added observations including entity name and new facts
+            list[dict]: per entity, { "entityName", "addedObservations", "found" }
 
         Example call:
         {
@@ -281,8 +293,7 @@ def create_mcp_server(
                 structured_content={"result": result},
             )
         except Exception as e:
-            logger.error(f"Error adding observations: {e}")
-            raise ToolError(f"Error adding observations: {e}")
+            raise tool_error("adding observations", e) from e
 
     @mcp.tool(
         name=namespace_prefix + "delete_entities",
@@ -299,13 +310,14 @@ def create_mcp_server(
             ..., description="List of exact entity names to delete permanently"
         ),
     ) -> ToolResult:
-        """Delete entities and all their associated relationships from the knowledge graph.
+        """Delete entities and all their relationships from the knowledge graph.
 
-        Permanently removes entities from the graph along with all relationships they participate in.
-        This is a destructive operation that cannot be undone. Entity names must match exactly.
+        Permanently removes entities along with every relationship they take part in. Entity
+        names must match exactly; a name that is not in the memory comes back under `notFound`
+        rather than being reported as a deletion.
 
         Returns:
-            str: Success confirmation message
+            dict: { "deleted": [...], "notFound": [...], "deletedRelations": int }
 
         Example call:
         {
@@ -316,16 +328,13 @@ def create_mcp_server(
         """
         logger.info(f"MCP tool: delete_entities ({len(entityNames)} entities)")
         try:
-            await memory.delete_entities(entityNames)
+            result = await memory.delete_entities(entityNames)
             return ToolResult(
-                content=[
-                    TextContent(type="text", text="Entities deleted successfully")
-                ],
-                structured_content={"result": "Entities deleted successfully"},
+                content=[TextContent(type="text", text=json.dumps(result))],
+                structured_content={"result": result},
             )
         except Exception as e:
-            logger.error(f"Error deleting entities: {e}")
-            raise ToolError(f"Error deleting entities: {e}")
+            raise tool_error("deleting entities", e) from e
 
     @mcp.tool(
         name=namespace_prefix + "delete_observations",
@@ -342,13 +351,13 @@ def create_mcp_server(
             ..., description="List of specific observations to remove from entities"
         ),
     ) -> ToolResult:
-        """Delete specific observations from existing entities in the knowledge graph.
+        """Delete specific observations from entities in the knowledge graph.
 
-        Removes specific observation texts from entities. The observation text must match exactly
-        what is stored. The entity will remain but the specified observations will be deleted.
+        The observation text must match exactly what is stored. The entity stays; only the
+        observations named are removed, and the ones actually removed come back in the result.
 
         Returns:
-            str: Success confirmation message
+            list[dict]: per entity, { "entityName", "deletedObservations", "found" }
 
         Example call:
         {
@@ -371,16 +380,13 @@ def create_mcp_server(
             deletion_objects = [
                 ObservationDeletion.model_validate(deletion) for deletion in deletions
             ]
-            await memory.delete_observations(deletion_objects)
+            result = await memory.delete_observations(deletion_objects)
             return ToolResult(
-                content=[
-                    TextContent(type="text", text="Observations deleted successfully")
-                ],
-                structured_content={"result": "Observations deleted successfully"},
+                content=[TextContent(type="text", text=json.dumps(result))],
+                structured_content={"result": result},
             )
         except Exception as e:
-            logger.error(f"Error deleting observations: {e}")
-            raise ToolError(f"Error deleting observations: {e}")
+            raise tool_error("deleting observations", e) from e
 
     @mcp.tool(
         name=namespace_prefix + "delete_relations",
@@ -399,12 +405,12 @@ def create_mcp_server(
     ) -> ToolResult:
         """Delete specific relationships between entities in the knowledge graph.
 
-        Removes relationships while keeping the entities themselves. The source, target, and
-        relationship type must match exactly for deletion. This only affects the relationships,
-        not the entities they connect.
+        Removes relationships while keeping the entities. Source and target must match
+        exactly; the type is matched upper-cased, so the case it is written in does not
+        matter. The result says how many relationships were actually removed.
 
         Returns:
-            str: Success confirmation message
+            dict: { "requested": int, "deletedRelations": int }
 
         Example call:
         {
@@ -421,24 +427,19 @@ def create_mcp_server(
                 }
             ]
         }
-
-        Note: All fields (source, target, relationType) must match exactly for deletion.
         """
         logger.info(f"MCP tool: delete_relations ({len(relations)} relations)")
         try:
             relation_objects = [
                 Relation.model_validate(relation) for relation in relations
             ]
-            await memory.delete_relations(relation_objects)
+            result = await memory.delete_relations(relation_objects)
             return ToolResult(
-                content=[
-                    TextContent(type="text", text="Relations deleted successfully")
-                ],
-                structured_content={"result": "Relations deleted successfully"},
+                content=[TextContent(type="text", text=json.dumps(result))],
+                structured_content={"result": result},
             )
         except Exception as e:
-            logger.error(f"Error deleting relations: {e}")
-            raise ToolError(f"Error deleting relations: {e}")
+            raise tool_error("deleting relations", e) from e
 
     @mcp.tool(
         name=namespace_prefix + "search_memories",
@@ -453,21 +454,32 @@ def create_mcp_server(
     async def search_memories(
         query: str = Field(
             ...,
-            description="Search query to find entities by name, type, or observations",
+            description=(
+                "Words to search for across entity names, types and observations. Every word "
+                "must match; the words are stemmed, so 'engineers' matches 'engineering'. "
+                "'*' asks for everything rather than for a word."
+            ),
         ),
         limit: int = Field(
             default_limit,
             ge=1,
+            le=MAX_LIMIT,
             description=(
-                f"Max matching entities to return (default {default_limit}); the "
-                "response's `truncated` flag is set if there are more."
+                f"Max matching entities to return (default {default_limit}, most "
+                f"{MAX_LIMIT}); the response's `truncated` flag is set if there are more."
             ),
         ),
     ) -> ToolResult:
-        """Search for entities in the knowledge graph using text search.
+        """Search the knowledge graph by words in an entity's name, type or observations.
 
-        Searches across entity names, types, and observations.
-        Returns matching entities (up to `limit`) and their connections. Supports partial matches.
+        **Every** word given must match — the words are joined with AND, not OR. They are
+        stemmed rather than matched as prefixes, so "engineers" finds "engineering" but "eng"
+        finds neither, and a query of only stop words ("the", "of") matches nothing because
+        the English dictionary drops them. A query of `"*"` asks for everything, which is
+        read_graph by another name.
+
+        Returns the matching entities, up to `limit`, and the relationships whose both ends
+        are among them.
 
         Returns:
             KnowledgeGraph: { "entities": [...], "relations": [...], "truncated": bool }
@@ -477,18 +489,18 @@ def create_mcp_server(
             "query": "engineer software"
         }
 
-        This searches for entities containing "engineer" or "software" in their name, type, or observations.
+        This finds entities whose name, type or observations contain both "engineer" and
+        "software".
         """
-        logger.info(f"MCP tool: search_memories ('{query}')")
+        logger.info("MCP tool: search_memories")
         try:
-            result = await memory.search_memories(query, limit=max(1, int(limit)))
+            result = await memory.search_memories(query, limit=limit)
             return ToolResult(
                 content=[TextContent(type="text", text=result.model_dump_json())],
                 structured_content=result,
             )
         except Exception as e:
-            logger.error(f"Error searching memories: {e}")
-            raise ToolError(f"Error searching memories: {e}")
+            raise tool_error("searching memories", e) from e
 
     @mcp.tool(
         name=namespace_prefix + "find_memories_by_name",
@@ -504,32 +516,36 @@ def create_mcp_server(
         names: list[str] = Field(
             ..., description="List of exact entity names to retrieve"
         ),
+        limit: int = Field(
+            default_limit,
+            ge=1,
+            le=MAX_LIMIT,
+            description=f"Max names to look up (default {default_limit}, most {MAX_LIMIT}).",
+        ),
     ) -> ToolResult:
-        """Find specific entities by their exact names.
+        """Find entities by their exact names, with what they are connected to.
 
-        Retrieves entities that exactly match the provided names, along with all their
-        relationships and connected entities. Use this when you know the exact entity names.
+        Returns the named entities, every relationship touching them in either direction, and
+        the entities at the other end of those relationships — so nothing in the result points
+        at something the result does not contain. Use this when you know the exact names.
 
         Returns:
-            KnowledgeGraph: Subgraph containing the specified entities and their relationships
+            KnowledgeGraph: the named entities plus their neighbours and relationships
 
         Example call:
         {
             "names": ["Alice Johnson", "Microsoft", "Seattle"]
         }
-
-        This retrieves the entities with exactly those names plus their connections.
         """
         logger.info(f"MCP tool: find_memories_by_name ({len(names)} names)")
         try:
-            result = await memory.find_memories_by_name(names)
+            result = await memory.find_memories_by_name(names, limit=limit)
             return ToolResult(
                 content=[TextContent(type="text", text=result.model_dump_json())],
                 structured_content=result,
             )
         except Exception as e:
-            logger.error(f"Error finding memories by name: {e}")
-            raise ToolError(f"Error finding memories by name: {e}")
+            raise tool_error("finding memories by name", e) from e
 
     return mcp
 
@@ -548,26 +564,23 @@ async def main(
     allow_origins: Optional[List[str]] = None,
     allowed_hosts: Optional[List[str]] = None,
 ) -> None:
-    """Open the pool, bootstrap the graph + helpers, and serve over the chosen transport."""
+    """Open the pool, make what the graph needs, and serve over the chosen transport."""
     logger.info("Starting AgensGraph MCP Memory Server")
 
-    pool = create_pool(build_dsn(db_url, username, password, database))
+    dsn = build_dsn(db_url, username, password, database)
+    await ensure_graph(dsn, graphname)
+    pool = make_pool(dsn, graphname)
     try:
         await pool.open()
+        await pool.wait()
         logger.info("Connection pool opened")
-        await ensure_graph(pool, graphname)
+        # Not best-effort. Without the labels and the unique index, every write makes
+        # duplicates and every search answers from an index that is not there, and a server
+        # that swallowed the failure would report itself healthy while doing both.
+        await bootstrap(pool, graphname)
 
-        # Create the jsonb_to_string helper used by fulltext search (idempotent).
-        async with get_pool_connection(pool) as conn:
-            async with conn.cursor() as cursor:
-                await cursor.execute(jsonb_to_string)
-            await conn.commit()
-
-        memory = AgensGraphMemory(pool, graphname)
-        await memory.create_fulltext_index()
-        logger.info("AgensGraphMemory initialized")
-
-        memory_limit = int(os.getenv("AGENSGRAPH_MEMORY_LIMIT", DEFAULT_MEMORY_LIMIT))
+        memory_limit = memory_limit_from_env()
+        memory = AgensGraphMemory(pool, graphname, max_limit=MAX_LIMIT)
         mcp = create_mcp_server(memory, namespace, memory_limit)
         await run_server(
             mcp,
@@ -582,3 +595,12 @@ async def main(
     finally:
         await pool.close()
         logger.info("Connection pool closed")
+
+
+__all__ = [
+    "AgensGraphMemory",
+    "create_mcp_server",
+    "main",
+    "memory_limit_from_env",
+    "tool_error",
+]

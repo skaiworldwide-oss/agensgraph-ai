@@ -17,10 +17,10 @@ import logging
 import re
 from contextlib import asynccontextmanager
 from typing import Any, Optional
-from urllib.parse import quote, urlparse
 
 import psycopg
 from psycopg import sql
+from psycopg.conninfo import make_conninfo
 from psycopg.rows import namedtuple_row
 from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool, PoolTimeout
@@ -52,13 +52,27 @@ def jsonb_params(params: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
 
 
 def build_dsn(db_url: str, username: str, password: str, database: str) -> str:
-    """Build a PostgreSQL DSN from a base URL plus explicit credentials/database."""
-    parsed = urlparse(db_url)
-    host = parsed.hostname or "localhost"
-    port = parsed.port or 5432
-    user = quote(username or "", safe="")
-    pw = quote(password or "", safe="")
-    return f"postgresql://{user}:{pw}@{host}:{port}/{database}"
+    """Compose a connection string from a base URL plus whichever parts were given.
+
+    Everything the URL carries is kept and everything given separately is layered on top, by
+    psycopg, which quotes each value for the format it is writing. Reading the URL for a host
+    and a port and rebuilding the rest by hand lost and invented settings:
+
+    * ``?sslmode=require`` in the URL was dropped, so a connection asked to be encrypted was
+      made in the clear;
+    * a user and password in the URL were dropped and replaced with empty ones;
+    * a database name is not a place for a query string, but it was pasted in front of one --
+      ``db?host=/tmp`` moved the connection to another host, and ``db?sslmode=disable`` turned
+      encryption off;
+    * a URL with no scheme parsed as nothing at all and became ``localhost:5432``, which is a
+      different server than the one asked for.
+
+    An empty user or password is left out rather than sent as empty. libpq then resolves it the
+    way it resolves everything else -- ``PGUSER``, ``PGPASSWORD``, ``.pgpass``, ``PGSERVICE``,
+    peer authentication -- none of which was reachable while an empty string was always sent.
+    """
+    given = {"dbname": database or None, "user": username or None, "password": password or None}
+    return make_conninfo(db_url, **{k: v for k, v in given.items() if v is not None})
 
 
 def create_pool(dsn: str, **kwargs: Any) -> AsyncConnectionPool:
@@ -86,6 +100,49 @@ async def get_pool_connection(pool: AsyncConnectionPool, timeout: Optional[float
             yield connection
     finally:
         await pool.putconn(connection)
+
+
+SERVER_PROGRAM_QUERY = """
+select rolsuper or pg_has_role(current_user, 'pg_execute_server_program', 'member')
+from pg_roles where rolname = current_user
+"""
+
+
+async def check_role_cannot_run_programs(
+    pool: AsyncConnectionPool, *, allow_server_programs: bool = False
+) -> None:
+    """Refuse to serve as a role that can run a command on the server's host.
+
+    ``COPY ... TO PROGRAM`` does exactly that, and a read-only transaction does not stop it: it
+    takes rows out of the database rather than putting any in, so there is no write for the
+    server to refuse. Reading the statement does not stop it either -- a second statement after
+    a semicolon and a leading comment both get one past, and both were demonstrated. What stops
+    it is not holding the privilege.
+
+    So the role is asked about once, here, at startup, and one that holds it is refused rather
+    than left to find out. A server that advertises a read-only tool while connected as such a
+    role is making a claim it cannot keep. Asked as ``member`` rather than ``usage``, because a
+    membership granted ``WITH INHERIT FALSE`` carries nothing until ``SET ROLE`` names it --
+    and ``SET ROLE`` moves no rows, so a read-only transaction permits it.
+    """
+    if allow_server_programs:
+        logger.warning(
+            "Serving as a role that may run a command on the server's host, because "
+            "--allow-server-programs was given. A read-only tool is not a boundary for it."
+        )
+        return
+    async with get_pool_connection(pool) as conn:
+        async with conn.cursor() as cur:
+            await cur.execute(SERVER_PROGRAM_QUERY)
+            row = await cur.fetchone()
+        await conn.rollback()
+    if row and row[0]:
+        raise RuntimeError(
+            "This role can run a command on the server's host, through COPY ... TO PROGRAM, "
+            "which a read-only transaction does not stop -- so the read tools would not be a "
+            "boundary. Connect as a role that is neither a superuser nor a member of "
+            "pg_execute_server_program, or pass --allow-server-programs to accept it."
+        )
 
 
 async def ensure_graph(pool: AsyncConnectionPool, graphname: str) -> None:
@@ -134,7 +191,15 @@ async def run_query(
                     await cur.execute(query, bound)
                 else:
                     await cur.execute(query)
-                await conn.commit()
+                if read_only:
+                    # Nothing to commit -- the transaction could not write. What it *could* do
+                    # is `SET`, and a committed setting belongs to the session rather than the
+                    # transaction, so on a pooled connection it would be inherited by whoever
+                    # borrows it next. Measured on a pool of one: `SET ROLE`, `SET search_path`
+                    # and `SET work_mem` all reached the following call.
+                    await conn.rollback()
+                else:
+                    await conn.commit()
             except psycopg.Error:
                 await conn.rollback()
                 raise

@@ -1,6 +1,6 @@
 [project]
 name = "mcp-agensgraph-cypher"
-version = "0.2.0"
+version = "0.3.0"
 description = "AgensGraph Cypher MCP server (schema introspection + read/write Cypher tools)."
 readme = "README.md"
 requires-python = ">=3.11,<4.0"

@@ -1195,9 +1195,10 @@ wheels = [
 
 [[package]]
 name = "mcp-agensgraph-common"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "../mcp-agensgraph-common" }
 dependencies = [
+    { name = "agensgraph-python" },
     { name = "fastmcp" },
     { name = "pydantic" },
     { name = "starlette" },
@@ -1206,6 +1207,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "agensgraph-python", editable = "../../../../agensgraph-python" },
     { name = "fastmcp", specifier = ">=3.0.0,<4.0.0" },
     { name = "psycopg", extras = ["binary", "pool"], marker = "extra == 'db'", specifier = ">=3.2.9,<4.0.0" },
     { name = "psycopg-pool", marker = "extra == 'db'", specifier = ">=3.2.6,<4.0.0" },
@@ -1227,7 +1229,7 @@ dev = [
 
 [[package]]
 name = "mcp-agensgraph-data-modeling"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "agensgraph-python" },

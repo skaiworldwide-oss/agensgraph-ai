@@ -1,6 +1,6 @@
 [project]
 name = "mcp-agensgraph-common"
-version = "0.2.0"
+version = "0.3.0"
 description = "Shared core for the AgensGraph MCP servers (config, connection, results, safety, transport)."
 readme = "README.md"
 requires-python = ">=3.11,<4.0"

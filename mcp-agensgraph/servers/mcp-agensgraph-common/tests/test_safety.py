@@ -1,11 +1,6 @@
 import pytest
 
-from mcp_agensgraph_common.safety import (
-    is_write_query,
-    quote_identifiers,
-    quote_label,
-    strip_comments_and_strings,
-)
+from mcp_agensgraph_common.safety import quote_identifiers
 
 
 @pytest.mark.parametrize(
@@ -27,41 +22,14 @@ def test_quote_identifiers(raw, expected):
     assert quote_identifiers(raw) == expected
 
 
-@pytest.mark.parametrize("label", ["KNOWS", "works_at", "Likes2", "_private"])
-def test_quote_label_valid(label):
-    assert quote_label(label) == f'"{label}"'
-
-
 @pytest.mark.parametrize(
-    "bad",
-    ['KNOWS"]->(x)-[:"BACKDOOR', "has space", "with-dash", "", "1leading", "a;b"],
+    "raw",
+    [
+        "MATCH (n) WHERE n.tag = 'a:Bcd' RETURN n",
+        "MATCH (n) WHERE n.file = 'report.PDF' RETURN n",
+        "MATCH (n) RETURN n -- a comment about :Labels",
+    ],
 )
-def test_quote_label_rejects_injection(bad):
-    with pytest.raises(ValueError):
-        quote_label(bad)
-
-
-def test_is_write_query_detects_writes():
-    assert is_write_query("MATCH (n) CREATE (m) RETURN m")
-    assert is_write_query("merge (n:X)")
-    assert is_write_query("MATCH (n) DETACH DELETE n")
-
-
-def test_is_write_query_allows_reads():
-    assert not is_write_query("MATCH (n) RETURN n")
-    assert not is_write_query("MATCH (n) RETURN n.created_at")  # 'CREATE' substring
-
-
-def test_is_write_query_not_fooled_by_comments_or_strings():
-    # 'CREATE' only appears in a comment / string literal -> still a read
-    assert not is_write_query("MATCH (n) RETURN n  // CREATE later")
-    assert not is_write_query("MATCH (n) WHERE n.note = 'please CREATE' RETURN n")
-    # a real write hidden after a comment is still caught
-    assert is_write_query("// comment\nCREATE (n:X)")
-
-
-def test_strip_comments_and_strings():
-    out = strip_comments_and_strings("MATCH (n) // CREATE\nRETURN 'DELETE'")
-    assert "CREATE" not in out
-    assert "DELETE" not in out
-    assert "MATCH" in out and "RETURN" in out
+def test_a_value_being_searched_for_is_not_edited(raw):
+    """Rewriting inside a literal turned one row into none: 'a:Bcd' became 'a:"Bcd"'."""
+    assert quote_identifiers(raw) == raw

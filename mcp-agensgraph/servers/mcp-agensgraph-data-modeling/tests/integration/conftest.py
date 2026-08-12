@@ -16,6 +16,9 @@ RETURNS BOOLEAN AS $$
 DECLARE
     found BOOLEAN;
 BEGIN
+    -- Either mechanism makes a property unique, and which one was used is not the question
+    -- being asked. A constraint is an exclusion constraint; a unique property index is a plain
+    -- unique index over the property expression.
     SELECT EXISTS (
         SELECT 1
         FROM pg_catalog.pg_constraint r
@@ -24,6 +27,18 @@ BEGIN
         WHERE g.graphname = current_setting('graph_path')
         AND r.contype IN ('c', 'x')
         AND pg_catalog.ag_get_graphconstraintdef(r.oid) ILIKE '%(' || key_name || ') IS UNIQUE%'
+    ) OR EXISTS (
+        SELECT 1
+        FROM pg_catalog.pg_index x
+        JOIN pg_catalog.pg_class i ON i.oid = x.indexrelid
+        JOIN pg_catalog.ag_label l ON x.indrelid = l.relid
+        JOIN pg_catalog.ag_graph g ON l.graphid = g.oid
+        WHERE g.graphname = current_setting('graph_path')
+        AND x.indisunique
+        AND i.relkind = 'i'
+        -- PostgreSQL's own printer, which returns a definition for any index. AgensGraph's
+        -- raises on one that is not a property index, and a toast index reaches this.
+        AND pg_catalog.pg_get_indexdef(i.oid) ILIKE '%''' || key_name || '''%'
     ) INTO found;
 
     RETURN found;
@@ -97,11 +112,14 @@ async def db_setup(graphname):
     """Setup AgensGraph connection pool for database tests."""
     db_name = os.getenv("AGENSGRAPH_DB")
     db_user = os.getenv("AGENSGRAPH_USERNAME")
-    db_password = os.getenv("AGENSGRAPH_PASSWORD")
+    db_password = os.getenv("AGENSGRAPH_PASSWORD", "")
     db_host = os.getenv("AGENSGRAPH_HOST", "localhost")
     db_port = os.getenv("AGENSGRAPH_PORT", "5432")
 
-    if not db_name or not db_user or not db_password:
+    # A password is not required to reach a server: trust and peer authentication have none, and
+    # a local one usually does. Requiring one here is what kept these tests from ever running --
+    # they are the only ones that execute the generated Cypher, which is the thing worth checking.
+    if not db_name or not db_user:
         pytest.skip(
             "Database integration tests skipped: AGENSGRAPH_DB, AGENSGRAPH_USERNAME, "
             "and AGENSGRAPH_PASSWORD environment variables must be set."

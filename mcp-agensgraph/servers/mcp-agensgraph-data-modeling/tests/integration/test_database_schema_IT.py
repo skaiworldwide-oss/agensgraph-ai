@@ -12,7 +12,6 @@ from mcp_agensgraph_data_modeling.data_model import (
     Property,
     Relationship,
 )
-from mcp_agensgraph_data_modeling.utils import _quote_identifiers
 
 
 @pytest.mark.asyncio
@@ -35,11 +34,12 @@ class TestConstraintCreation:
         )
 
         # Get the constraint query
-        constraint_query = node.get_cypher_constraint_query()
-        print(f"\nConstraint Query: {constraint_query}")
+        constraint_statements = node.get_cypher_constraint_statements()
+        print(f"\nConstraint statements: {constraint_statements}")
 
         # Execute the constraint creation
-        await cursor.execute(constraint_query)
+        for statement in constraint_statements:
+            await cursor.execute(statement)
         await conn.commit()
 
         # Verify constraint was created using the helper function
@@ -61,17 +61,22 @@ class TestConstraintCreation:
         )
 
         # Get the constraint query
-        constraint_query = relationship.get_cypher_constraint_query()
-        print(f"\nRelationship Constraint Query: {constraint_query}")
+        constraint_statements = relationship.get_cypher_constraint_statements()
+        print(f"\nRelationship constraint statements: {constraint_statements}")
 
         # Execute the constraint creation
-        await cursor.execute(constraint_query)
+        for statement in constraint_statements:
+            await cursor.execute(statement)
         await conn.commit()
 
-        # Verify constraint was created
+        # The label is declared, so a write does not have to make it -- but no uniqueness is
+        # asserted. A relationship key identifies one relationship between one pair of
+        # endpoints, which the ingest merges on; asserting it across the whole label makes the
+        # ingest fail on the second relationship that reuses a key between another pair.
+        assert constraint_statements == ['create elabel if not exists "WORKS_AT"']
         await cursor.execute("SELECT property_has_unique_constraint('employmentId')")
         result = await cursor.fetchone()
-        assert result[0] is True, "Relationship constraint should be created"
+        assert result[0] is False, "a relationship key is not unique across the label"
 
     async def test_constraint_prevents_duplicates(self, db_connection, graphname):
         """Test that UNIQUE constraint prevents duplicate values."""
@@ -80,21 +85,22 @@ class TestConstraintCreation:
         # Create node with constraint
         node = Node(label="User", key_property=Property(name="userId", type="STRING"))
 
-        constraint_query = node.get_cypher_constraint_query()
-        await cursor.execute(constraint_query)
+        constraint_statements = node.get_cypher_constraint_statements()
+        for statement in constraint_statements:
+            await cursor.execute(statement)
         await conn.commit()
 
         # Create first node
-        create_query1 = _quote_identifiers("""
-            CREATE (u: User {userId: 'user123', name: 'Alice'})
-        """)
+        create_query1 = """
+            CREATE (u: "User" {"userId": 'user123', name: 'Alice'})
+        """
         await cursor.execute(create_query1)
         await conn.commit()
 
         # Try to create duplicate - should fail
-        create_query2 = _quote_identifiers("""
-            CREATE (u: User {userId: 'user123', name: 'Bob'})
-        """)
+        create_query2 = """
+            CREATE (u: "User" {"userId": 'user123', name: 'Bob'})
+        """
 
         with pytest.raises(Exception) as exc_info:
             await cursor.execute(create_query2)
@@ -138,10 +144,10 @@ class TestNodeIngestion:
         await conn.commit()
 
         # Verify node was created
-        verify_query = _quote_identifiers("""
-            MATCH (p: Product {productId: 'prod-001'})
+        verify_query = """
+            MATCH (p: "Product" {"productId": 'prod-001'})
             RETURN p.name, p.price
-        """)
+        """
         await cursor.execute(verify_query)
         result = await cursor.fetchone()
 
@@ -176,10 +182,10 @@ class TestNodeIngestion:
         await conn.commit()
 
         # Verify all nodes were created
-        verify_query = _quote_identifiers("""
-            MATCH (e: Employee)
+        verify_query = """
+            MATCH (e: "Employee")
             RETURN count(e)
-        """)
+        """
         await cursor.execute(verify_query)
         result = await cursor.fetchone()
 
@@ -219,10 +225,10 @@ class TestNodeIngestion:
         await conn.commit()
 
         # Verify node was updated
-        verify_query = _quote_identifiers("""
-            MATCH (c: Customer {customerId: 'cust-001'})
+        verify_query = """
+            MATCH (c: "Customer" {"customerId": 'cust-001'})
             RETURN c.status
-        """)
+        """
         await cursor.execute(verify_query)
         result = await cursor.fetchone()
 
@@ -239,11 +245,11 @@ class TestRelationshipIngestion:
         conn, cursor = db_connection
 
         # First, create nodes
-        create_nodes = _quote_identifiers("""
-            CREATE (p1: Person {personId: 'p1', name: 'Alice'}),
-                   (p2: Person {personId: 'p2', name: 'Bob'}),
-                   (c: Company {companyId: 'c1', name: 'TechCorp'})
-        """)
+        create_nodes = """
+            CREATE (p1: "Person" {"personId": 'p1', name: 'Alice'}),
+                   (p2: "Person" {"personId": 'p2', name: 'Bob'}),
+                   (c: "Company" {"companyId": 'c1', name: 'TechCorp'})
+        """
         await cursor.execute(create_nodes)
         await conn.commit()
 
@@ -273,10 +279,10 @@ class TestRelationshipIngestion:
         await conn.commit()
 
         # Verify relationships were created
-        verify_query = _quote_identifiers("""
-            MATCH (p: Person)-[r: WORKS_AT]->(c: Company)
+        verify_query = """
+            MATCH (p: "Person")-[r: "WORKS_AT"]->(c: "Company")
             RETURN count(r)
-        """)
+        """
         await cursor.execute(verify_query)
         result = await cursor.fetchone()
 
@@ -289,10 +295,10 @@ class TestRelationshipIngestion:
         conn, cursor = db_connection
 
         # Create nodes
-        create_nodes = _quote_identifiers("""
-            CREATE (a: Account {accountId: 'a1'}),
-                   (t: Transaction {transactionId: 't1'})
-        """)
+        create_nodes = """
+            CREATE (a: "Account" {"accountId": 'a1'}),
+                   (t: "Transaction" {"transactionId": 't1'})
+        """
         print(f"\nCreate Nodes Query: {create_nodes}")
         await cursor.execute(create_nodes)
         await conn.commit()
@@ -325,10 +331,10 @@ class TestRelationshipIngestion:
 
         # Verify relationship with properties — both the key and the extra
         # property must live on the relationship (r), not the end node.
-        verify_query = _quote_identifiers("""
-            MATCH (a: Account)-[r: HAS_TRANSACTION]->(t: Transaction)
-            RETURN r.linkId, r.timestamp
-        """)
+        verify_query = """
+            MATCH (a: "Account")-[r: "HAS_TRANSACTION"]->(t: "Transaction")
+            RETURN r."linkId", r.timestamp
+        """
         print(f"\nVerify Query: {verify_query}")
         await cursor.execute(verify_query)
         result = await cursor.fetchone()
@@ -354,8 +360,9 @@ class TestCaseSensitivity:
         )
 
         # Create constraint
-        constraint_query = node.get_cypher_constraint_query()
-        await cursor.execute(constraint_query)
+        constraint_statements = node.get_cypher_constraint_statements()
+        for statement in constraint_statements:
+            await cursor.execute(statement)
         await conn.commit()
 
         # Ingest data
@@ -365,10 +372,10 @@ class TestCaseSensitivity:
         await conn.commit()
 
         # Query with exact case - should work
-        verify_query = _quote_identifiers("""
-            MATCH (pc: ProductCategory {categoryId: 'cat-001'})
-            RETURN pc.categoryName
-        """)
+        verify_query = """
+            MATCH (pc: "ProductCategory" {"categoryId": 'cat-001'})
+            RETURN pc."categoryName"
+        """
         await cursor.execute(verify_query)
         result = await cursor.fetchone()
 
@@ -450,11 +457,11 @@ class TestCompleteDataModel:
         await conn.commit()
 
         # Step 4: Verify complete graph
-        verify_query = _quote_identifiers("""
-            MATCH (p: Person)-[r: LIVES_IN]->(c: City)
+        verify_query = """
+            MATCH (p: "Person")-[r: "LIVES_IN"]->(c: "City")
             RETURN p.name as person_name, c.name as city_name
             ORDER BY person_name
-        """)
+        """
         await cursor.execute(verify_query)
         results = await cursor.fetchall()
 

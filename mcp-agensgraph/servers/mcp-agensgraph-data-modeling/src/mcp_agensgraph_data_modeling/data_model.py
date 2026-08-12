@@ -4,7 +4,14 @@ from typing import Any
 
 from pydantic import BaseModel, Field, ValidationInfo, field_validator
 
-from .utils import _quote_identifiers
+from agensgraph import (
+    DesiredIndex,
+    Unique,
+    create_index_statement,
+    create_label_statement,
+)
+from agensgraph.cypher import quote_identifier
+from agensgraph.introspect import constraint_name
 
 NODE_COLOR_PALETTE = [
     ("#e3f2fd", "#1976d2"),  # Light Blue / Blue
@@ -212,30 +219,40 @@ class Node(BaseModel):
         Note: For AgensGraph with psycopg, use: cursor.execute(query, {"records": Jsonb(records)})
         where Jsonb is imported from psycopg.types.json
         """
+        label = quote_identifier(self.label)
+        key = quote_identifier(self.key_property.name)
         formatted_props = ", ".join(
-            [f"{p.name}: record.{p.name}" for p in self.properties]
+            f"{quote_identifier(p.name)}: record.{quote_identifier(p.name)}"
+            for p in self.properties
         )
-        query = f"""UNWIND %(records)s as record
-MERGE (n: {self.label} {{{self.key_property.name}: record.{self.key_property.name}}})
+        return f"""UNWIND %(records)s as record
+MERGE (n: {label} {{{key}: record.{key}}})
 SET n += {{{formatted_props}}}"""
-        return _quote_identifiers(query)
 
-    def get_cypher_constraint_query(self) -> str:
+    def get_cypher_constraint_statements(self) -> list[str]:
         """
-        Generate a Cypher query to create a UNIQUE constraint on the node's key property.
-        This enforces uniqueness on the key property of the node using AgensGraph syntax.
-        First creates the VLABEL if it doesn't exist, then creates the constraint.
+        Generate the statements that declare the node's label and make its key unique.
+
+        A list rather than one string, because a caller given statements joined by a separator
+        has to split on it, and a label is allowed to hold whatever a label holds -- including
+        the separator. Splitting there executes a fragment of a name as though it were code.
+
+        A unique property index rather than a constraint, because an index takes
+        ``IF NOT EXISTS`` and a constraint does not -- the grammar has no arm for one, so a
+        constraint script reports that the relation behind its name already exists the second
+        time it is run. Both statements here can be run again.
         """
-        # Create VLABEL first, then constraint
-        vlabel_query = f"CREATE VLABEL IF NOT EXISTS {self.label}"
-        constraint_query = f"CREATE CONSTRAINT {self.label}_constraint ON {self.label} ASSERT {self.key_property.name} IS UNIQUE"
-
-        # Apply identifier quoting to both queries
-        vlabel_query = _quote_identifiers(vlabel_query)
-        constraint_query = _quote_identifiers(constraint_query)
-
-        # Return both queries separated by semicolon
-        return f"{vlabel_query}; {constraint_query}"
+        vlabel = create_label_statement(self.label, "v")
+        index = create_index_statement(
+            DesiredIndex(
+                self.label,
+                (self.key_property.name,),
+                unique=True,
+                name=constraint_name(Unique(self.label, self.key_property.name)),
+            ),
+            if_not_exists=True,
+        )
+        return [vlabel, index]
 
 
 class Relationship(BaseModel):
@@ -372,43 +389,48 @@ class Relationship(BaseModel):
         where Jsonb is imported from psycopg.types.json
         """
         formatted_props = ", ".join(
-            [f"{p.name}: record.{p.name}" for p in self.properties]
+            f"{quote_identifier(p.name)}: record.{quote_identifier(p.name)}"
+            for p in self.properties
         )
         key_prop = (
-            f" {{{self.key_property.name}: record.{self.key_property.name}}}"
+            f" {{{quote_identifier(self.key_property.name)}: "
+            f"record.{quote_identifier(self.key_property.name)}}}"
             if self.key_property
             else ""
         )
 
+        # The two fixed field names of an ingest record. Quoted like any other, because an
+        # unquoted name is lowered by the lexer and a JSON key is not: `record.sourceId` would
+        # look for `sourceid`, find nothing, and the match would silently return no rows.
+        source = quote_identifier("sourceId")
+        target = quote_identifier("targetId")
         query = f"""UNWIND %(records)s as record
-MATCH (startNode: {self.start_node_label} {{{start_node_key_property_name}: record.sourceId}})
-MATCH (endNode: {self.end_node_label} {{{end_node_key_property_name}: record.targetId}})
-MERGE (startNode)-[r:{self.type}{key_prop}]->(endNode)"""
+MATCH (startNode: {quote_identifier(self.start_node_label)} \
+{{{quote_identifier(start_node_key_property_name)}: record.{source}}})
+MATCH (endNode: {quote_identifier(self.end_node_label)} \
+{{{quote_identifier(end_node_key_property_name)}: record.{target}}})
+MERGE (startNode)-[r:{quote_identifier(self.type)}{key_prop}]->(endNode)"""
         if formatted_props:
             # Relationship properties belong on the relationship (r), not the end node.
             query += f"""
 SET r += {{{formatted_props}}}"""
-        return _quote_identifiers(query)
+        return query
 
-    def get_cypher_constraint_query(self) -> str | None:
+    def get_cypher_constraint_statements(self) -> list[str]:
         """
-        Generate a Cypher query to create a UNIQUE constraint on the relationship's key property.
-        This enforces uniqueness on the key property of the relationship using AgensGraph syntax.
-        First creates the ELABEL if it doesn't exist, then creates the constraint.
+        Generate the statement that declares the relationship's label.
+
+        Declaring it matters: a write to a label that does not exist makes one, which puts DDL
+        inside the write's transaction, and two writers arriving together report ``42P07`` from
+        each other's label.
+
+        No uniqueness is asserted, and a key property does not change that. The ingest above
+        merges on the endpoints *and* the key, so what the key identifies is one relationship
+        between one pair -- while a constraint on the property alone would assert it is unique
+        across the whole label, which is a different and stronger claim. Asserting it makes the
+        ingest fail on the second relationship that reuses a key between another pair.
         """
-        if self.key_property:
-            # Create ELABEL first, then constraint
-            elabel_query = f"CREATE ELABEL IF NOT EXISTS {self.type}"
-            constraint_query = f"CREATE CONSTRAINT {self.type}_constraint ON {self.type} ASSERT {self.key_property.name} IS UNIQUE"
-
-            # Apply identifier quoting to both queries
-            elabel_query = _quote_identifiers(elabel_query)
-            constraint_query = _quote_identifiers(constraint_query)
-
-            # Return both queries separated by semicolon
-            return f"{elabel_query}; {constraint_query}"
-        else:
-            return None
+        return [create_label_statement(self.type, "e")]
 
 
 class DataModel(BaseModel):
@@ -610,10 +632,9 @@ class DataModel(BaseModel):
         Generate a list of Cypher queries to create constraints on the data model.
         This creates range indexes on the key properties of the nodes and relationships and enforces uniqueness and existence of the key properties.
         """
-        node_queries = [n.get_cypher_constraint_query() + ";" for n in self.nodes]
-        relationship_queries = [
-            r.get_cypher_constraint_query() + ";"
-            for r in self.relationships
-            if r.key_property is not None
-        ]
-        return node_queries + relationship_queries
+        statements: list[str] = []
+        for node in self.nodes:
+            statements.extend(node.get_cypher_constraint_statements())
+        for relationship in self.relationships:
+            statements.extend(relationship.get_cypher_constraint_statements())
+        return statements

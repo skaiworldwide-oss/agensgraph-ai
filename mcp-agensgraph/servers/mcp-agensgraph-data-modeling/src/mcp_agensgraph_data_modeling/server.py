@@ -232,7 +232,13 @@ def create_mcp_server(namespace: str = "") -> FastMCP:
 
     @mcp.tool(name=namespace_prefix + "get_constraints_cypher_queries")
     def get_constraints_cypher_queries(data_model: DataModel) -> list[str]:
-        "Get the Cypher queries to create constraints on the data model. This creates range indexes on the key properties of the nodes and relationships and enforces uniqueness and existence of the key properties."
+        """Get the statements that declare the data model's labels and make each node key unique.
+
+        Run them one at a time, in the order given: each item is one statement, and none of them
+        is to be split on a semicolon, because a label may hold one. They can all be run again.
+        A relationship gets its label declared but no uniqueness asserted, since a relationship
+        key identifies one relationship between one pair of endpoints rather than one across the
+        whole label."""
         logger.info(
             "Getting the Cypher queries to create constraints on the data model."
         )

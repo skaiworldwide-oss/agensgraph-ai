@@ -564,7 +564,7 @@ def test_relationship_cypher_generation_for_many_records():
         == """UNWIND %(records)s as record
 MATCH (startNode: "Person" {"personId": record."sourceId"})
 MATCH (endNode: "Place" {"placeId": record."targetId"})
-MERGE (startNode)-[r: "KNOWS" {"relId": record."relId"}]->(endNode)
+MERGE (startNode)-[r:"KNOWS" {"relId": record."relId"}]->(endNode)
 SET r += {since: record.since}"""
     )
 
@@ -587,7 +587,7 @@ def test_relationship_cypher_generation_for_many_records_no_key_property():
         == """UNWIND %(records)s as record
 MATCH (startNode: "Person" {"personId": record."sourceId"})
 MATCH (endNode: "Place" {"placeId": record."targetId"})
-MERGE (startNode)-[r: "KNOWS"]->(endNode)
+MERGE (startNode)-[r:"KNOWS"]->(endNode)
 SET r += {since: record.since}"""
     )
 
@@ -608,7 +608,7 @@ def test_relationship_cypher_generation_for_many_records_no_properties():
         == """UNWIND %(records)s as record
 MATCH (startNode: "Person" {"personId": record."sourceId"})
 MATCH (endNode: "Place" {"placeId": record."targetId"})
-MERGE (startNode)-[r: "KNOWS"]->(endNode)"""
+MERGE (startNode)-[r:"KNOWS"]->(endNode)"""
     )
 
 
@@ -638,20 +638,39 @@ def test_get_relationship_cypher_ingest_query_for_many_records(
         == """UNWIND %(records)s as record
 MATCH (startNode: "Person" {id: record."sourceId"})
 MATCH (endNode: "Place" {id: record."targetId"})
-MERGE (startNode)-[r: "LIVES_IN"]->(endNode)"""
+MERGE (startNode)-[r:"LIVES_IN"]->(endNode)"""
     )
 
 
 def test_get_cypher_constraints_query(valid_data_model: DataModel):
-    """Test generating a list of Cypher queries to create constraints on the data model."""
+    """Each item is one statement, so no caller has to split on a separator a label may hold."""
     queries = valid_data_model.get_cypher_constraints_query()
 
-    assert len(queries) == 2
-    assert (
-        queries[0]
-        == 'CREATE VLABEL IF NOT EXISTS "Person"; CREATE CONSTRAINT Person_constraint ON "Person" ASSERT id IS UNIQUE;'
-    )
-    assert (
-        queries[1]
-        == 'CREATE VLABEL IF NOT EXISTS "Place"; CREATE CONSTRAINT Place_constraint ON "Place" ASSERT id IS UNIQUE;'
-    )
+    assert queries == [
+        'create vlabel if not exists "Person"',
+        'create unique property index if not exists "Person_id_unique" on "Person" (id)',
+        'create vlabel if not exists "Place"',
+        'create unique property index if not exists "Place_id_unique" on "Place" (id)',
+        'create elabel if not exists "LIVES_IN"',
+    ]
+
+
+def test_no_statement_holds_a_separator_a_caller_would_split_on(
+    valid_data_model: DataModel,
+) -> None:
+    """The property that makes the list contract worth having."""
+    for statement in valid_data_model.get_cypher_constraints_query():
+        assert ";" not in statement
+
+
+def test_a_relationship_gets_its_label_but_no_uniqueness(
+    valid_data_model: DataModel,
+) -> None:
+    """A relationship key identifies one relationship between one pair, not one per label.
+
+    Asserting it across the label makes the ingest fail on the second relationship that reuses
+    a key between another pair.
+    """
+    statements = valid_data_model.relationships[0].get_cypher_constraint_statements()
+    assert statements == ['create elabel if not exists "LIVES_IN"']
+    assert not any("unique" in statement.lower() for statement in statements)

@@ -1,39 +1,55 @@
-"""Data-modeling utils: the DDL-aware identifier quoter + config composition.
+"""Config composition, and the quoting the generators depend on.
 
-Transport/config parsing is unit-tested in ``mcp-agensgraph-common``; here we keep
-coverage for the locally-retained ``_quote_identifiers`` (which handles
-VLABEL/ELABEL/ON/ASSERT and camelCase) and the thin ``process_config``.
+Quoting is the driver's, applied where a name is placed into a statement. What is asserted here
+is the property the generators rely on: whatever a name holds, it comes out as one identifier,
+so a name can never become a second statement or a second clause.
 """
 
 import argparse
 
 import pytest
+from agensgraph.cypher import quote_identifier
 
-from mcp_agensgraph_data_modeling.utils import _quote_identifiers, process_config
+from mcp_agensgraph_data_modeling.utils import process_config
+
+HOSTILE = [
+    "Zap2; CREATE TEMP TABLE exfil(l text); COPY exfil FROM PROGRAM 'id'; --",
+    "Victim {id: record.id}) DETACH DELETE n WITH record MERGE (n: Pwned",
+    'a"b',
+    "a) ; drop table t; --",
+    "My Label",
+    "2Cool",
+]
+
+
+@pytest.mark.parametrize("name", HOSTILE)
+def test_a_hostile_name_becomes_one_quoted_identifier(name: str) -> None:
+    quoted = quote_identifier(name)
+    assert quoted.startswith('"') and quoted.endswith('"')
+    # Every quote inside is doubled, so none of them closes the identifier early.
+    assert quoted[1:-1].replace('""', "") .count('"') == 0
+
+
+def test_a_null_byte_is_refused_rather_than_quoted() -> None:
+    """The server's lexer stops at one, so the statement would end somewhere unexpected."""
+    with pytest.raises(ValueError, match="null byte"):
+        quote_identifier("a\x00b")
 
 
 @pytest.mark.parametrize(
-    "raw,expected",
+    ("name", "expected"),
     [
-        ("MATCH (p:Person) RETURN p", 'MATCH (p: "Person") RETURN p'),
-        ("RETURN p.FirstName", 'RETURN p."FirstName"'),
-        ("RETURN p.firstName", 'RETURN p."firstName"'),  # camelCase
-        (
-            "CREATE VLABEL IF NOT EXISTS Person",
-            'CREATE VLABEL IF NOT EXISTS "Person"',
-        ),
-        (
-            "CREATE ELABEL IF NOT EXISTS Friend",
-            'CREATE ELABEL IF NOT EXISTS "Friend"',
-        ),
-        (
-            "CREATE CONSTRAINT c ON Person ASSERT personId IS UNIQUE",
-            'CREATE CONSTRAINT c ON "Person" ASSERT "personId" IS UNIQUE',
-        ),
+        ("person", "person"),
+        ("Person", '"Person"'),
+        ("firstName", '"firstName"'),
+        ("sourceId", '"sourceId"'),
+        ("create", '"create"'),
     ],
 )
-def test_quote_identifiers_ddl_cases(raw, expected):
-    assert _quote_identifiers(raw) == expected
+def test_case_is_preserved_because_an_unquoted_name_is_lowered(
+    name: str, expected: str
+) -> None:
+    assert quote_identifier(name) == expected
 
 
 def test_process_config_is_transport_only():

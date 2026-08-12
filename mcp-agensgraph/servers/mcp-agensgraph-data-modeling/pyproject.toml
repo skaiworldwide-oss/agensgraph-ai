@@ -3,7 +3,7 @@ name = "mcp-agensgraph-data-modeling"
 version = "0.2.0"
 description = "AgensGraph data-modeling MCP server (validate models, generate ingest/constraint Cypher, Arrows/Mermaid)."
 readme = "README.md"
-requires-python = ">=3.10,<4.0"
+requires-python = ">=3.11,<4.0"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 authors = [
@@ -29,7 +29,8 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "mcp-agensgraph-common>=0.2.0",
+    "mcp-agensgraph-common>=0.3.0",
+    "agensgraph-python",
     "fastmcp>=3.0.0,<4.0.0",
     "pydantic>=2.10.1",
 ]
@@ -51,6 +52,7 @@ include = ["/src", "/tests", "/README.md", "/LICENSE", "/NOTICE"]
 
 [tool.uv.sources]
 mcp-agensgraph-common = { path = "../mcp-agensgraph-common", editable = true }
+agensgraph-python = { path = "../../../../agensgraph-python", editable = true }
 
 [tool.uv]
 dev-dependencies = [

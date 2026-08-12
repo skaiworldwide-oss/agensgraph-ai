@@ -5,7 +5,7 @@ Wikipedia text, and natural-language questions are answered by generating Cypher
 — both through LangChain idioms.
 
 ```
-(:Person|Organization|Location|Event|Concept|Work|…)-[:<LLM-named>]->(…)
+(:Person|Organization|Location|Event|Concept|Work|…)-[:LOCATED_IN|PART_OF|…]->(…)
 (:Document {title,url})-[:MENTIONS]->(entity)        # provenance
 ```
 
@@ -27,23 +27,38 @@ LLM, default 1800), `WIKI_CONCURRENCY` (parallel extractions, default 8),
 
 ## Where LangChain does the work
 
+- **A fixed relationship vocabulary.** `build_kg.py` constrains both ends of the
+  extraction: `allowed_nodes` and `allowed_relationships`. Constraining only the nodes
+  is a trap — the model then names each relationship after the sentence it came from,
+  and a 500-article build produced **1,626 relationship types for 11,888 edges, 951 of
+  them holding a single edge** (`HAS_NOT_DEVELOPED`, `QUESTIONS_AUTHORESHIP`, …). That
+  costs twice: every type is a table with its own indexes, so the graph took 203 MB to
+  hold a few MB of facts, and it cannot be queried, because nobody can write Cypher
+  against a vocabulary they cannot enumerate. `strict_mode` (on by default) drops
+  anything outside either list.
 - **`build_kg.py`** — `LLMGraphTransformer` (LangChain): the LLM extracts typed
   entities and relationships from each article as **structured output**, returning
   `GraphDocument`s that drop straight into `AgensGraph.add_graph_documents(...,
   include_source=True)` (which also records the source article + `MENTIONS`
   edges). Extraction is run with bounded concurrency via `aconvert_to_graph_documents`.
-- **`ask.py`** — an idiomatic **LCEL** Text2Cypher pipeline:
+- **`ask.py`** — **`AgensCypherQAChain`**, the library's Text2Cypher chain:
 
   ```python
-  RunnablePassthrough.assign(cypher = cypher_prompt | llm | StrOutputParser() | clean)
-  | RunnablePassthrough.assign(results = run_cypher)          # read-only, timed
-  | RunnablePassthrough.assign(answer  = answer_prompt | llm | StrOutputParser())
+  chain = AgensCypherQAChain.from_llm(llm, graph=graph, return_intermediate_steps=True)
+  out = chain.invoke({"query": "Which people are mentioned most often?"})
+  out["intermediate_steps"]   # [{"query": "MATCH ..."}, {"context": [...]}]
   ```
 
+  The chain carries the parts that are easy to get wrong: the AgensGraph dialect
+  rules in the prompt, a repair pass for identifiers the model leaves unquoted,
+  refusal of generated writes, an `EXPLAIN` check so a malformed query never runs,
+  and a statement timeout.
+
   The graph's `get_schema` (with `enhanced_schema=True`, so it carries example
-  property values) is fed to the model so it writes valid AgensGraph Cypher
-  (double-quoted labels, read-only, bounded). Generated queries are checked to be
-  read-only and run with a statement timeout before grounding the answer.
+  property values) goes into the prompt, and the same schema decides what the repair
+  pass may quote — AgensGraph folds unquoted identifiers, and folding runs both ways,
+  so only the schema knows whether `n.firstName` or `n."firstName"` is the right
+  spelling for your data.
 
 ## Notes
 

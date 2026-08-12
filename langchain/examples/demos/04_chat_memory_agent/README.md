@@ -30,6 +30,21 @@ Prerequisite: demo 03's news store (`03_news_vector_rag/ingest.py`).
   - a **fresh agent instance** (as a new process) resumes the exact conversation
     from the checkpoint — the demo asks "what was my first question?" and it
     answers from persisted state, without searching again.
+- **`AgensStore`** — the other half of memory. The checkpointer scopes state to one
+  conversation; the store holds what should outlive any of them, keyed by who it is
+  about rather than by which thread mentioned it. Passed as
+  `create_agent(..., store=AgensStore(...))` and reached through `remember_about_user`
+  / `recall_about_user` tools, so the demo can state a preference on one `thread_id`
+  and have it recalled on a **different** one — something the checkpointer cannot do
+  by design.
+  - `index={"dims": ..., "embed": ..., "fields": ["text"]}` turns on semantic recall.
+    The dimension is read from the embedding model rather than hard-coded.
+  - `put` embeds the one memory it writes, which is what an agent learning a single fact
+    wants. Seeding or importing should use `batch`, which embeds the whole set in one
+    request — measured at 2.1 memories a second against 21.
+  - Items are ordinary vertices, so a memory can be linked to other memories or to
+    domain data with ordinary edges. Embeddings are held outside the property map, in
+    a companion-schema table, so recall never reads a vector out of jsonb.
 - **Grounded tool use** — a `search_news` tool runs `AgensgraphVector`
   similarity search over the news store, so graph store, vector store, and agent
   memory all live in one AgensGraph database.
@@ -42,5 +57,10 @@ end-to-end walkthrough.
 ## Notes
 
 - Uses OpenAI for the agent's reasoning and the tool's embeddings.
-- `delete_thread(thread_id)` clears a conversation's checkpoints.
+- `delete_thread(thread_id)` clears a conversation's checkpoints. `prune([thread_id])`
+  trims a thread to its current state while keeping whatever a channel still needs to
+  rebuild; `copy_thread(src, dst)` forks one; `delete_for_runs([...])` removes the
+  checkpoints of particular runs across whatever threads they touched.
+- The two memories are independent: clearing a conversation leaves the store's facts,
+  and clearing the store leaves the conversations.
 - The agent loop (reason → call tool → answer) issues a few LLM calls per turn.

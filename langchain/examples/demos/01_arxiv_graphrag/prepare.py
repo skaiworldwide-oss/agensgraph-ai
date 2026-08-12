@@ -95,66 +95,116 @@ def _reset(conf: Dict[str, Any]) -> None:
 
 # ── batched ingest ──────────────────────────────────────────────────────────
 
-PAPER_Q = """
+AUTHORED_Q = """
 UNWIND %(rows)s AS row
-MERGE (p:"Paper" {id: row.id})
-  SET p.title = row.title, p.abstract = row.abstract, p.year = row.year
-MERGE (y:"Year" {year: row.year})
-MERGE (p)-[:"UPDATED_IN"]->(y)
-"""
-
-AUTHOR_Q = """
-UNWIND %(rows)s AS row
-MERGE (a:"Author" {name: row.name})
-MERGE (p:"Paper" {id: row.pid})
+MATCH (p:"Paper" {id: row.pid})
+MATCH (a:"Author" {name: row.name})
 MERGE (p)-[:"AUTHORED_BY"]->(a)
 """
 
-CATEGORY_Q = """
+IN_CATEGORY_Q = """
 UNWIND %(rows)s AS row
-MERGE (c:"Category" {name: row.name})
-MERGE (p:"Paper" {id: row.pid})
+MATCH (p:"Paper" {id: row.pid})
+MATCH (c:"Category" {name: row.name})
 MERGE (p)-[:"IN_CATEGORY"]->(c)
 """
 
+UPDATED_IN_Q = """
+UNWIND %(rows)s AS row
+MATCH (p:"Paper" {id: row.pid})
+MATCH (y:"Year" {year: row.year})
+MERGE (p)-[:"UPDATED_IN"]->(y)
+"""
+
+
+def _distinct_pairs(pairs: Iterable[tuple]) -> List[Dict[str, Any]]:
+    """The ``{pid, name}`` edge rows for a batch, each pair once, in the order first seen."""
+    seen = dict.fromkeys(pairs)
+    return [{"pid": pid, "name": name} for pid, name in seen]
+
 
 def _ensure_schema(graph) -> None:
-    """Labels + property indexes so every MERGE is an index lookup, not a seq scan.
+    """Labels + the unique property indexes the upsert addresses each label by.
 
-    Without these the MERGE-by-name on Author/Category (and MERGE-by-id on Paper)
-    would sequentially scan the label on every row → O(N^2) ingest.
+    Unique rather than plain for two reasons. ``upsert_vertices`` reads which keys are
+    already present and copies only the rest, which is only sound if a key names at most
+    one element -- so it refuses a key with no uniqueness behind it. And uniqueness is
+    what makes a re-run safe: with a plain index two concurrent loaders merging the same
+    paper id produce two papers rather than an error.
     """
     for vlabel in ("Paper", "Author", "Category", "Year"):
         graph.query(f'CREATE VLABEL IF NOT EXISTS "{vlabel}"')
     for elabel in ("AUTHORED_BY", "IN_CATEGORY", "UPDATED_IN"):
         graph.query(f'CREATE ELABEL IF NOT EXISTS "{elabel}"')
-    graph.query('CREATE PROPERTY INDEX IF NOT EXISTS paper_id_idx ON "Paper" (id)')
-    graph.query('CREATE PROPERTY INDEX IF NOT EXISTS author_name_idx ON "Author" (name)')
-    graph.query('CREATE PROPERTY INDEX IF NOT EXISTS category_name_idx ON "Category" (name)')
-    graph.query('CREATE PROPERTY INDEX IF NOT EXISTS year_year_idx ON "Year" (year)')
+    graph.query('CREATE UNIQUE PROPERTY INDEX IF NOT EXISTS paper_id_idx ON "Paper" (id)')
+    graph.query('CREATE UNIQUE PROPERTY INDEX IF NOT EXISTS author_name_idx ON "Author" (name)')
+    graph.query('CREATE UNIQUE PROPERTY INDEX IF NOT EXISTS category_name_idx ON "Category" (name)')
+    graph.query('CREATE UNIQUE PROPERTY INDEX IF NOT EXISTS year_year_idx ON "Year" (year)')
 
 
 def _ingest(graph, records: Iterable[Dict[str, Any]], batch_size: int) -> Dict[str, int]:
-    """Batched UNWIND ingest. Reports DB-only throughput separately from the
-    HF streaming latency (which is network-bound and dominates wall-clock)."""
+    """Write the vertices by key, then join them up.
+
+    Each label goes in through ``upsert_vertices``, which asks the graph which of these
+    keys it already holds and copies only the rows whose key it does not. It asks for the
+    keys by name, so the cost follows the batch rather than the size of the label.
+
+    The endpoints exist by the time the edges go in, so an edge statement matches both
+    and merges only the relationship.
+
+    Throughput is reported for the database alone as well as for the wall clock, which
+    the Hugging Face stream dominates.
+    """
+    engine = agens.get_engine()
     n_papers = n_authored = n_incat = 0
     db_seconds = 0.0
     wall_start = time.perf_counter()
-    for chunk in batched(records, batch_size):
-        t0 = time.perf_counter()
-        graph.query(PAPER_Q, {"rows": Jsonb(chunk)})
-        author_rows = [{"pid": r["id"], "name": a} for r in chunk for a in r["authors"]]
-        if author_rows:
-            graph.query(AUTHOR_Q, {"rows": Jsonb(author_rows)})
-        cat_rows = [{"pid": r["id"], "name": c} for r in chunk for c in r["categories"]]
-        if cat_rows:
-            graph.query(CATEGORY_Q, {"rows": Jsonb(cat_rows)})
-        db_seconds += time.perf_counter() - t0
-        n_papers += len(chunk)
-        n_authored += len(author_rows)
-        n_incat += len(cat_rows)
-        if n_papers % (batch_size * 10) == 0:
-            print(f"    ... {n_papers:,} papers")
+
+    with engine.connection(GRAPH) as conn:
+        for chunk in batched(records, batch_size):
+            # Deduplicated because a paper may list the same author or category twice,
+            # and each repeat is a MERGE the server performs and then discards.
+            authored = _distinct_pairs((r["id"], a) for r in chunk for a in r["authors"])
+            in_category = _distinct_pairs((r["id"], c) for r in chunk for c in r["categories"])
+            updated_in = [{"pid": r["id"], "year": r["year"]} for r in chunk]
+
+            # Deduplicated per batch: the same author, category or year recurs across a
+            # batch's papers, and a key repeated inside one copy is work the server does
+            # twice and then has to reconcile.
+            papers = [
+                {"id": r["id"], "title": r["title"], "abstract": r["abstract"], "year": r["year"]}
+                for r in chunk
+            ]
+            authors = [{"name": n} for n in {r["name"] for r in authored}]
+            categories = [{"name": n} for n in {r["name"] for r in in_category}]
+            years = [{"year": y} for y in {r["year"] for r in chunk}]
+
+            t0 = time.perf_counter()
+            # `skip`, not `update`. A re-run appends papers rather than revising the ones
+            # already there, and an update is charged the whole property map per row --
+            # once a paper is embedded that map holds 1,536 floats, all of which `+=`
+            # reads and writes back to change a title.
+            conn.upsert_vertices("Paper", "id", papers, on_existing="skip")
+            if authors:
+                conn.upsert_vertices("Author", "name", authors)
+            if categories:
+                conn.upsert_vertices("Category", "name", categories)
+            if years:
+                conn.upsert_vertices("Year", "year", years)
+
+            conn.execute(UPDATED_IN_Q, {"rows": Jsonb(updated_in)})
+            if authored:
+                conn.execute(AUTHORED_Q, {"rows": Jsonb(authored)})
+            if in_category:
+                conn.execute(IN_CATEGORY_Q, {"rows": Jsonb(in_category)})
+            conn.commit()
+            db_seconds += time.perf_counter() - t0
+
+            n_papers += len(chunk)
+            n_authored += len(authored)
+            n_incat += len(in_category)
+            if n_papers % (batch_size * 10) == 0:
+                print(f"    ... {n_papers:,} papers")
 
     wall = time.perf_counter() - wall_start
     edges = n_authored + n_incat + n_papers  # + UPDATED_IN (one per paper)

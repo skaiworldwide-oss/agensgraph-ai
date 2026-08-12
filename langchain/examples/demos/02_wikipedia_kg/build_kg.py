@@ -3,7 +3,7 @@
 Uses LangChain's LLMGraphTransformer to extract a knowledge graph from Wikipedia
 article leads, then writes it to AgensGraph with add_graph_documents:
 
-    (:Person|Organization|Location|...)-[:<LLM-named relationship>]->(...)
+    (:Person|Organization|Location|...)-[:LOCATED_IN|PART_OF|...]->(...)
     (:Document {title,url})-[:MENTIONS]->(entity)     # provenance (include_source)
 
 This is the LangChain-native graph-construction path: the LLM does the entity /
@@ -41,6 +41,20 @@ DATASET = ("wikimedia/wikipedia", "20231101.en")
 ALLOWED_NODES = [
     "Person", "Organization", "Location", "Event",
     "Concept", "Work", "Field", "Group", "Technology", "Award",
+]
+
+# Left unconstrained, the model names a relationship after the sentence it came from,
+# so an encyclopaedia yields a type per fact: HAS_NOT_DEVELOPED, QUESTIONS_AUTHORESHIP,
+# INITIATED_INDUSTRIAL_PRODUCTION_OF. A 500-article build produced 1,626 types for 11,888
+# edges, 951 of them holding a single edge. That is expensive twice over — every type is
+# a table with its own indexes, so the graph cost 203MB to hold a few MB of facts — and
+# it is useless to query, because no one can write Cypher against a vocabulary they
+# cannot enumerate. A fixed vocabulary keeps the graph answerable.
+ALLOWED_RELATIONSHIPS = [
+    "LOCATED_IN", "PART_OF", "MEMBER_OF", "FOUNDED", "WORKED_FOR",
+    "CREATED", "PARTICIPATED_IN", "INFLUENCED", "RELATED_TO", "IS_A",
+    "USES", "DEVELOPED", "RECEIVED", "SUCCEEDED", "BORN_IN",
+    "DIED_IN", "OCCURRED_IN", "STUDIED",
 ]
 
 
@@ -91,7 +105,8 @@ def main() -> None:
     transformer = LLMGraphTransformer(
         get_llm(),
         allowed_nodes=ALLOWED_NODES,
-        node_properties=False,
+        allowed_relationships=ALLOWED_RELATIONSHIPS,
+        node_properties=False,   # strict_mode drops anything outside either list
     )
 
     console.sub("LLM extraction (LLMGraphTransformer, structured output)")

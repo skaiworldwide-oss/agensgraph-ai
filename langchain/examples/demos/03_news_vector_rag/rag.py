@@ -5,7 +5,7 @@ Five ways to use the AgensgraphVector store built by ingest.py:
   (a) vector semantic search          (HNSW)
   (b) metadata-filtered search        ($gte date, $in domain, $and)
   (c) hybrid search                   (vector + keyword, RRF fusion)
-  (d) effective_search_ratio          (over-fetch for recall under a filter)
+  (d) search_options                  (hnsw.ef_search — pgvector's recall control)
   (e) RAG                             (as_retriever -> LCEL chain -> cited answer)
 
     cd langchain
@@ -20,16 +20,18 @@ import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
+from _common import agens, config, console
+from _common.models import get_embeddings, get_llm
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.runnables import RunnablePassthrough
 
 from langchain_agensgraph import AgensgraphVector
-from langchain_agensgraph.vectorstores.agensgraph_vector import HybridSearchConfig, SearchType
-
-from _common import agens, config, console
-from _common.models import get_embeddings, get_llm
+from langchain_agensgraph.vectorstores.agensgraph_vector import (
+    HybridSearchConfig,
+    SearchType,
+)
 
 GRAPH = "news"
 NODE_LABEL = "Article"
@@ -39,7 +41,7 @@ DEFAULT_QUESTION = "How is artificial intelligence being used in business?"
 def _vec(search_type, keyword=None):
     return AgensgraphVector.from_existing_index(
         embedding=get_embeddings(),
-        index_name="vector",
+        index_name="Article_embedding_idx",
         search_type=search_type,
         keyword_index_name=keyword,
         node_label=NODE_LABEL,
@@ -64,6 +66,12 @@ def main() -> None:
     graph = agens.make_graph(GRAPH, create=False, refresh_schema=False)
     try:
         # corpus stats so the filters below use real values
+        # A date the record did not carry is absent rather than "", so IS NOT NULL is
+        # the whole test. It matters for more than tidiness: "" sorts below every real
+        # date, so a corpus holding one would give `lo = ""` and a filter of
+        # `date >= lo` built from it would select everything. And the index answers
+        # this from its first entry -- adding `AND n.date <> ''` makes it walk past
+        # every empty one instead, fetching each from the heap to test it.
         dates = graph.query(
             'MATCH (n:"Article") WHERE n.date IS NOT NULL '
             "RETURN min(n.date) AS lo, max(n.date) AS hi"
@@ -89,10 +97,19 @@ def main() -> None:
         )
         _show(hits)
 
-        console.section("(d) effective_search_ratio (over-fetch for recall under a filter)")
-        _show(vector.similarity_search_with_score(
-            "sports", k=5, filter={"date": {"$gte": dates["lo"]}}, effective_search_ratio=4.0
-        ))
+        console.section("(d) search_options (hnsw.ef_search — pgvector's recall control)")
+        print("  ef_search is how many candidates the index considers before ranking;")
+        print("  raising it trades latency for recall. Over-fetching k does not:")
+        print("  a larger LIMIT returns the same rows, because the index already")
+        print("  stopped looking. `effective_search_ratio` is still accepted and does")
+        print("  nothing but over-fetch.")
+        for ef in (20, 200):
+            with console.timer(f"hnsw.ef_search={ef}"):
+                hits = vector.similarity_search_with_score(
+                    "sports", k=5, filter={"date": {"$gte": dates["lo"]}},
+                    search_options={"hnsw.ef_search": ef},
+                )
+            _show(hits)
 
         # (e) RAG: AgensgraphVector.as_retriever plugged into an LCEL chain
         console.section(f"(e) RAG (as_retriever -> LCEL chain): {question!r}")

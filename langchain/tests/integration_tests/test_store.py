@@ -271,6 +271,120 @@ class TestSemanticSearch:
         assert int(graph.query(f"SELECT count(*) AS c FROM {table}")[0]["c"]) == 0
 
 
+class TestOneFilterMeansOneAnswer:
+    """A filter must not depend on whether a query came with it.
+
+    A comparison over a value stored as text is a different question in jsonb than in
+    Python -- jsonb orders by type class, Python by magnitude -- so two implementations of
+    the operators answered oppositely and which one a caller got depended on the presence
+    of ``query=``. There is one implementation, and it is the database's.
+    """
+
+    MIXED = {"num3": 3, "num10": 10, "str3": "3", "str20": "20", "boolt": True}
+
+    @pytest.fixture
+    def mixed(self, vector_store: AgensStore):
+        for key, age in self.MIXED.items():
+            vector_store.put(("f",), key, {"text": "shared text", "age": age})
+        return vector_store
+
+    @pytest.mark.parametrize(
+        "flt",
+        [
+            {"age": {"$gt": 5}},
+            {"age": {"$lt": 5}},
+            {"age": {"$gte": 3}},
+            {"age": {"$lte": 10}},
+            {"age": {"$ne": 3}},
+            {"age": {"$eq": 3}},
+        ],
+    )
+    def test_the_same_filter_with_and_without_a_query(self, mixed, flt):
+        plain = sorted(i.key for i in mixed.search(("f",), filter=flt, limit=50))
+        semantic = sorted(
+            i.key for i in mixed.search(("f",), query="shared text", filter=flt, limit=50)
+        )
+        assert plain == semantic
+
+    @pytest.mark.asyncio
+    async def test_the_async_path_agrees_too(self, mixed):
+        flt = {"age": {"$gt": 5}}
+        plain = sorted(i.key for i in mixed.search(("f",), filter=flt, limit=50))
+        semantic = sorted(
+            i.key
+            for i in await mixed.asearch(
+                ("f",), query="shared text", filter=flt, limit=50
+            )
+        )
+        assert plain == semantic
+
+    def test_a_filter_still_narrows(self, mixed):
+        """Guards against the two paths agreeing by both matching everything."""
+        everything = mixed.search(("f",), query="shared text", limit=50)
+        narrowed = mixed.search(
+            ("f",), query="shared text", filter={"age": {"$eq": 3}}, limit=50
+        )
+        assert len(everything) == len(self.MIXED)
+        assert [i.key for i in narrowed] == ["num3"]
+
+
+class TestIndexFalseIsHonoured:
+    """``index=False`` asks for an item to be stored and not embedded."""
+
+    @staticmethod
+    def _vectors(store: AgensStore) -> int:
+        table = f'"{store._graph.graph_name}_store".item_vec'
+        return int(store._graph.query(f"SELECT count(*) AS c FROM {table}")[0]["c"])
+
+    def test_on_the_sync_path(self, vector_store: AgensStore):
+        vector_store.batch(
+            [
+                PutOp(namespace=("n",), key="embedded", value={"text": "a"}, index=None),
+                PutOp(namespace=("n",), key="declined", value={"text": "b"}, index=False),
+            ]
+        )
+        assert len(vector_store.search(("n",))) == 2
+        assert self._vectors(vector_store) == 1
+
+    @pytest.mark.asyncio
+    async def test_on_the_async_path(self, vector_store: AgensStore):
+        await vector_store.abatch(
+            [
+                PutOp(namespace=("n",), key="embedded", value={"text": "a"}, index=None),
+                PutOp(namespace=("n",), key="declined", value={"text": "b"}, index=False),
+            ]
+        )
+        assert len(await vector_store.asearch(("n",))) == 2
+        assert self._vectors(vector_store) == 1
+
+
+class TestEveryMatchConditionHolds:
+    """LangGraph applies ``all`` over the conditions, so one match is not enough."""
+
+    @pytest.fixture
+    def tree(self, store: AgensStore):
+        for ns in (
+            ("users", "alice", "memories"),
+            ("users", "alice", "notes"),
+            ("orgs", "bob", "memories"),
+        ):
+            store.put(ns, "k", {"v": 1})
+        return store
+
+    def test_a_wildcard_condition_beside_a_plain_one(self, tree: AgensStore):
+        found = tree.list_namespaces(
+            prefix=("users", "*"), suffix=("memories",), limit=50
+        )
+        assert found == [("users", "alice", "memories")]
+
+    @pytest.mark.asyncio
+    async def test_the_async_path_agrees(self, tree: AgensStore):
+        found = await tree.alist_namespaces(
+            prefix=("users", "*"), suffix=("memories",), limit=50
+        )
+        assert found == [("users", "alice", "memories")]
+
+
 class TestAsyncParity:
     @pytest.mark.asyncio
     async def test_async_round_trip(self, store: AgensStore):
@@ -352,3 +466,228 @@ class TestQueryPlans:
         assert "Seq Scan" not in plan
         # the range must reach the index, not sit in a post-scan Filter
         assert "Index Cond" in plan or "Recheck Cond" in plan
+
+
+class TestAnEmbeddingGoesOverTheWireAsItself:
+    """A vector column takes a vector, not its decimal spelling.
+
+    At 1,536 dimensions that is 6,152 bytes against 21,504, and the server has nothing to
+    parse. Sending one requires the vector types to be registered on the connection it is
+    sent on -- every connection, including each one a pool makes.
+    """
+
+    DIMS = 1536
+
+    class WideEmbeddings:
+        def _vec(self, text):
+            return [0.01 + (abs(hash(text)) % 1000) * 1e-6] * 1536
+
+        def embed_documents(self, texts):
+            return [self._vec(t) for t in texts]
+
+        def embed_query(self, text):
+            return self._vec(text)
+
+    @pytest.fixture
+    def wide(self):
+        g = AgensGraph("store_wide_it", _conf(), create=True)
+        g.query("MATCH (n) DETACH DELETE n")
+        store = AgensStore(
+            graph=g,
+            index={"dims": self.DIMS, "embed": self.WideEmbeddings(), "fields": ["t"]},
+        )
+        g.query(f'DELETE FROM "{g.graph_name}_store".item_vec')
+        yield store
+        g.close()
+
+    def test_a_wide_embedding_round_trips(self, wide: AgensStore):
+        wide.put(("ns",), "k", {"t": "a memory"})
+        found = wide.search(("ns",), query="a memory", limit=1)
+        assert [i.key for i in found] == ["k"]
+
+    def test_the_stored_vector_has_the_width_it_was_given(self, wide: AgensStore):
+        wide.put(("ns",), "k", {"t": "a memory"})
+        table = f'"{wide._graph.graph_name}_store".item_vec'
+        dims = wide._graph.query(
+            f"SELECT vector_dims(embedding) AS d FROM {table} LIMIT 1"
+        )[0]["d"]
+        assert int(dims) == self.DIMS
+
+    @pytest.mark.asyncio
+    async def test_the_async_connection_can_send_one_too(self, wide: AgensStore):
+        """Registering is per connection, so the async one is told the same thing."""
+        await wide.aput(("ns",), "async-key", {"t": "another memory"})
+        found = await wide.asearch(("ns",), query="another memory", limit=1)
+        assert [i.key for i in found] == ["async-key"]
+
+
+class TestListingNamespacesReadsWhatItReturns:
+    """A page is taken by the server unless something afterwards would change it.
+
+    A wildcard condition and a depth limit both collapse rows, so with either of them the
+    page cannot be taken until they have been. With neither, reading everything and
+    slicing in Python is work nobody asked for.
+    """
+
+    @pytest.fixture
+    def many(self, store: AgensStore):
+        from psycopg.types.json import Jsonb
+
+        rows = [
+            {
+                "prefix": f"users.u{i}.memories",
+                "key": "k",
+                "value": {"n": i},
+                "created_at": "t",
+                "updated_at": "t",
+                "ancestors": ["users", f"users.u{i}", f"users.u{i}.memories"],
+            }
+            for i in range(200)
+        ]
+        store._graph.query(store._put_cypher(), {"rows": Jsonb(rows)})
+        return store
+
+    def test_a_plain_page_is_asked_for_by_the_statement(self, many: AgensStore):
+        from langgraph.store.base import ListNamespacesOp
+
+        op = ListNamespacesOp(match_conditions=(), max_depth=None, limit=5, offset=0)
+        assert not many._collapses_rows(op)
+        statement, _ = many._namespace_page(op, None, {})
+        rendered = statement.as_string(many._graph.connection)
+        assert "LIMIT 5" in rendered and "1000000" not in rendered
+
+    def test_it_returns_the_page_asked_for(self, many: AgensStore):
+        found = many.list_namespaces(limit=5, offset=0)
+        assert len(found) == 5
+        assert many.list_namespaces(limit=5, offset=5) != found
+
+    def test_a_depth_limit_still_collapses_first(self, many: AgensStore):
+        from langgraph.store.base import ListNamespacesOp
+
+        op = ListNamespacesOp(match_conditions=(), max_depth=1, limit=5, offset=0)
+        assert many._collapses_rows(op)
+        # every namespace shortens to "users", so one comes back however many there are
+        assert many.list_namespaces(max_depth=1, limit=5) == [("users",)]
+
+    def test_a_wildcard_still_collapses_first(self, many: AgensStore):
+        found = many.list_namespaces(prefix=("users", "*"), limit=3)
+        assert len(found) == 3
+        assert all(n[0] == "users" for n in found)
+
+
+class TestAnItemAndItsEmbeddingLandTogether:
+    """Embedding is a call to something that is not the database.
+
+    Written first, the item is committed and then the call is made -- and a call that
+    fails leaves an item that nothing can find, for as long as it exists.
+    """
+
+    class Failing:
+        def embed_documents(self, texts):
+            raise RuntimeError("the embedding service is down")
+
+        def embed_query(self, text):
+            return [0.1] * 10
+
+    def test_a_failed_embedding_leaves_no_item_behind(self):
+        graph = AgensGraph("store_atomic_it", _conf(), create=True)
+        graph.query("MATCH (n) DETACH DELETE n")
+        store = AgensStore(
+            graph=graph,
+            index={"dims": 10, "embed": self.Failing(), "fields": ["t"]},
+        )
+        try:
+            with pytest.raises(RuntimeError, match="embedding service"):
+                store.put(("ns",), "k", {"t": "a memory"})
+            held = graph.query('MATCH (n:"StoreItem") RETURN count(*) AS c')[0]["c"]
+            assert held == 0, "the item was written without an embedding"
+        finally:
+            graph.query("MATCH (n) DETACH DELETE n")
+            graph.close()
+
+    def test_a_good_one_writes_both(self):
+        graph = AgensGraph("store_atomic_it", _conf(), create=True)
+        graph.query("MATCH (n) DETACH DELETE n")
+
+        class Working:
+            def embed_documents(self, texts):
+                return [[0.1] * 10 for _ in texts]
+
+            def embed_query(self, text):
+                return [0.1] * 10
+
+        store = AgensStore(
+            graph=graph, index={"dims": 10, "embed": Working(), "fields": ["t"]}
+        )
+        try:
+            store.put(("ns",), "k", {"t": "a memory"})
+            table = f'"{graph.graph_name}_store".item_vec'
+            items = graph.query('MATCH (n:"StoreItem") RETURN count(*) AS c')[0]["c"]
+            vecs = graph.query(f"SELECT count(*) AS c FROM {table}")[0]["c"]
+            assert int(items) == 1 and int(vecs) == 1
+        finally:
+            graph.query("MATCH (n) DETACH DELETE n")
+            graph.close()
+
+
+class TestASearchOfOneNamespaceFindsIt:
+    """The namespace is part of the search, not something applied to its results.
+
+    Ranked globally and narrowed afterwards, a search of one user's memories in a store
+    holding many users returns whatever of theirs happens to fall in the global nearest
+    few -- which over 5,000 memories across fifty users was nothing at all.
+    """
+
+    class Spread:
+        def _vec(self, text):
+            h = abs(hash(text))
+            return [((h >> i) % 97) / 97.0 for i in range(10)]
+
+        def embed_documents(self, texts):
+            return [self._vec(t) for t in texts]
+
+        def embed_query(self, text):
+            return self._vec(text)
+
+    @pytest.fixture
+    def crowded(self):
+        from langgraph.store.base import PutOp
+
+        graph = AgensGraph("store_ns_it", _conf(), create=True)
+        store = AgensStore(
+            graph=graph, index={"dims": 10, "embed": self.Spread(), "fields": ["t"]}
+        )
+        held = graph.query('MATCH (n:"StoreItem") RETURN count(*) AS c')[0]["c"]
+        if held < 2000:
+            graph.query("MATCH (n) DETACH DELETE n")
+            graph.query(f'DELETE FROM "{graph.graph_name}_store".item_vec')
+            for base in range(0, 2000, 500):
+                store.batch(
+                    [
+                        PutOp(
+                            namespace=("users", f"u{(base + i) % 40}"),
+                            key=f"k{base + i}",
+                            value={"t": f"memory {base + i}"},
+                            index=None,
+                        )
+                        for i in range(500)
+                    ]
+                )
+        yield store
+        graph.close()
+
+    @pytest.mark.parametrize("limit", [5, 10, 20])
+    def test_it_returns_a_full_page_from_the_namespace(self, crowded, limit):
+        found = crowded.search(("users", "u7"), query="memory 287", limit=limit)
+        assert len(found) == limit
+        assert all(item.namespace == ("users", "u7") for item in found)
+
+    @pytest.mark.asyncio
+    async def test_the_awaited_search_does_too(self, crowded):
+        found = await crowded.asearch(("users", "u7"), query="memory 287", limit=10)
+        assert len(found) == 10
+        assert all(item.namespace == ("users", "u7") for item in found)
+
+    def test_a_large_limit_does_not_exceed_what_pgvector_takes(self, crowded):
+        """`hnsw.ef_search` is 1..1000 and the over-fetch is four times the limit."""
+        assert crowded.search(("users", "u7"), query="memory 287", limit=300) is not None

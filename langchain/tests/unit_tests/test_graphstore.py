@@ -1,48 +1,18 @@
-'''
-Copyright (c) 2025, SKAI Worldwide Co., Ltd.
+"""Unit tests for the graph store's pure helpers.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
+What can be tested without a server is label cleaning, the sanitizer, and the shape the
+schema is rendered in. Decoding the wire format is the driver's, and is tested there.
+"""
 
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-'''
+from __future__ import annotations
 
 import unittest
-from collections import namedtuple
 from typing import Any, Dict, List
 
 from langchain_agensgraph.graphs.agensgraph import AgensGraph
 
 
-class TestAgensGraph(unittest.TestCase):
-    def test_format_triples(self) -> None:
-        test_input = [
-            {"start": "from_a", "type": "edge_a", "end": "to_a"},
-            {"start": "from_b", "type": "edge_b", "end": "to_b"},
-        ]
-
-        expected = [
-            '(:"from_a")-[:"edge_a"]->(:"to_a")',
-            '(:"from_b")-[:"edge_b"]->(:"to_b")',
-        ]
-
-        self.assertEqual(AgensGraph._format_triples(test_input), expected)
-
-    def test_format_properties(self) -> None:
-        inputs: List[Dict[str, Any]] = [{}, {"a": "b"}, {"a": "b", "c": 1, "d": True}]
-
-        expected = ["{}", '{"a": \'b\'}', '{"a": \'b\', "c": 1, "d": True}']
-
-        for idx, value in enumerate(inputs):
-            self.assertEqual(AgensGraph._format_properties(value), expected[idx])
-
+class TestAgensGraphHelpers(unittest.TestCase):
     def test_clean_graph_labels(self) -> None:
         inputs = ["label", "label 1", "label#$"]
 
@@ -51,43 +21,71 @@ class TestAgensGraph(unittest.TestCase):
         for idx, value in enumerate(inputs):
             self.assertEqual(AgensGraph.clean_graph_labels(value), expected[idx])
 
-    def test_record_to_dict(self) -> None:
-        Record = namedtuple("Record", ["node1", "edge", "node2"])
-        r = Record(
-            node1='label1[1.1]{"prop": "a"}',
-            edge='edge[2.1][1.1,1.2]{"test": "abc"}',
-            node2='label1[1.2]{"prop": "b"}'
+    def test_structured_schema_splits_vertex_and_edge_properties(self) -> None:
+        """A label's kind decides which half of the schema it lands in.
+
+        An edge's property map has to survive decoding for the relationship half to hold
+        anything at all.
+        """
+        from agensgraph import GraphDescription, PropertyShape, Triple
+        from agensgraph.introspect import Label
+
+        description = GraphDescription(
+            graph="g",
+            labels=(
+                Label(3, "Person", "v", "ag_vertex"),
+                Label(4, "KNOWS", "e", "ag_edge"),
+            ),
+            properties={
+                "Person": (PropertyShape("name", "string", False),),
+                "KNOWS": (PropertyShape("since", "integer", False),),
+            },
+            triples=(Triple("Person", "KNOWS", "Person", 7),),
+            counts={"Person": 2, "KNOWS": 7},
+            meta_gathered=True,
         )
 
-        result = AgensGraph._record_to_dict(r)
+        structured = AgensGraph._structured(_FakeGraph(), description)
 
-        expected = {
-            "node1": {"prop": 'a'},
-            "edge": ({"prop": 'a'}, "edge", {"prop": 'b'}),
-            "node2": {"prop": 'b'},
-        }
-
-        self.assertEqual(result, expected)
-
-        # psycopg already decodes scalars/maps/lists to native Python types,
-        # so _record_to_dict must pass non-vertex/edge values through
-        # unchanged. In particular numeric-looking *string* ids (graphids,
-        # arXiv ids, zip codes) must NOT be coerced into numbers.
-        Record2 = namedtuple(
-            "Record2", ["pid", "graphid", "year", "score", "flag", "none", "title"]
+        self.assertEqual(
+            structured["node_props"], {"Person": [{"property": "name", "type": "string"}]}
         )
-        r2 = Record2("2301.12345", "3.52714", 2023, 1.5, True, None, "Deep Learning")
+        self.assertEqual(
+            structured["rel_props"], {"KNOWS": [{"property": "since", "type": "integer"}]}
+        )
+        self.assertEqual(
+            structured["relationships"],
+            [{"start": "Person", "type": "KNOWS", "end": "Person"}],
+        )
+        self.assertEqual(structured["counts"], {"Person": 2, "KNOWS": 7})
+        self.assertTrue(structured["metadata"]["meta_gathered"])
 
-        result = AgensGraph._record_to_dict(r2)
-
-        expected2 = {
-            "pid": "2301.12345",   # preserved as string (was corrupted to float)
-            "graphid": "3.52714",  # preserved as string
-            "year": 2023,
-            "score": 1.5,
-            "flag": True,
-            "none": None,
-            "title": "Deep Learning",
+    def test_rendered_schema_names_each_section(self) -> None:
+        """The prompt's framing is contractual -- a chain's few-shot examples read it."""
+        structured: Dict[str, Any] = {
+            "node_props": {"Person": [{"property": "name", "type": "string"}]},
+            "rel_props": {"KNOWS": [{"property": "since", "type": "integer"}]},
+            "relationships": [{"start": "Person", "type": "KNOWS", "end": "Person"}],
+            "counts": {"Person": 2},
+            "metadata": {},
         }
+        rendered = AgensGraph._rendered(None, structured)
 
-        self.assertEqual(result, expected2)
+        self.assertIn("Node properties are the following:", rendered)
+        self.assertIn("Relationship properties are the following:", rendered)
+        self.assertIn("The relationships are the following:", rendered)
+        # Counts are new, and free: they come from the catalogs with everything else, and a
+        # model picking between two ways of matching writes a better query knowing them.
+        self.assertIn("Element counts are the following:", rendered)
+        self.assertIn('(:"Person")-[:"KNOWS"]->(:"Person")', rendered)
+
+
+class _FakeGraph:
+    """Enough of an AgensGraph for `_structured`, which only reads `capabilities`."""
+
+    class capabilities:  # noqa: N801 - stands in for a property
+        version = (2, 18)
+
+
+def _entries(props: List[Dict[str, str]]) -> List[str]:
+    return [p["property"] for p in props]

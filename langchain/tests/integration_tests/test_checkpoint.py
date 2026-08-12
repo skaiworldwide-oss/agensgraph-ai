@@ -4,7 +4,6 @@ import os
 from typing import Annotated, TypedDict
 
 import pytest
-
 from langgraph.checkpoint.base import BaseCheckpointSaver
 
 from langchain_agensgraph import AgensGraph, AgensSaver
@@ -350,3 +349,147 @@ class TestDeltaChannelHistory:
         assert await saver.aget_delta_channel_history(
             config=cfg, channels=["delta"]
         ) == saver.get_delta_channel_history(config=cfg, channels=["delta"])
+
+
+class TestAgreesWithTheReferenceSaver:
+    """The same operations on ``InMemorySaver``, which defines what the answer is.
+
+    Each of these compares against it rather than against a number written down here, so
+    a change in the interface's semantics shows up as a disagreement instead of as a test
+    that still passes while both sides moved.
+    """
+
+    @staticmethod
+    def _both(saver: AgensSaver):
+        from langgraph.checkpoint.memory import InMemorySaver
+
+        return saver, InMemorySaver()
+
+    @staticmethod
+    def _scenario(target: BaseCheckpointSaver, thread_id: str) -> None:
+        """Three supersteps in the default namespace and one in a second.
+
+        The third gives ``a`` a new version while holding no value for it, which is what
+        a channel emptied by a step looks like.
+        """
+
+        def cfg(ns: str, parent: str | None = None):
+            c: dict = {"configurable": {"thread_id": thread_id, "checkpoint_ns": ns}}
+            if parent:
+                c["configurable"]["checkpoint_id"] = parent
+            return c
+
+        target.put(
+            cfg(""),
+            _empty_checkpoint("c1", {"a": "one"}, {"a": "1"}),
+            {"step": 1, "source": "loop"},
+            {"a": "1"},
+        )
+        target.put(
+            cfg("", "c1"),
+            _empty_checkpoint("c2", {"a": "one", "b": "two"}, {"a": "1", "b": "2"}),
+            {"step": 2, "source": "loop"},
+            {"b": "2"},
+        )
+        target.put(
+            cfg("", "c2"),
+            _empty_checkpoint("c3", {"b": "two"}, {"a": "3", "b": "2"}),
+            {"step": 3, "source": "input"},
+            {"a": "3"},
+        )
+        target.put(
+            cfg("sub"),
+            _empty_checkpoint("s1", {"z": "sub"}, {"z": "1"}),
+            {"step": 1, "source": "loop"},
+            {"z": "1"},
+        )
+
+    @pytest.mark.parametrize(
+        "name,call",
+        [
+            (
+                "a config naming no namespace asks about every namespace",
+                lambda s, t: len(list(s.list({"configurable": {"thread_id": t}}))),
+            ),
+            (
+                "no config at all asks about every thread and namespace",
+                lambda s, t: len(list(s.list(None))),
+            ),
+            (
+                "a config naming a checkpoint asks about that one",
+                lambda s, t: len(
+                    list(
+                        s.list(
+                            {
+                                "configurable": {
+                                    "thread_id": t,
+                                    "checkpoint_ns": "",
+                                    "checkpoint_id": "c2",
+                                }
+                            }
+                        )
+                    )
+                ),
+            ),
+            (
+                "a limit counts what passed the filter",
+                lambda s, t: len(
+                    list(
+                        s.list(
+                            {"configurable": {"thread_id": t, "checkpoint_ns": ""}},
+                            filter={"source": "loop"},
+                            limit=2,
+                        )
+                    )
+                ),
+            ),
+            (
+                "a limit with no filter still bounds the rows",
+                lambda s, t: len(
+                    list(
+                        s.list(
+                            {"configurable": {"thread_id": t, "checkpoint_ns": ""}},
+                            limit=2,
+                        )
+                    )
+                ),
+            ),
+            (
+                "an emptied channel is absent from the state, not stale in it",
+                lambda s, t: sorted(
+                    s.get_tuple(
+                        {"configurable": {"thread_id": t, "checkpoint_ns": ""}}
+                    ).checkpoint["channel_values"]
+                ),
+            ),
+        ],
+    )
+    def test_list_and_read(self, saver: AgensSaver, name, call):
+        ours, reference = self._both(saver)
+        self._scenario(ours, "ref1")
+        self._scenario(reference, "ref1")
+        assert call(ours, "ref1") == call(reference, "ref1"), name
+
+    def test_a_channel_is_stored_under_the_version_it_took(self, saver: AgensSaver):
+        """One row per new version, and the same rows the reference keeps.
+
+        A channel whose value did not change this step is not written again, and one that
+        took a new version while empty is written as empty rather than left out.
+        """
+        ours, reference = self._both(saver)
+        self._scenario(ours, "ref2")
+        self._scenario(reference, "ref2")
+
+        stored = {
+            (r["ch"], r["v"], r["t"])
+            for r in saver._graph.query(
+                'MATCH (b:"CheckpointBlob") WHERE b.thread_id = \'ref2\' '
+                "RETURN b.channel AS ch, b.version AS v, b.type AS t"
+            )
+        }
+        expected = {
+            (channel, str(version), payload[0])
+            for (_, _, channel, version), payload in reference.blobs.items()
+        }
+        assert stored == expected
+        assert ("a", "3", "empty") in stored

@@ -1,10 +1,13 @@
 """Test AgensgraphVector functionality."""
 
-import os, json
+import os
+from hashlib import md5
 from math import isclose
 from typing import Any, Dict, List, cast
 
+import pytest
 from langchain_core.documents import Document
+from psycopg import sql
 from yaml import safe_load
 
 
@@ -60,25 +63,14 @@ url = os.environ.get("AGENSGRAPH_URL", f"postgresql://{conf['user']}:{conf['pass
 
 def drop_vector_indexes(store: AgensgraphVector) -> None:
     """Cleanup all vector indexes"""
-    all_indexes = store.query(
-        """
-            SELECT name FROM ag_list_vector_indexes()
-                              """
-    )
-    for index in all_indexes:
+    for index in store._vector_indexes():
         store.query(f"""DROP PROPERTY INDEX "{index['name']}" CASCADE""")
 
     store.query("MATCH (n) DETACH DELETE n;")
 
 def drop_fulltext_indexes(store: AgensgraphVector) -> None:
-    """Cleanup all vector indexes"""
-    all_indexes = store.query(
-        """
-            SELECT name FROM ag_list_text_indexes()
-                              """
-    )
-    print("DEBUG - all_indexes", all_indexes)
-    for index in all_indexes:
+    """Cleanup all keyword indexes"""
+    for index in store._text_indexes():
         store.query(f"""DROP PROPERTY INDEX "{index['name']}" CASCADE""")
 
     store.query("MATCH (n) DETACH DELETE n;")
@@ -644,8 +636,12 @@ def test_retrieval_params() -> None:
         url=url,
     )
 
+    # Passed plainly. Before the driver, a string parameter reached the server with no
+    # declared type and the Cypher parser *parsed* it as JSON, so every value had to be
+    # `json.dumps`-ed first -- and a value that happened to read as JSON, like an order
+    # number or a postcode, silently matched nothing. A string is now sent as text.
     output = docsearch.similarity_search(
-        "Foo", k=2, params={"test": json.dumps("test"), "test1": json.dumps("test1")}
+        "Foo", k=2, params={"test": "test", "test1": "test1"}
     )
     assert _no_id(output) == [
         Document(page_content="test", metadata={"test": "test1"}),
@@ -855,3 +851,513 @@ def test_agensgraph_vector_passing_graph_object() -> None:
     assert _no_id(output) == [Document(page_content="foo")]
 
     drop_vector_indexes(docsearch)
+
+
+class TestABitColumnIsUsable:
+    """``HAMMING`` and ``JACCARD`` measure a ``bit`` column, and both are reachable.
+
+    A bit column holds a string of ones and zeros, so an embedding bound for one is
+    binary quantised into that string. Written as a list it would be cast from its printed
+    form and read as a bit string of that whole length.
+    """
+
+    class BitEmbeddings:
+        """A deterministic 0/1 embedding, which is what a bit column holds."""
+
+        dims = 12
+
+        def _vec(self, text: str) -> List[float]:
+            digest = int(md5(text.encode()).hexdigest(), 16)
+            return [float((digest >> i) & 1) for i in range(self.dims)]
+
+        def embed_documents(self, texts: List[str]) -> List[List[float]]:
+            return [self._vec(t) for t in texts]
+
+        def embed_query(self, text: str) -> List[float]:
+            return self._vec(text)
+
+    @pytest.mark.parametrize(
+        "strategy", [DistanceStrategy.HAMMING, DistanceStrategy.JACCARD]
+    )
+    def test_a_bit_distance_indexes_ingests_and_searches(self, strategy) -> None:
+        store = AgensgraphVector.from_texts(
+            texts=["alpha", "beta", "gamma"],
+            embedding=self.BitEmbeddings(),
+            url=url,
+            graph_name="vector_it",
+            node_label="BitChunk",
+            index_name=f"bit_{strategy.value.lower()}",
+            distance_strategy=strategy,
+            vector_type="bit",
+            pre_delete_collection=True,
+        )
+        try:
+            stored = store.query(
+                'MATCH (n:"BitChunk") RETURN n.embedding AS e LIMIT 1'
+            )[0]["e"]
+            assert set(stored) <= {"0", "1"} and len(stored) == 12
+            assert store.similarity_search("beta", k=1)[0].page_content == "beta"
+        finally:
+            drop_vector_indexes(store)
+
+
+class TestMetadataDoesNotOverwriteWhatTheStoreWrites:
+    """The text, the embedding and the id are written after a caller's metadata.
+
+    A metadata key of the same name would otherwise land on top of them -- and an
+    embedding replaced by a string is refused by the vector index, so the write fails
+    outright rather than quietly storing the wrong thing.
+    """
+
+    def test_reserved_keys_in_metadata(self) -> None:
+        store = AgensgraphVector.from_texts(
+            texts=["the quick brown fox"],
+            embedding=FakeEmbeddings(),
+            metadatas=[
+                {"embedding": "clobbered", "text": "clobbered", "__id__": "clobbered"}
+            ],
+            url=url,
+            graph_name="vector_it",
+            node_label="ReservedChunk",
+            index_name="reserved",
+            pre_delete_collection=True,
+        )
+        try:
+            row = store.query(
+                'MATCH (n:"ReservedChunk") RETURN n.text AS text, '
+                "n.__id__ AS id, array_size(n.embedding) AS dims"
+            )[0]
+            assert row["text"] == "the quick brown fox"
+            assert row["id"] != "clobbered"
+            assert row["dims"] == len(FakeEmbeddings().embed_query("x"))
+        finally:
+            drop_vector_indexes(store)
+
+
+class TestAMissingPropertyAnswersTheSame:
+    """``$ne`` and ``$nin`` are the same question about an element that lacks the key.
+
+    An absent property is unequal to anything, so it satisfies both.
+    """
+
+    @pytest.mark.parametrize(
+        "flt",
+        [{"kind": {"$ne": "a"}}, {"kind": {"$nin": ["a"]}}],
+    )
+    def test_an_element_without_the_property(self, flt) -> None:
+        store = AgensgraphVector.from_texts(
+            texts=["has it", "missing it"],
+            embedding=FakeEmbeddings(),
+            metadatas=[{"kind": "a"}, {}],
+            url=url,
+            graph_name="vector_it",
+            node_label="MissingChunk",
+            index_name="missing",
+            pre_delete_collection=True,
+        )
+        try:
+            found = store.similarity_search("has it", k=10, filter=flt)
+            assert [d.page_content for d in found] == ["missing it"]
+        finally:
+            drop_vector_indexes(store)
+
+
+class TestAGraphThatWasAlreadyThere:
+    """What ``from_existing_graph`` has to get right for a graph it did not create."""
+
+    @staticmethod
+    def _seed() -> AgensgraphVector:
+        graph = AgensGraph("vector_existing_it", conf, create=True)
+        graph.query("MATCH (n) DETACH DELETE n")
+        for title, content in [
+            ("quantum computing", "qubits and gates"),
+            ("cooking pasta", "boil water add salt"),
+            ("quantum mechanics", "wave functions"),
+        ]:
+            graph.query(
+                'CREATE (:"Doc" {"title": %(t)s, "content": %(c)s})',
+                {"t": title, "c": content},
+            )
+        graph.close()
+        return AgensgraphVector.from_existing_graph(
+            embedding=FakeEmbeddings(),
+            node_label="Doc",
+            embedding_node_property="embedding",
+            text_node_properties=["title", "content"],
+            url=url,
+            graph_name="vector_existing_it",
+            index_name="existing_vector",
+        )
+
+    def test_a_document_has_an_id_and_can_be_read_back_by_it(self) -> None:
+        store = self._seed()
+        try:
+            hits = store.similarity_search("quantum", k=3)
+            assert all(doc.id for doc in hits)
+            fetched = store.get_by_ids([hits[0].id])
+            assert fetched and fetched[0].id == hits[0].id
+        finally:
+            drop_vector_indexes(store)
+
+    def test_maximal_marginal_relevance_reads_the_embeddings_it_needs(self) -> None:
+        """The retrieval query shapes the document and carries no embedding."""
+        store = self._seed()
+        try:
+            picked = store.max_marginal_relevance_search("quantum", k=2, fetch_k=3)
+            assert len(picked) == 2
+            assert all("_embedding_" not in doc.metadata for doc in picked)
+        finally:
+            drop_vector_indexes(store)
+
+    @pytest.mark.asyncio
+    async def test_the_async_path_agrees(self) -> None:
+        store = self._seed()
+        try:
+            picked = await store.amax_marginal_relevance_search(
+                "quantum", k=2, fetch_k=3
+            )
+            assert len(picked) == 2
+        finally:
+            drop_vector_indexes(store)
+
+
+class TestHybridScoresBothHalves:
+    """A hybrid search fuses two rankings, and an element has to be found in both.
+
+    The halves are joined on the element's own identity. ``__id__`` is a property only
+    ``add_embeddings`` writes, so over a graph that was already there it was null on both
+    sides, nothing joined, and every hit was scored by one half of the fusion.
+    """
+
+    def test_an_element_matched_by_both_scores_more_than_one_matched_by_one(self) -> None:
+        graph = AgensGraph("vector_hybrid_it", conf, create=True)
+        graph.query("MATCH (n) DETACH DELETE n")
+        for title, content in [
+            ("quantum computing", "qubits and gates"),
+            ("cooking pasta", "boil water add salt"),
+        ]:
+            graph.query(
+                'CREATE (:"Doc" {"title": %(t)s, "content": %(c)s})',
+                {"t": title, "c": content},
+            )
+        graph.close()
+        store = AgensgraphVector.from_existing_graph(
+            embedding=FakeEmbeddings(),
+            node_label="Doc",
+            embedding_node_property="embedding",
+            text_node_properties=["title", "content"],
+            search_type=SearchType.HYBRID,
+            url=url,
+            graph_name="vector_hybrid_it",
+            index_name="hybrid_vector",
+            keyword_index_name="hybrid_keyword",
+        )
+        try:
+            hits = store.similarity_search_with_score("quantum computing", k=5)
+            scores = sorted((score for _, score in hits), reverse=True)
+            # Two terms of the fusion against one: the best hit is matched by the
+            # keyword half as well, so it scores about twice the one that is not.
+            assert scores[0] > scores[-1] * 1.8
+        finally:
+            drop_vector_indexes(store)
+            drop_fulltext_indexes(store)
+
+    def test_the_keyword_half_reads_every_property_it_indexed(self) -> None:
+        """A term only in the second text property still matches."""
+        graph = AgensGraph("vector_hybrid_it", conf, create=True)
+        graph.query("MATCH (n) DETACH DELETE n")
+        graph.query(
+            'CREATE (:"Doc" {"title": %(t)s, "content": %(c)s})',
+            {"t": "an unremarkable heading", "c": "supercalifragilistic contents"},
+        )
+        graph.close()
+        store = AgensgraphVector.from_existing_graph(
+            embedding=FakeEmbeddings(),
+            node_label="Doc",
+            embedding_node_property="embedding",
+            text_node_properties=["title", "content"],
+            search_type=SearchType.HYBRID,
+            url=url,
+            graph_name="vector_hybrid_it",
+            index_name="hybrid_vector2",
+            keyword_index_name="hybrid_keyword2",
+        )
+        try:
+            match, _ = store._keyword_expressions()
+            rendered = match.as_string(store.connection)
+            assert '"title"' in rendered and '"content"' in rendered
+            hits = store.similarity_search_with_score("supercalifragilistic", k=1)
+            # One document, matched by both halves, so both terms of the fusion.
+            assert hits and hits[0][1] > 1.0 / 61
+        finally:
+            drop_vector_indexes(store)
+            drop_fulltext_indexes(store)
+
+
+class TestTheStoreInstallsNothing:
+    """Building a store adds no function of ours to somebody else's database.
+
+    What an index covers is read from the definition the server prints for it. Asking the
+    question with a function of our own meant creating one on every construction, into
+    whatever ``search_path`` happened to resolve to.
+    """
+
+    @staticmethod
+    def _function_count(store: AgensgraphVector) -> int:
+        return int(
+            store.query("SELECT count(*) AS c FROM pg_catalog.pg_proc")[0]["c"]
+        )
+
+    def test_pg_proc_is_the_same_size_afterwards(self) -> None:
+        graph = AgensGraph("vector_install_it", conf, create=True)
+        graph.query("MATCH (n) DETACH DELETE n")
+        # A database may already hold such functions from elsewhere. They are dropped
+        # first, so that what is asserted is whether building a store creates any.
+        for leftover in graph.query(
+            "SELECT p.oid::regprocedure AS signature FROM pg_catalog.pg_proc p "
+            "WHERE p.proname LIKE 'ag\\_list%'"
+        ):
+            graph.query(f"DROP FUNCTION IF EXISTS {leftover['signature']}")
+        before = int(
+            graph.query("SELECT count(*) AS c FROM pg_catalog.pg_proc")[0]["c"]
+        )
+        store = AgensgraphVector.from_texts(
+            texts=["alpha", "beta"],
+            embedding=FakeEmbeddings(),
+            graph=graph,
+            node_label="InstallChunk",
+            index_name="install_vec",
+            keyword_index_name="install_kw",
+            search_type=SearchType.HYBRID,
+            pre_delete_collection=True,
+        )
+        try:
+            assert store.similarity_search("alpha", k=1)
+            assert self._function_count(store) == before
+            named = store.query(
+                "SELECT count(*) AS c FROM pg_catalog.pg_proc "
+                "WHERE proname LIKE 'ag\\_list%'"
+            )
+            assert int(named[0]["c"]) == 0
+        finally:
+            drop_vector_indexes(store)
+            drop_fulltext_indexes(store)
+            graph.close()
+
+    def test_the_driver_still_knows_which_graph_is_selected(self) -> None:
+        """A raw ``SET graph_path`` would leave it unable to read the catalogs."""
+        graph = AgensGraph("vector_install_it", conf, create=True)
+        store = AgensgraphVector.from_texts(
+            texts=["alpha"],
+            embedding=FakeEmbeddings(),
+            graph=graph,
+            node_label="SelectedChunk",
+            index_name="selected_vec",
+            pre_delete_collection=True,
+        )
+        try:
+            assert graph.connection.label_table.graph == "vector_install_it"
+            assert graph.connection.indexes()  # would raise if none were selected
+        finally:
+            drop_vector_indexes(store)
+            graph.close()
+
+
+class TestNamingElementsByIdReachesTheIndex:
+    """The perf contract is only real if a test enforces it.
+
+    A bound list is compared by containment -- the list is asked whether it holds the
+    property -- and containment is not a comparison the unique index on the id can
+    answer, so the label is read whole. The rows come back either way, so only the plan
+    shows it.
+
+    Enforced over enough elements for the choice to matter. Below a few thousand, reading
+    the label once and joining is genuinely the cheaper plan and the server picks it,
+    which says nothing about whether the index can be used at a size where it counts.
+    """
+
+    ROWS = 20000
+
+    @pytest.fixture
+    def loaded(self):
+        graph = AgensGraph("vector_plan_it", conf, create=True)
+        held = graph.query('MATCH (n:"PlanChunk") RETURN count(*) AS c')[0]["c"]
+        store = AgensgraphVector(
+            FakeEmbeddings(),
+            graph=graph,
+            node_label="PlanChunk",
+            index_name="plan_vec",
+        )
+        if held < self.ROWS:
+            graph.query("MATCH (n) DETACH DELETE n")
+            store.add_texts(
+                [f"chunk {i}" for i in range(self.ROWS)],
+                ids=[f"id{i}" for i in range(self.ROWS)],
+                batch_size=2500,
+            )
+            graph.query(f'ANALYZE "{graph.graph_name}"."PlanChunk"')
+        yield store
+        graph.close()
+
+    def _plan(self, store, statement, params) -> str:
+        rows = store.query(
+            "EXPLAIN (COSTS OFF) " + statement.as_string(store.connection), params
+        )
+        return "\n".join(str(next(iter(r.values()))) for r in rows)
+
+    def test_reading_by_id_is_an_index_scan(self, loaded) -> None:
+        params: dict = {}
+        statement = sql.SQL("{by} RETURN n.__id__ AS id").format(
+            by=loaded._named_by_id([f"id{i}" for i in range(20)], params)
+        )
+        plan = self._plan(loaded, statement, params)
+        assert "Index Scan" in plan
+        assert "Seq Scan" not in plan
+
+    def test_reading_many_by_id_does_not_grow_the_statement(self, loaded) -> None:
+        """One probe repeated, not one term per id.
+
+        Written out as a term each, the statement grows with the list and the planner pays
+        for every term -- and with no index to answer them, each is a pass over the label.
+        """
+        params: dict = {}
+        few = loaded._named_by_id(["id1"], params).as_string(loaded.connection)
+        many = loaded._named_by_id(
+            [f"id{i}" for i in range(200)], {}
+        ).as_string(loaded.connection)
+        assert few == many, "the statement says the same thing however many ids"
+
+    def test_get_by_ids_returns_what_was_asked_for(self, loaded) -> None:
+        wanted = [f"id{i}" for i in range(0, self.ROWS, self.ROWS // 20)][:20]
+        found = loaded.get_by_ids(wanted)
+        assert sorted(d.id for d in found) == sorted(wanted)
+
+    def test_delete_removes_only_those(self, loaded) -> None:
+        before = loaded.query('MATCH (n:"PlanChunk") RETURN count(*) AS c')[0]["c"]
+        loaded.delete(["id1", "id2", "id3"])
+        after = loaded.query('MATCH (n:"PlanChunk") RETURN count(*) AS c')[0]["c"]
+        assert int(before) - int(after) == 3
+        loaded.add_texts(["chunk 1", "chunk 2", "chunk 3"], ids=["id1", "id2", "id3"])
+
+    @pytest.mark.asyncio
+    async def test_the_async_twins_agree(self, loaded) -> None:
+        wanted = ["id10", "id11"]
+        found = await loaded.aget_by_ids(wanted)
+        assert sorted(d.id for d in found) == sorted(wanted)
+
+
+class TestSearchTuningEndsWithTheSearch:
+    """``hnsw.ef_search`` decides how many candidates the index looks at.
+
+    Set for the session it stays on a pooled connection and tunes every later borrower's
+    search -- a recall setting one caller asked for, silently applied to everyone who gets
+    that connection next, and a cost they did not ask to pay.
+    """
+
+    def test_the_connection_is_left_as_it_was_found(self) -> None:
+        from langchain_agensgraph.engine import AgensEngine
+
+        # One connection, so the next borrower certainly gets the same one.
+        engine = AgensEngine.from_url(url, min_size=1, max_size=1)
+        graph = AgensGraph(
+            "vector_tuning_it", conf, create=True, engine=engine, refresh_schema=False
+        )
+        store = AgensgraphVector.from_texts(
+            texts=["alpha", "beta"],
+            embedding=FakeEmbeddings(),
+            graph=graph,
+            node_label="TunedChunk",
+            index_name="tuned_vec",
+            pre_delete_collection=True,
+            search_options={"hnsw.ef_search": 200},
+        )
+        try:
+            with engine.connection() as conn:
+                default = conn.execute("SHOW hnsw.ef_search").fetchone()[0]
+
+            assert store.similarity_search("alpha", k=1)
+
+            with engine.connection() as conn:
+                after = conn.execute("SHOW hnsw.ef_search").fetchone()[0]
+            assert after == default, "the tuning outlived the search that asked for it"
+        finally:
+            drop_vector_indexes(store)
+            graph.close()
+            engine.close()
+
+
+class TestBuildingAStoreCostsNoEmbedding:
+    """How wide an embedding is comes from the index, not from asking the model.
+
+    Asking is a request to whatever is behind the embedding function -- for a hosted
+    model, a wait and a charge -- and it was made on every construction, including one
+    that only ever reads.
+    """
+
+    class Counting:
+        calls = 0
+
+        def embed_documents(self, texts):
+            type(self).calls += len(texts)
+            return [[0.1] * 10 for _ in texts]
+
+        def embed_query(self, text):
+            type(self).calls += 1
+            return [0.1] * 10
+
+    @pytest.fixture
+    def seeded(self):
+        graph = AgensGraph("vector_width_it", conf, create=True)
+        graph.query("MATCH (n) DETACH DELETE n")
+        store = AgensgraphVector.from_texts(
+            texts=["a", "b"],
+            embedding=self.Counting(),
+            graph=graph,
+            node_label="WidthChunk",
+            index_name="width_vec",
+            pre_delete_collection=True,
+        )
+        yield store
+        drop_vector_indexes(store)
+        graph.close()
+
+    def test_building_over_an_existing_index_asks_nothing(self, seeded) -> None:
+        self.Counting.calls = 0
+        AgensgraphVector.from_existing_index(
+            embedding=self.Counting(),
+            url=url,
+            graph_name="vector_width_it",
+            index_name="width_vec",
+            node_label="WidthChunk",
+        )
+        assert self.Counting.calls == 0
+
+    def test_the_width_still_comes_out_right(self, seeded) -> None:
+        store = AgensgraphVector.from_existing_index(
+            embedding=self.Counting(),
+            url=url,
+            graph_name="vector_width_it",
+            index_name="width_vec",
+            node_label="WidthChunk",
+        )
+        assert store.embedding_dimension == 10
+
+    def test_a_model_of_the_wrong_width_is_refused_on_the_first_write(
+        self, seeded
+    ) -> None:
+        class Wider(self.Counting):
+            def embed_documents(self, texts):
+                return [[0.1] * 99 for _ in texts]
+
+            def embed_query(self, text):
+                return [0.1] * 99
+
+        store = AgensgraphVector.from_existing_index(
+            embedding=Wider(),
+            url=url,
+            graph_name="vector_width_it",
+            index_name="width_vec",
+            node_label="WidthChunk",
+        )
+        with pytest.raises(ValueError, match="dimensions do not match"):
+            store.add_texts(["one of the wrong width"])

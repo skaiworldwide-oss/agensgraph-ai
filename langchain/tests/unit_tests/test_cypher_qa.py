@@ -111,11 +111,34 @@ class TestIsWriteQuery:
         [
             "MATCH (n) RETURN n",
             "MATCH (n) WHERE n.name = 'CREATE' RETURN n",
-            "MATCH (n) RETURN n // CREATE was mentioned in a comment",
+            'MATCH (n:"Person") WHERE n."deleted" IS NULL RETURN n',
+            "MATCH (n) RETURN n -- CREATE was mentioned in a comment",
+            "MATCH (n) RETURN n /* CREATE was mentioned in a comment */",
         ],
     )
     def test_a_keyword_in_a_string_or_comment_is_not_a_write(self, query):
         assert not is_write_query(query)
+
+    @pytest.mark.parametrize(
+        "query",
+        [
+            "MATCH (n) RETURN n.set",
+            "MATCH (n) RETURN n.create AS created",
+            "MATCH (n) RETURN n.remove",
+        ],
+    )
+    def test_a_property_named_after_a_clause_is_not_a_write(self, query):
+        """A read that a first opinion must not refuse.
+
+        The name follows a dot, so it is a key rather than a clause, and a chain that
+        refuses this answers nothing for a graph whose data happens to use the word.
+        """
+        assert not is_write_query(query)
+
+    def test_a_second_statement_after_a_semicolon_is_read(self):
+        """A parameterless statement goes over the simple query protocol, which runs
+        every statement in it, so the write in the second one is a write in the text."""
+        assert is_write_query("MATCH (n) RETURN n; CREATE (m:Evil)")
 
 
 class TestPrompt:

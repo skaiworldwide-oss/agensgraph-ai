@@ -8,7 +8,6 @@ on a live AgensGraph 2.17 instance.
 from __future__ import annotations
 
 import os
-from typing import List
 
 import pytest
 

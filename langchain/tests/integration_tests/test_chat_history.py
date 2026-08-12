@@ -95,3 +95,70 @@ async def test_async_roundtrip(graph):
     assert [m.content for m in msgs] == ["async hi", "yo"]
     await h.aclear()
     assert await h.aget_messages() == []
+
+
+class TestAppendingDoesNotGetDearerWithDepth:
+    """A session carries the number it counts from.
+
+    Counting the messages already there to number the next one makes each append dearer
+    than the last, which over a conversation is quadratic in its length.
+    """
+
+    def test_a_session_written_without_the_number_keeps_its_order(self, graph):
+        """A session written without the number is counted once and carries on."""
+        from psycopg.types.json import Jsonb
+
+        graph.query('CREATE (s:"Session" {id: \'legacy\'})')
+        for i in range(5):
+            graph.query(
+                'MATCH (s:"Session" {id: \'legacy\'}) '
+                'CREATE (s)-[:"HAS_MESSAGE"]->(:"Message" {seq: %(i)s, data: %(d)s})',
+                {
+                    "i": i,
+                    "d": Jsonb({"type": "human", "data": {"content": f"old {i}"}}),
+                },
+            )
+        history = AgensChatMessageHistory(session_id="legacy", graph=graph)
+        assert [m.content for m in history.messages] == [f"old {i}" for i in range(5)]
+
+        history.add_user_message("new one")
+        assert [m.content for m in history.messages] == [
+            *[f"old {i}" for i in range(5)],
+            "new one",
+        ]
+        seqs = [
+            r["seq"]
+            for r in graph.query(
+                'MATCH (s:"Session" {id: \'legacy\'})-[:"HAS_MESSAGE"]->(m:"Message") '
+                "RETURN m.seq AS seq ORDER BY m.seq"
+            )
+        ]
+        assert seqs == sorted(set(seqs)), "a number was handed out twice"
+
+    def test_the_number_is_established_once(self, graph):
+        history = AgensChatMessageHistory(session_id="counted", graph=graph)
+        history.add_user_message("first")
+        counts: list = []
+
+        from agensgraph.observability import add_query_logger
+
+        add_query_logger(
+            lambda r: counts.append(r) if "count(" in str(r.statement or "") else None
+        )
+        history.add_user_message("second")
+        history.add_user_message("third")
+        assert counts == []
+
+    def test_messages_keep_their_order_across_appends(self, graph):
+        history = AgensChatMessageHistory(session_id="ordered", graph=graph)
+        for i in range(12):
+            history.add_user_message(f"m{i}")
+        assert [m.content for m in history.messages] == [f"m{i}" for i in range(12)]
+
+    @pytest.mark.asyncio
+    async def test_the_async_path_numbers_the_same_way(self, graph):
+        history = AgensChatMessageHistory(session_id="async-ordered", graph=graph)
+        await history.aadd_messages([HumanMessage(content=f"a{i}") for i in range(5)])
+        await history.aadd_messages([HumanMessage(content="a5")])
+        got = await history.aget_messages()
+        assert [m.content for m in got] == [f"a{i}" for i in range(6)]

@@ -10,8 +10,8 @@ import os
 from langchain_agensgraph import (
     AgensChatMessageHistory,
     AgensGraph,
-    AgensSaver,
     AgensgraphVector,
+    AgensSaver,
 )
 from tests.integration_tests.fake_embeddings import FakeEmbeddings
 
@@ -73,8 +73,9 @@ def test_checkpoint_indexes_thread_keys():
 
 
 def test_add_graph_documents_indexes_id():
-    from langchain_agensgraph import GraphDocument, Node, Relationship
     from langchain_core.documents import Document
+
+    from langchain_agensgraph import GraphDocument, Node, Relationship
 
     g = AgensGraph("idxtest", _conf(), create=True)
     g.query("MATCH (n) DETACH DELETE n")

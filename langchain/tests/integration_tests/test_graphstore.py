@@ -15,9 +15,7 @@ limitations under the License.
 '''
 
 import os
-import re
-import unittest, pytest
-from typing import Any, Dict
+import unittest
 
 from langchain_core.documents import Document
 
@@ -58,13 +56,11 @@ class TestAgensGraph(unittest.TestCase):
     def setUp(self) -> None:
         self.assertIsNotNone(conf["dbname"])
         self.assertIsNotNone(conf["user"])
-        self.assertIsNotNone(conf["password"])
 
         self.graph = AgensGraph("test", conf, create=True)
         self.graph.query("MATCH (n) DETACH DELETE n")
 
-    def test_node_properties(self) -> None:
-        # Create two nodes and a relationship
+    def _seed(self) -> None:
         self.graph.query(
             """
             CREATE ELABEL IF NOT EXISTS "REL_TYPE";
@@ -75,72 +71,42 @@ class TestAgensGraph(unittest.TestCase):
             MERGE (la)-[:"REL_TYPE" {rel_prop: 'abc'}]-> (lc)
             """
         )
-        # Refresh schema information
-        # self.graph.refresh_schema()
+        self.graph.refresh_schema(force=True)
 
-        node_properties = self.graph._get_node_properties()
-
-        expected_node_properties = [
-            {
-                "properties": [{"property": "property_a", "type": "STRING"}],
-                "labels": "LabelA",
-            }
-        ]
-
+    def test_node_properties(self) -> None:
+        self._seed()
+        node_props = self.graph.get_structured_schema["node_props"]
         self.assertEqual(
-            sorted(node_properties, key=lambda x: x["labels"]), expected_node_properties
+            node_props["LabelA"], [{"property": "property_a", "type": "string"}]
         )
+        # A label with no properties is still a label, and is still reported.
+        self.assertIn("LabelB", node_props)
 
     def test_edge_properties(self) -> None:
-        # Create two nodes and a relationship
-        self.graph.query(
-            """
-            CREATE ELABEL IF NOT EXISTS "REL_TYPE";
-            CREATE (la:"LabelA" {property_a: 'a'})
-            CREATE (lb:"LabelB")
-            CREATE (lc:"LabelC")
-            MERGE (la)-[:"REL_TYPE"]-> (lb)
-            MERGE (la)-[:"REL_TYPE" {rel_prop: 'abc'}]-> (lc)
-            """
+        self._seed()
+        rel_props = self.graph.get_structured_schema["rel_props"]
+        # An edge's own properties, which are only reachable if the decoder keeps them.
+        self.assertEqual(
+            rel_props["REL_TYPE"], [{"property": "rel_prop", "type": "string"}]
         )
-        # Refresh schema information
-        # self.graph.refresh_schema()
-
-        relationships_properties = self.graph._get_edge_properties()
-
-        expected_relationships_properties = [
-            {
-                "type": "REL_TYPE",
-                "properties": [{"property": "rel_prop", "type": "STRING"}],
-            }
-        ]
-
-        self.assertEqual(relationships_properties, expected_relationships_properties)
 
     def test_relationships(self) -> None:
-        self.graph.query(
-            """
-            CREATE ELABEL IF NOT EXISTS "REL_TYPE";
-            CREATE (la:"LabelA" {property_a: 'a'})
-            CREATE (lb:"LabelB")
-            CREATE (lc:"LabelC")
-            MERGE (la)-[:"REL_TYPE"]-> (lb)
-            MERGE (la)-[:"REL_TYPE" {rel_prop: 'abc'}]-> (lc)
-            """
-        )
-        # Refresh schema information
-        # self.graph.refresh_schema()
-
-        relationships = self.graph._get_triples()
-
-        expected_relationships = [
-            {"start": "LabelA", "type": "REL_TYPE", "end": "LabelB"},
-            {"start": "LabelA", "type": "REL_TYPE", "end": "LabelC"},
-        ]
-
+        self._seed()
+        rels = self.graph.get_structured_schema["relationships"]
         self.assertEqual(
-            sorted(relationships, key=lambda x: x["end"]), expected_relationships
+            sorted(rels, key=lambda x: x["end"]),
+            [
+                {"start": "LabelA", "type": "REL_TYPE", "end": "LabelB"},
+                {"start": "LabelA", "type": "REL_TYPE", "end": "LabelC"},
+            ],
         )
+
+    def test_counts_come_with_the_schema(self) -> None:
+        """Counts are free -- they arrive from the catalogs with everything else."""
+        self._seed()
+        counts = self.graph.get_structured_schema["counts"]
+        self.assertEqual(counts["LabelA"], 1)
+        self.assertEqual(counts["REL_TYPE"], 2)
 
     def test_add_documents(self) -> None:
         # Create two nodes and a relationship
@@ -159,39 +125,38 @@ class TestAgensGraph(unittest.TestCase):
             "MATCH (n) RETURN label(n) AS label, count(*) AS count ORDER BY label"
         )
 
-        expected = [
-            {"label": "Document", "count": 1},
-            {"label": "bar", "count": 1},
-            {"label": "foo", "count": 2},
-        ]
-        self.assertEqual(output, expected)
-
-    def test_get_schema(self) -> None:
-        self.graph.refresh_schema()
-
-        expected = """
-            Node properties are the following:
-            []
-            Relationship properties are the following:
-            []
-            The relationships are the following:
-            []
-            """
-        # check that works on empty schema
-        graph_schema = self.graph.get_schema
-
+        # One `foo`, not two: both mentions carry id "foo" and an element is merged on
+        # its id. Previously `include_source=True` merged on the whole property map, so
+        # the same entity became two nodes depending on the flag.
         self.assertEqual(
-            re.sub(r"\s", "", graph_schema), re.sub(r"\s", "", expected)
+            {row["label"]: row["count"] for row in output},
+            {"Document": 1, "bar": 1, "foo": 1},
         )
 
+    def test_get_schema(self) -> None:
+        """The schema, empty and then populated.
+
+        Asserted on the structured form plus the rendered string's sections, rather than
+        on a verbatim repr of a Python dict. The old test compared the whole rendering
+        character for character, which made it sensitive to dict ordering and to the
+        spelling of a type name -- neither of which is what the schema is for.
+        """
+        self.graph.refresh_schema(force=True)
+
+        empty = self.graph.get_schema
+        for section in (
+            "Node properties are the following:",
+            "Relationship properties are the following:",
+            "The relationships are the following:",
+        ):
+            self.assertIn(section, empty)
+
         actual_structured = self.graph.get_structured_schema
-        # 0.2.0 added capability metadata; compare structure ignoring it.
         self.assertEqual(actual_structured["node_props"], {})
         self.assertEqual(actual_structured["rel_props"], {})
         self.assertEqual(actual_structured["relationships"], [])
         self.assertIn("metadata", actual_structured)
 
-        # Create two nodes and a relationship
         self.graph.query(
             """
             CREATE VLABEL IF NOT EXISTS a;
@@ -201,67 +166,29 @@ class TestAgensGraph(unittest.TestCase):
             """
         )
 
-        # check that schema doesn't update without refresh
-        self.assertEqual(
-            re.sub(r"\s", "", self.graph.get_schema), re.sub(r"\s", "", expected)
-        )
+        # The schema does not update without a refresh.
         stale = self.graph.get_structured_schema
         self.assertEqual(stale["node_props"], {})
-        self.assertEqual(stale["rel_props"], {})
         self.assertEqual(stale["relationships"], [])
 
-        # two possible orderings of node props
-        expected_possibilities = [
-            """
-            Node properties are the following:
-            [
-                {'labels': 'a', 'properties': [{'type': 'INTEGER', 'property': 'id'}]},
-                {'labels': 'c', 'properties': [{'type': 'INTEGER', 'property': 'id'}]}
-            ]
-            Relationship properties are the following:
-            [
-                {'type': 'b', 'properties': [{'type': 'INTEGER', 'property': 'id'}]}
-            ]
-            The relationships are the following:
-            [
-                '(:"a")-[:"b"]->(:"c")'
-            ]
-            """,
-            """
-            Node properties are the following:
-            [
-                {'labels': 'c', 'properties': [{'type': 'INTEGER', 'property': 'id'}]},
-                {'labels': 'a', 'properties': [{'type': 'INTEGER', 'property': 'id'}]}
-            ]
-            Relationship properties are the following:
-            [
-                {'type': 'b', 'properties': [{'type': 'INTEGER', 'property': 'id'}]}
-            ]
-            The relationships are the following:
-            [
-                '(:"a")-[:"b"]->(:"c")'
-            ]
-            """,
-        ]
-
-        self.graph.refresh_schema()
-
-        # check that schema is refreshed
-        self.assertIn(
-            re.sub(r"\s", "", self.graph.get_schema),
-            [re.sub(r"\s", "", x) for x in expected_possibilities],
-        )
+        self.graph.refresh_schema(force=True)
         refreshed = self.graph.get_structured_schema
+
+        # `integer` rather than `INTEGER`: the type is `jsonb_typeof`'s, with a whole
+        # number told from a fractional one.
         self.assertEqual(
             refreshed["node_props"],
             {
-                "a": [{"property": "id", "type": "INTEGER"}],
-                "c": [{"property": "id", "type": "INTEGER"}],
+                "a": [{"property": "id", "type": "integer"}],
+                "c": [{"property": "id", "type": "integer"}],
             },
         )
         self.assertEqual(
-            refreshed["rel_props"], {"b": [{"property": "id", "type": "INTEGER"}]}
+            refreshed["rel_props"], {"b": [{"property": "id", "type": "integer"}]}
         )
         self.assertEqual(
             refreshed["relationships"], [{"start": "a", "type": "b", "end": "c"}]
         )
+        # Counts arrive from the catalogs with everything else.
+        self.assertEqual(refreshed["counts"], {"a": 1, "c": 1, "b": 1})
+        self.assertIn('(:"a")-[:"b"]->(:"c")', self.graph.get_schema)

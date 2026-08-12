@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import os
 
-import pytest
-
 from langchain_agensgraph.vectorstores.agensgraph_vector import (
     AgensgraphVector,
     HybridSearchConfig,
@@ -19,7 +17,7 @@ URL = os.environ.get("AGENSGRAPH_URL")
 
 
 def _drop_vector_indexes(store: AgensgraphVector) -> None:
-    for idx in store.query("SELECT name FROM ag_list_vector_indexes()"):
+    for idx in store._vector_indexes():
         store.query(f'''DROP PROPERTY INDEX "{idx['name']}" CASCADE''')
     store.query("MATCH (n) DETACH DELETE n")
 
@@ -42,7 +40,7 @@ def test_create_hnsw_index_with_build_params():
         index_config=IndexConfig(am=VectorIndexAM.HNSW, m=8, ef_construction=32)
     )
     # Index is present and usable.
-    names = [i["name"] for i in store.query("SELECT name FROM ag_list_vector_indexes()")]
+    names = [i["name"] for i in store._vector_indexes()]
     assert "hnsw_cfg_idx" in names
     assert store.similarity_search("a", k=2)
     store.close()

@@ -98,17 +98,46 @@ class TestOpGrouping:
 
 
 class TestWildcardMatching:
+    @staticmethod
+    def _ok(prefix, path, match_type):
+        from langgraph.store.base import MatchCondition
+
+        return AgensStore._condition_ok(
+            prefix, MatchCondition(match_type=match_type, path=path)
+        )
+
     def test_prefix_wildcard(self):
-        assert AgensStore._wildcard_ok("users.alice.memories", ("users", "*"), "prefix")
-        assert not AgensStore._wildcard_ok("orgs.alice", ("users", "*"), "prefix")
+        assert self._ok("users.alice.memories", ("users", "*"), "prefix")
+        assert not self._ok("orgs.alice", ("users", "*"), "prefix")
 
     def test_suffix_wildcard(self):
-        ok = AgensStore._wildcard_ok
-        assert ok("users.alice.memories", ("*", "memories"), "suffix")
-        assert not ok("users.alice.notes", ("*", "memories"), "suffix")
+        assert self._ok("users.alice.memories", ("*", "memories"), "suffix")
+        assert not self._ok("users.alice.notes", ("*", "memories"), "suffix")
 
-    def test_length_mismatch_does_not_match(self):
-        assert not AgensStore._wildcard_ok("users", ("users", "*", "*"), "prefix")
+    def test_a_namespace_shorter_than_the_path_does_not_match(self):
+        assert not self._ok("users", ("users", "*", "*"), "prefix")
+
+    def test_an_unknown_match_type_is_refused(self):
+        with pytest.raises(ValueError, match="match type"):
+            self._ok("users.alice", ("users",), "somewhere-in-the-middle")
+
+    def test_every_condition_has_to_hold(self):
+        """LangGraph applies ``all`` over the conditions, so one match is not enough."""
+        from langgraph.store.base import ListNamespacesOp, MatchCondition
+
+        op = ListNamespacesOp(
+            match_conditions=(
+                MatchCondition(match_type="prefix", path=("users", "*")),
+                MatchCondition(match_type="suffix", path=("memories",)),
+            ),
+            max_depth=None,
+            limit=10,
+            offset=0,
+        )
+        store = AgensStore.__new__(AgensStore)
+        assert store._apply_match_conditions(
+            ["users.alice.memories", "users.alice.notes", "orgs.bob.memories"], op
+        ) == ["users.alice.memories"]
 
 
 class TestDepthTruncation:
@@ -132,26 +161,42 @@ class TestPredicateBuilders:
         ).as_string()
         assert " OR " in out
         assert "IN" not in out
-        assert params["p0"].obj == "a" and params["k0"].obj == "k1"
-        assert params["p1"].obj == "b" and params["k1"].obj == "k2"
+        # Sent as text, not wrapped as jsonb: the property index is on the text, so a
+        # jsonb comparison would not match it.
+        assert params["p0"] == "a" and params["k0"] == "k1"
+        assert params["p1"] == "b" and params["k1"] == "k2"
 
-    def test_namespace_predicate_is_a_seekable_range(self):
+    def test_namespace_predicate_asks_whether_it_is_an_ancestor(self):
+        """A containment test, not a range.
+
+        The range it replaced compared two strings, and jsonb compares with the
+        database's collation: on a linguistically collated database the descendant
+        `users.u5.notes` did not fall inside `[users.u5., users.u5/)` at all, so a
+        search of a namespace returned only itself. Equality inside a list is the
+        same answer on every database.
+        """
         params: dict = {}
         out = AgensStore._namespace_predicate_named("users.u5", params, "").as_string()
-        # a contiguous range the planner can turn into an Index Cond ...
-        assert ">=" in out and "<" in out
-        # ... plus the residual that removes the over-selected siblings
-        assert " OR " in out
-        assert params["ns_p"].obj == "users.u5"
-        assert params["ns_lo"].obj == "users.u5."
-        assert params["ns_hi"].obj == "users.u5/"
+        assert "@>" in out
+        assert "ancestors" in out
+        assert params["ns_p"].obj == ["users.u5"]
 
     def test_namespace_predicate_tags_keep_params_distinct(self):
         params: dict = {}
         AgensStore._namespace_predicate_named("a", params, "_mc0")
         AgensStore._namespace_predicate_named("b", params, "_mc1")
-        assert params["ns_p_mc0"].obj == "a"
-        assert params["ns_p_mc1"].obj == "b"
+        assert params["ns_p_mc0"].obj == ["a"]
+        assert params["ns_p_mc1"].obj == ["b"]
+
+    def test_ancestors_of_names_every_containing_namespace(self):
+        from langchain_agensgraph.store.agensgraph import ancestors_of
+
+        assert ancestors_of("users") == ["users"]
+        assert ancestors_of("users.alice.memories") == [
+            "users",
+            "users.alice",
+            "users.alice.memories",
+        ]
 
 
 class TestMatchConditions:

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any
 
+import pytest
 from langchain_core.documents import Document
 from langchain_core.runnables import RunnableLambda
 
@@ -111,3 +113,105 @@ async def test_async_conversion():
     )
     assert len(docs) == 2
     assert all(d.nodes for d in docs)
+
+
+class TestOneEntityHoweverTheModelSpellsItsType:
+    """A type is admitted whatever its case, and an endpoint is looked up by that.
+
+    A model naming the same entity ``Person`` among the nodes and ``PERSON`` in a
+    relationship is naming one entity. Looked up by what it wrote, the node it described
+    is missed and a second one of the same type is built carrying none of the properties
+    -- and that one is written last, so it wins.
+    """
+
+    PAYLOAD = {
+        "nodes": [
+            {
+                "id": "Alice",
+                "type": "Person",
+                "properties": [{"key": "role", "value": "engineer"}],
+            }
+        ],
+        "relationships": [
+            {
+                "source_id": "Alice",
+                "source_type": "PERSON",
+                "target_id": "Acme",
+                "target_type": "company",
+                "type": "works_at",
+                "properties": [],
+            }
+        ],
+    }
+
+    def _transform(self):
+        transformer = LLMGraphTransformer(
+            FakeStructuredLLM(self.PAYLOAD),
+            allowed_nodes=["Person", "Company"],
+            allowed_relationships=["WORKS_AT"],
+            node_properties=True,
+        )
+        return transformer.process_response(Document(page_content="Alice at Acme."))
+
+    def test_the_relationships_endpoint_is_the_node_that_was_described(self):
+        doc = self._transform()
+        assert [(n.id, n.type) for n in doc.nodes] == [("Alice", "Person")]
+        assert doc.relationships[0].source.properties == {"role": "engineer"}
+
+    def test_the_endpoint_keeps_the_case_the_caller_asked_for(self):
+        doc = self._transform()
+        rel = doc.relationships[0]
+        assert (rel.source.type, rel.target.type, rel.type) == (
+            "Person",
+            "Company",
+            "WORKS_AT",
+        )
+
+
+class TestCancellationIsNotAFailedDocument:
+    """``CancelledError`` is a ``BaseException``, so it arrives like any other result.
+
+    Classified as a failure it would be logged and skipped; classified as a result it
+    lands in the returned list of graph documents and fails later in whatever is handed
+    it. A caller that cancelled is owed the cancellation.
+    """
+
+    class CancellingLLM(FakeStructuredLLM):
+        """One call is cancelled, as a client cleaning up after a timeout does."""
+
+        def __init__(self, payload: dict):
+            super().__init__(payload)
+            self.calls = 0
+
+        def with_structured_output(self, schema: Any, **kwargs: Any):
+            async def answer(_messages):
+                self.calls += 1
+                if self.calls == 2:
+                    raise asyncio.CancelledError()
+                return dict(self._payload)
+
+            return RunnableLambda(func=lambda m: dict(self._payload), afunc=answer)
+
+    @pytest.mark.asyncio
+    async def test_an_inner_cancellation_is_raised_on(self):
+        transformer = LLMGraphTransformer(self.CancellingLLM(CANNED))
+        docs = [Document(page_content=f"doc {i}") for i in range(3)]
+        with pytest.raises(asyncio.CancelledError):
+            await transformer.aconvert_to_graph_documents(docs)
+
+    @pytest.mark.asyncio
+    async def test_an_ordinary_failure_is_still_skipped(self):
+        class FailingLLM(FakeStructuredLLM):
+            def with_structured_output(self, schema: Any, **kwargs: Any):
+                async def answer(_messages):
+                    raise RuntimeError("the answer hit the output-token limit")
+
+                return RunnableLambda(
+                    func=lambda m: dict(self._payload), afunc=answer
+                )
+
+        transformer = LLMGraphTransformer(FailingLLM(CANNED))
+        out = await transformer.aconvert_to_graph_documents(
+            [Document(page_content="doc")]
+        )
+        assert out == []

@@ -28,7 +28,22 @@ import agensgraph
 from agensgraph import AsyncConnection, AsyncConnectionPool, DesiredIndex, DesiredLabel
 from agensgraph.cypher import quote_identifier
 from agensgraph.introspect import MAX_IDENTIFIER
+from mcp_agensgraph_common.connection import ensure_graph
 from psycopg.types.json import Jsonb
+
+__all__ = [
+    "BootstrapReport",
+    "MEMORY_LABEL",
+    "RELATION_VOCABULARY",
+    "bootstrap",
+    "edge_index_name",
+    "edge_labels",
+    "ensure_edge_uniqueness",
+    "ensure_graph",
+    "fulltext_expression",
+    "make_pool",
+    "verify",
+]
 
 logger = logging.getLogger("mcp_agensgraph_memory")
 
@@ -130,20 +145,6 @@ class BootstrapReport:
         if self.reindexed:
             parts.append("full-text index rebuilt")
         return ", ".join(parts)
-
-
-async def ensure_graph(dsn: str, graphname: str) -> None:
-    """Make the graph, on a connection of its own.
-
-    Before the pool, because a pool told which graph to read selects it on every connection it
-    makes and a graph that is not there yet fails all of them.
-    """
-    conn = await AsyncConnection.connect(dsn, autocommit=True)
-    try:
-        await conn.execute(f"create graph if not exists {quote_identifier(graphname)}")
-    finally:
-        await conn.close()
-    logger.info("Graph %r is there", graphname)
 
 
 async def bootstrap(pool: AsyncConnectionPool, graphname: str) -> BootstrapReport:

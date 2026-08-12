@@ -1,41 +1,43 @@
-"""AgensGraph connection + query execution for the DB-backed MCP servers.
+"""AgensGraph connection and query execution for the DB-backed MCP servers.
 
-Centralizes the connection-pool lifecycle, graph bootstrap, and a single query
-executor that applies (per transaction, so it is pool-safe):
+Three things are settled once, when the pool is made, rather than per tool call:
 
-- ``SET TRANSACTION READ ONLY`` when ``read_only`` — AgensGraph rejects any Cypher
-  write at the database level (verified). This is the real read-only guarantee.
-- ``SET LOCAL statement_timeout`` for read queries.
-- ``SET LOCAL graph_path`` to the (identifier-quoted) graph name.
+* **which graph to read.** The driver selects it on every connection it hands out, and fills
+  the label table for it. Selecting it per statement is a statement per call, and the driver
+  does not read a graph path set behind its back.
+* **how long a statement may take.** It travels in the connection's own startup options, so
+  the limit is already in force when the connection arrives.
+* **how many connections there may be.** Both bounds are given values, because a pool that
+  names neither is four connections wide however much work arrives.
 
-Identifiers (graph name) are composed with ``psycopg.sql`` rather than f-strings.
+What a call decides for itself is whether its transaction may write. A read runs inside the
+driver's ``read_only_transaction``, so the refusal is the server's -- ``25006`` for a Cypher
+write, an ``INSERT``, a ``TRUNCATE`` or a ``DROP`` alike -- rather than a reading of the text.
+It ends by rolling back: a transaction that could not write has nothing to commit, and the one
+thing it can do is ``SET``, which committed would belong to whoever borrows the connection next.
 """
 
 from __future__ import annotations
 
 import logging
 import re
-from contextlib import asynccontextmanager
 from typing import Any, Optional
 
 import agensgraph
-import psycopg
-from agensgraph.cypher import without_literals
-from psycopg import sql
+from agensgraph import AsyncConnection, AsyncConnectionPool
+from agensgraph.cypher import quote_identifier, without_literals
 from psycopg.conninfo import make_conninfo
-from psycopg.rows import namedtuple_row
 from psycopg.types.json import Jsonb
-from psycopg_pool import AsyncConnectionPool, PoolTimeout
 
-from .results import record_to_dict
+from .config import DEFAULT_POOL_MAX_SIZE, DEFAULT_POOL_MIN_SIZE
+from .results import rows_of
 
 logger = logging.getLogger("mcp_agensgraph_common")
 
-# Paging clauses the caller ended their own query with. Cypher takes one set of them per
-# query part, so ours cannot follow theirs (see ``run_paginated_query``). ``OFFSET`` is
-# ``SKIP`` under another name, so a query ending in one takes the same shape as a query
-# ending in the other: appending to `... OFFSET 5` produces `... OFFSET 5 SKIP 0 LIMIT 101`,
-# which the server rejects with "Cypher query must end with RETURN, FINISH or update clause".
+# Paging clauses the caller ended their own query with. Cypher takes one set of them per query
+# part, so ours cannot follow theirs: appending to `... OFFSET 5` produces
+# `... OFFSET 5 SKIP 0 LIMIT 101`, which the server rejects with "Cypher query must end with
+# RETURN, FINISH or update clause". `OFFSET` is `SKIP` under another name.
 _TRAILING_PAGING = re.compile(r"\b(?:SKIP|OFFSET|LIMIT)\s+\S+\s*$", re.IGNORECASE)
 
 # Clauses the grammar keeps for the top of a statement. `SELECT * FROM (<cypher>) AS _page`
@@ -45,6 +47,10 @@ _TRAILING_PAGING = re.compile(r"\b(?:SKIP|OFFSET|LIMIT)\s+\S+\s*$", re.IGNORECAS
 # `... NEXT RETURN t` and `... CALL jsonb_each(...) YIELD key RETURN key` each come back
 # `ERROR: syntax error at or near "FILTER" / "NEXT" / "CALL"`.
 _TOP_LEVEL_ONLY = re.compile(r"(?<![A-Za-z0-9_.\"])(FILTER|NEXT|YIELD)(?![A-Za-z0-9_])", re.IGNORECASE)
+
+# A query made of several parts. Which one a trailing SKIP and LIMIT belong to is the reason
+# this is worth finding: they bind to the last part alone.
+_UNION = re.compile(r"(?<![A-Za-z0-9_.\"])UNION(?![A-Za-z0-9_])", re.IGNORECASE)
 
 
 def unwrappable_clause(query: str) -> Optional[str]:
@@ -61,10 +67,10 @@ def jsonb_params(params: Optional[dict[str, Any]]) -> Optional[dict[str, Any]]:
     """Wrap list/dict param values as JSONB.
 
     Cypher parameters are JSONB-shaped (a query like ``UNWIND $records AS r`` or
-    ``WHERE n.name IN $names`` expects a JSONB array/object), but psycopg cannot adapt
-    a bare Python ``list``/``dict``. Params reaching an MCP tool arrive as plain JSON
-    values, so wrap any list/dict in ``Jsonb`` here; scalars and already-wrapped
-    values pass through unchanged.
+    ``WHERE n.name IN $names`` expects a JSONB array/object), but psycopg adapts a bare Python
+    ``list`` as a PostgreSQL array. Params reaching an MCP tool arrive as plain JSON values, so
+    wrap any list/dict in ``Jsonb`` here; scalars and already-wrapped values pass through
+    unchanged.
     """
     if not params:
         return params
@@ -97,50 +103,45 @@ def build_dsn(db_url: str, username: str, password: str, database: str) -> str:
     return make_conninfo(db_url, **{k: v for k, v in given.items() if v is not None})
 
 
-def create_pool(dsn: str, **kwargs: Any) -> AsyncConnectionPool:
-    """Create a (not-yet-opened) async connection pool of graph connections.
+def create_pool(
+    dsn: str,
+    graphname: str,
+    *,
+    min_size: int = DEFAULT_POOL_MIN_SIZE,
+    max_size: int = DEFAULT_POOL_MAX_SIZE,
+    read_timeout: Optional[float] = None,
+    **kwargs: Any,
+) -> AsyncConnectionPool:
+    """A (not-yet-opened) pool of connections already reading ``graphname``.
 
-    The connection class is the driver's, which is what makes a vertex arrive as a vertex.
-    Read over a plain psycopg connection, a graph value is the text the server printed and has
-    to be matched with a regular expression; the endpoints of an edge are two identities that
-    expression cannot resolve, so ``MATCH ()-[r]->() RETURN r`` reported an empty map at each
-    end. The driver decodes the wire form, so both ends are named whether or not the query
-    also returned the vertices.
+    The driver selects the graph on every connection it makes, which is where the saving is:
+    a statement that selects a graph is a round trip, and every tool call sends one statement.
+    It is also the only way to tell the driver which graph its label table describes, since it
+    does not read a graph path set behind its back.
 
-    It also refuses a server it cannot read at connect time, from the version in the startup
-    packet, rather than at whichever later statement first wants a catalog that is not there.
+    ``read_timeout`` becomes the connection's own ``statement_timeout``, in its startup options,
+    so it is in force before the first statement and costs nothing per call. A limit set inside
+    the transaction instead is one more round trip on every read; a per-caller deadline is two,
+    because it opens the transaction to carry the setting and the read-only block then nests
+    inside it. Measured over a proxy counting client-to-server flushes: 5.00 round trips per
+    read call this way, 6.00 with the limit set per statement, and 9.00 with a deadline.
+
+    Every statement on the connection is bounded by it, a write included. Lifting it for a write
+    is a round trip of its own, and what it buys is a statement somebody else wrote holding a
+    pooled connection for as long as it likes.
     """
-    return AsyncConnectionPool(
-        dsn, open=False, connection_class=agensgraph.AsyncConnection, **kwargs
+    options = kwargs.pop("kwargs", None) or {}
+    if read_timeout is not None:
+        setting = f"-c statement_timeout={int(read_timeout * 1000)}"
+        options = {**options, "options": f"{options.get('options', '')} {setting}".strip()}
+    return agensgraph.AsyncConnectionPool(
+        dsn,
+        graph=graphname,
+        min_size=min_size,
+        max_size=max_size,
+        kwargs=options or None,
+        **kwargs,
     )
-
-
-@asynccontextmanager
-async def get_pool_connection(pool: AsyncConnectionPool, timeout: Optional[float] = None):
-    """Borrow a connection from the pool, returning it on exit.
-
-    Includes a workaround for a psycopg_pool edge case where the pool can time out
-    while reporting capacity; ``putconn`` resets the connection (rolling back any
-    open transaction), so callers manage their own transaction explicitly.
-    """
-    try:
-        connection = await pool.getconn(timeout=timeout)
-    except PoolTimeout:
-        await pool._add_connection(None)  # pragma: no cover - pool workaround
-        connection = await pool.getconn(timeout=timeout)
-    try:
-        # `async with connection` commits on clean exit / rolls back on error, so
-        # callers that don't manage their own transaction still get committed work.
-        async with connection:
-            yield connection
-    finally:
-        await pool.putconn(connection)
-
-
-SERVER_PROGRAM_QUERY = """
-select rolsuper or pg_has_role(current_user, 'pg_execute_server_program', 'member')
-from pg_roles where rolname = current_user
-"""
 
 
 async def check_role_cannot_run_programs(
@@ -156,9 +157,12 @@ async def check_role_cannot_run_programs(
 
     So the role is asked about once, here, at startup, and one that holds it is refused rather
     than left to find out. A server that advertises a read-only tool while connected as such a
-    role is making a claim it cannot keep. Asked as ``member`` rather than ``usage``, because a
-    membership granted ``WITH INHERIT FALSE`` carries nothing until ``SET ROLE`` names it --
-    and ``SET ROLE`` moves no rows, so a read-only transaction permits it.
+    role is making a claim it cannot keep.
+
+    The question is the driver's ``can_run_server_programs``, which asks membership as
+    ``member`` rather than ``usage`` -- a membership granted ``WITH INHERIT FALSE`` carries
+    nothing until ``SET ROLE`` names it, and ``SET ROLE`` moves no rows, so a read-only
+    transaction permits it.
     """
     if allow_server_programs:
         logger.warning(
@@ -166,12 +170,10 @@ async def check_role_cannot_run_programs(
             "--allow-server-programs was given. A read-only tool is not a boundary for it."
         )
         return
-    async with get_pool_connection(pool) as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(SERVER_PROGRAM_QUERY)
-            row = await cur.fetchone()
+    async with pool.connection() as conn:
+        held = await conn.can_run_server_programs()
         await conn.rollback()
-    if row and row[0]:
+    if held:
         raise RuntimeError(
             "This role can run a command on the server's host, through COPY ... TO PROGRAM, "
             "which a read-only transaction does not stop -- so the read tools would not be a "
@@ -180,102 +182,73 @@ async def check_role_cannot_run_programs(
         )
 
 
-async def ensure_graph(pool: AsyncConnectionPool, graphname: str) -> None:
-    """``CREATE GRAPH IF NOT EXISTS`` with an identifier-quoted graph name."""
-    async with get_pool_connection(pool) as conn:
-        async with conn.cursor() as cur:
-            await cur.execute(
-                sql.SQL("CREATE GRAPH IF NOT EXISTS {}").format(sql.Identifier(graphname))
-            )
-        await conn.commit()
-    logger.info("Ensured graph %r exists", graphname)
+async def ensure_graph(dsn: str, graphname: str) -> None:
+    """Make the graph, on a connection of its own, before the pool that reads it.
+
+    Before the pool rather than through it: a pool told which graph to read selects it on every
+    connection it makes, and a graph that is not there yet fails all of them.
+    """
+    conn = await AsyncConnection.connect(dsn, autocommit=True)
+    try:
+        await conn.execute(f"CREATE GRAPH IF NOT EXISTS {quote_identifier(graphname)}")
+    finally:
+        await conn.close()
+    logger.info("Graph %r is there", graphname)
 
 
 async def run_query(
     pool: AsyncConnectionPool,
-    graphname: str,
     query: str,
     params: Optional[dict[str, Any]] = None,
     *,
     read_only: bool = False,
-    timeout: Optional[float] = None,
+    allow_server_programs: bool = False,
 ) -> list[dict[str, Any]]:
-    """Execute a Cypher query against ``graphname`` and return parsed rows.
+    """Run one statement on a connection from the pool and return its rows as maps.
 
-    When ``read_only`` is set, the statement runs in a READ ONLY transaction so the
-    database itself rejects writes (defense in depth, independent of any client-side
-    keyword check).
+    With ``read_only`` the statement runs inside a transaction the server will not let write,
+    which is the boundary itself rather than a message about one: a Cypher write, an ``INSERT``,
+    a ``TRUNCATE`` and a ``DROP`` are each refused with ``25006`` and leave nothing behind. The
+    block ends by rolling back, so a ``SET`` the statement performed does not reach the next
+    caller to borrow the connection.
+
+    The graph is the pool's, so nothing here selects one.
     """
-    set_path = sql.SQL("SET LOCAL graph_path = {}").format(sql.Identifier(graphname))
-    async with get_pool_connection(pool) as conn:
-        async with conn.cursor(row_factory=namedtuple_row) as cur:
-            try:
-                if read_only:
-                    # Must precede any snapshot-taking statement in the transaction.
-                    await cur.execute("SET TRANSACTION READ ONLY")
-                if timeout is not None:
-                    # SET does not accept bind parameters; inline the validated int.
-                    await cur.execute(
-                        sql.SQL("SET LOCAL statement_timeout = {}").format(
-                            sql.Literal(int(timeout * 1000))
-                        )
-                    )
-                await cur.execute(set_path)
-                bound = jsonb_params(params)
-                if bound:
-                    await cur.execute(query, bound)
-                else:
-                    await cur.execute(query)
-                if read_only:
-                    # Nothing to commit -- the transaction could not write. What it *could* do
-                    # is `SET`, and a committed setting belongs to the session rather than the
-                    # transaction, so on a pooled connection it would be inherited by whoever
-                    # borrows it next. Measured on a pool of one: `SET ROLE`, `SET search_path`
-                    # and `SET work_mem` all reached the following call.
-                    await conn.rollback()
-                else:
-                    await conn.commit()
-            except psycopg.Error:
-                await conn.rollback()
-                raise
-
-            try:
-                rows = await cur.fetchall()
-            except psycopg.ProgrammingError:
-                # Statement returned no result set (e.g. SET, write with no RETURN).
-                return []
-
-    return [record_to_dict(r) for r in rows]
+    bound = jsonb_params(params) or None
+    async with pool.connection() as conn:
+        if read_only:
+            async with conn.read_only_transaction(
+                allow_server_programs=allow_server_programs
+            ):
+                result = await conn.execute_query(query, bound)
+        else:
+            async with conn.transaction():
+                result = await conn.execute_query(query, bound)
+    return rows_of(result)
 
 
-async def run_paginated_query(
-    pool: AsyncConnectionPool,
-    graphname: str,
-    query: str,
-    params: Optional[dict[str, Any]] = None,
-    *,
-    read_only: bool = False,
-    timeout: Optional[float] = None,
-    limit: int = 100,
-    offset: int = 0,
-) -> tuple[list[dict[str, Any]], bool]:
-    """Run a Cypher query and return one page of rows plus a ``has_more`` flag.
+def paged_statement(query: str, *, limit: int, offset: int) -> str:
+    """The caller's query, asking the server for one page of it and one row more.
 
-    Paging is applied **by the database**, so it can short-circuit instead of
-    materializing the whole result set (the point of paginating an arbitrary read). One
-    extra row is fetched to detect whether more results exist beyond this page.
+    ``SKIP`` and ``LIMIT`` appended to the query is the form the grammar takes anywhere, and it
+    is what a single-part query gets. It binds to the **last query part**, though, so two
+    queries cannot have it:
 
-    Cypher's ``SKIP``/``LIMIT`` carries the page. A query the caller already ended with
-    paging clauses -- ``SKIP``, its GQL spelling ``OFFSET``, or ``LIMIT`` -- takes another set
-    only from outside, wrapped as ``SELECT * FROM (<cypher>) AS _page``.
+    * a ``UNION``, where the last part is one arm. Measured: a five-row page of a two-arm union
+      had the server produce 50,006 rows and Python then kept five. Read as a subquery, the
+      server produces six.
+    * a query that already ends in paging of its own, where a second ``SKIP`` cannot follow the
+      first -- the server answers "Cypher query must end with RETURN, FINISH or update clause".
 
-    Neither shape fits a query that both ends in paging and holds a clause the grammar keeps
-    for the top of a statement, so that is refused here in terms the caller can act on rather
-    than sent to produce a syntax error naming a word they did not write.
+    Both are taken from outside instead, as ``SELECT * FROM (<cypher>) AS _page``, and the
+    closing bracket goes on a line of its own so that a query the caller ended with a ``--``
+    comment does not comment it out. Three clauses the grammar keeps for the top of a statement
+    cannot be read as a subquery at all, so a query holding one of those *and* needing to be
+    wrapped is refused here, in terms the caller can act on, rather than sent to produce a wrong
+    count or a syntax error naming a word they did place correctly.
 
-    Vertex/edge values survive both forms, so the normal parsing still applies.
-
-    Returns ``(rows, has_more)`` where ``rows`` has at most ``limit`` items.
+    ``limit`` and ``offset`` are integers this function bounds, so writing them into the
+    statement binds nothing a caller chose.
     """
     limit = max(1, int(limit))
     offset = max(0, int(offset))
@@ -283,23 +256,48 @@ async def run_paginated_query(
     # Located against the statement with its strings and comments blanked, so that a property
     # named `next` and the word LIMIT inside a quoted value are not read as clauses.
     blanked = without_literals(inner)
-    # limit/offset are validated ints, so inlining them is injection-safe (and both
-    # forms accept binds, but the caller's query owns the param namespace).
-    if not _TRAILING_PAGING.search(blanked):
-        paged = f"{inner}\nSKIP {offset} LIMIT {limit + 1}"
-    elif (clause := unwrappable_clause(inner)) is not None:
-        raise ValueError(
-            f"this query ends with its own paging clause and also uses {clause}, which the "
-            f"grammar accepts only at the top of a statement. A page can be taken by appending "
-            f"SKIP and LIMIT, which cannot follow the paging already there, or by reading the "
-            f"query as a subquery, which {clause} cannot be part of. Take the page in the query "
-            f"itself -- write the SKIP and LIMIT you want -- and ask for it with limit and "
-            f"offset left alone."
+    own_paging = _TRAILING_PAGING.search(blanked) is not None
+    several_parts = _UNION.search(blanked) is not None
+    if not (own_paging or several_parts):
+        return f"{inner}\nSKIP {offset} LIMIT {limit + 1}"
+    if (clause := unwrappable_clause(inner)) is not None:
+        reason = (
+            "is a UNION, so a page of it has to be taken from outside"
+            if several_parts
+            else "ends with its own paging clause, which a second SKIP cannot follow"
         )
-    else:
-        paged = f"SELECT * FROM (\n{inner}\n) AS _page LIMIT {limit + 1} OFFSET {offset}"
+        raise ValueError(
+            f"this query {reason}, and it also uses {clause}, which the grammar accepts only at "
+            f"the top of a statement -- so it cannot be read as the subquery that taking the "
+            f"page from outside needs. Take the page in the query itself, by writing the SKIP "
+            f"and LIMIT you want, and ask for it with limit and offset left alone."
+        )
+    return f"SELECT * FROM (\n{inner}\n) AS _page LIMIT {limit + 1} OFFSET {offset}"
+
+
+async def read_page(
+    pool: AsyncConnectionPool,
+    query: str,
+    params: Optional[dict[str, Any]] = None,
+    *,
+    limit: int = 100,
+    offset: int = 0,
+    allow_server_programs: bool = False,
+) -> tuple[list[dict[str, Any]], bool]:
+    """One page of a read, and whether there is more behind it.
+
+    The page is taken **by the server**, so it can stop rather than produce the whole result and
+    have the rows thrown away here. One row more than the page is asked for, which is how a full
+    page is told from a page with more behind it.
+
+    Returns ``(rows, has_more)`` where ``rows`` holds at most ``limit`` items.
+    """
+    limit = max(1, int(limit))
     rows = await run_query(
-        pool, graphname, paged, params, read_only=read_only, timeout=timeout
+        pool,
+        paged_statement(query, limit=limit, offset=offset),
+        params,
+        read_only=True,
+        allow_server_programs=allow_server_programs,
     )
-    has_more = len(rows) > limit
-    return rows[:limit], has_more
+    return rows[:limit], len(rows) > limit

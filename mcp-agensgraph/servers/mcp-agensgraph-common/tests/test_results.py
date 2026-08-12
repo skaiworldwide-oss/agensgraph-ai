@@ -1,20 +1,20 @@
 import json
-from collections import namedtuple
 
+from agensgraph import Result
 from agensgraph._protocol.graphid import GraphId
 from agensgraph.types import Edge, Vertex
 from mcp_agensgraph_common.results import (
     OMITTED,
+    column_names,
     count_tokens,
     fit_rows,
-    record_to_dict,
+    rows_of,
     value_sanitize,
 )
 
 
-def _rec(**fields):
-    R = namedtuple("R", list(fields))
-    return R(**fields)
+def _result(keys, *records):
+    return Result(records=list(records), keys=list(keys), counts=None)
 
 
 def _vertex(label, labid, locid, props):
@@ -25,37 +25,67 @@ def _edge(label, labid, locid, start, end, props):
     return Edge(GraphId(labid, locid), label, GraphId(*start), GraphId(*end), props)
 
 
-def test_record_to_dict_vertex():
-    rec = _rec(n=_vertex("Person", 3, 1, {"id": 1, "name": "alice"}))
-    out = record_to_dict(rec)
-    assert out["n"] == {
-        "id": "3.1",
-        "label": "Person",
-        "properties": {"id": 1, "name": "alice"},
-    }
+def test_rows_of_vertex():
+    out = rows_of(_result(["n"], (_vertex("Person", 3, 1, {"id": 1, "name": "alice"}),)))
+    assert out == [
+        {
+            "n": {
+                "id": "3.1",
+                "label": "Person",
+                "properties": {"id": 1, "name": "alice"},
+            }
+        }
+    ]
 
 
-def test_record_to_dict_edge_names_both_endpoints_on_its_own():
+def test_rows_of_edge_names_both_endpoints_on_its_own():
     """An edge read without its vertices still says what is at each end."""
-    rec = _rec(r=_edge("KNOWS", 5, 1, (3, 1), (3, 2), {"since": 2020}))
-    out = record_to_dict(rec)
-    assert out["r"] == {
-        "id": "5.1",
-        "label": "KNOWS",
-        "start": "3.1",
-        "end": "3.2",
-        "properties": {"since": 2020},
-    }
+    out = rows_of(_result(["r"], (_edge("KNOWS", 5, 1, (3, 1), (3, 2), {"since": 2020}),)))
+    assert out == [
+        {
+            "r": {
+                "id": "5.1",
+                "label": "KNOWS",
+                "start": "3.1",
+                "end": "3.2",
+                "properties": {"since": 2020},
+            }
+        }
+    ]
 
 
-def test_record_to_dict_walks_containers():
-    rec = _rec(everyone=[_vertex("Person", 3, 1, {"name": "alice"})])
-    assert record_to_dict(rec)["everyone"][0]["properties"] == {"name": "alice"}
+def test_rows_of_walks_containers():
+    out = rows_of(_result(["everyone"], ([_vertex("Person", 3, 1, {"name": "alice"})],)))
+    assert out[0]["everyone"][0]["properties"] == {"name": "alice"}
 
 
-def test_record_to_dict_scalars_passthrough():
-    rec = _rec(count=42, name="plain", flag=True)
-    assert record_to_dict(rec) == {"count": 42, "name": "plain", "flag": True}
+def test_rows_of_scalars_passthrough():
+    out = rows_of(_result(["count", "name", "flag"], (42, "plain", True)))
+    assert out == [{"count": 42, "name": "plain", "flag": True}]
+
+
+def test_a_repeated_column_name_keeps_both_values():
+    """`RETURN n.a AS x, n.b AS x` names two columns, and both were asked for."""
+    out = rows_of(_result(["x", "x"], (1, "alice")))
+    assert out == [{"x": 1, "x (column 2)": "alice"}]
+
+
+def test_a_column_named_after_a_keyword_is_the_name_it_was_given():
+    """Building rows as namedtuples refused this one outright."""
+    assert rows_of(_result(["class"], (1,))) == [{"class": 1}]
+
+
+def test_a_leading_underscore_is_not_renamed():
+    """A namedtuple silently made this `f_x`, so the caller's own alias was unreachable."""
+    assert rows_of(_result(["_x"], (1,))) == [{"_x": 1}]
+
+
+def test_column_names_leaves_a_name_used_once_alone():
+    assert column_names(["a", "b", "c"]) == ["a", "b", "c"]
+
+
+def test_column_names_distinguishes_three_of_a_kind():
+    assert column_names(["x", "x", "x"]) == ["x", "x (column 2)", "x (column 3)"]
 
 
 def test_value_sanitize_marks_an_oversized_list_rather_than_dropping_it():

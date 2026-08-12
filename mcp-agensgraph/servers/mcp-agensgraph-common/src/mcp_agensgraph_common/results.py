@@ -17,9 +17,9 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, NamedTuple
+from typing import Any, Sequence
 
-from agensgraph import to_builtins
+from agensgraph import Result, to_builtins
 
 logger = logging.getLogger("mcp_agensgraph_common")
 
@@ -52,9 +52,57 @@ def as_builtins(value: Any) -> Any:
         return value
 
 
-def record_to_dict(record: NamedTuple) -> dict[str, Any]:
-    """Convert an AgensGraph result row (namedtuple) to a dict."""
-    return {name: as_builtins(getattr(record, name)) for name in record._fields}
+def column_names(keys: Sequence[str]) -> list[str]:
+    """The column names, each one usable as a key of the same map.
+
+    A result's columns are a list rather than a set, and nothing stops two of them sharing a
+    name: ``RETURN n.a AS x, n.b AS x`` names both ``x``. Keeping the first and dropping the
+    second would answer a question with half of it, so a repeat is named by the position it
+    came from and both values survive.
+
+    Nothing else is renamed. A column called ``class`` or ``_x`` is what the caller asked for
+    and is a perfectly good key -- building rows as namedtuples was what could not hold those,
+    with ``ValueError: Type names and field names cannot be a keyword`` for the first and a
+    silent rename to ``f_x`` for the second.
+    """
+    taken: set[str] = set()
+    names: list[str] = []
+    for position, key in enumerate(keys, 1):
+        name = key
+        while name in taken:
+            name = f"{name} (column {position})"
+        taken.add(name)
+        names.append(name)
+    return names
+
+
+def mapping_rows(cursor: Any) -> Any:
+    """A psycopg row factory building the same maps as :func:`rows_of`.
+
+    For a stream, which yields rows rather than a result and so has no column names to hand
+    afterwards. The names are read once, when the factory is built for a result.
+    """
+    names = column_names([column.name for column in cursor.description or ()])
+
+    def build(values: Sequence[Any]) -> dict[str, Any]:
+        return {name: as_builtins(value) for name, value in zip(names, values)}
+
+    return build
+
+
+def rows_of(result: Result) -> list[dict[str, Any]]:
+    """A result's rows as maps of column name to a JSON-shaped value.
+
+    The values arrive decoded: the driver reads the wire form, so a vertex is a vertex and an
+    edge carries its own id, its properties and the identity at each of its ends -- which
+    matching the text the server printed could not do, since an edge read on its own reported
+    an empty map at each end.
+    """
+    names = column_names(result.keys)
+    return [
+        {name: as_builtins(value) for name, value in zip(names, record)}
+        for record in result.records
+    ]
 
 
 def value_sanitize(value: Any, list_limit: int = 128) -> Any:
@@ -132,9 +180,11 @@ def fit_rows(
 __all__ = [
     "OMITTED",
     "as_builtins",
+    "column_names",
     "count_tokens",
     "fit_rows",
-    "record_to_dict",
+    "mapping_rows",
+    "rows_of",
     "token_encoding",
     "value_sanitize",
 ]

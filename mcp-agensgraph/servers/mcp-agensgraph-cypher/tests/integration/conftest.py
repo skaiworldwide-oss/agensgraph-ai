@@ -10,10 +10,15 @@ import pytest_asyncio
 from mcp_agensgraph_cypher.server import (
     create_mcp_server,
     create_pool,
-    get_pool_connection,
+    ensure_graph,
 )
 from mcp_agensgraph_common.safety import quote_identifiers as _quote_identifiers
-from psycopg.rows import namedtuple_row  # type: ignore
+
+# The role these tests run as is whoever the developer is connected as, which locally is the
+# bootstrap superuser -- one that can run a command on the server's host, and so one the read
+# tools refuse to serve unless it is accepted out loud. What is under test here is the
+# transaction, which refuses a write from any role.
+ALLOW_SERVER_PROGRAMS = True
 
 
 def free_port() -> int:
@@ -113,8 +118,9 @@ async def _stop_server(process: Any, port: int) -> None:
 def graphname():
     return os.getenv("AGENSGRAPH_GRAPH_NAME", "test")
 
-@pytest_asyncio.fixture(scope="module", autouse=True)
-async def setup(graphname):
+@pytest.fixture(scope="module")
+def db_url():
+    """Where the server is, out of the environment."""
     db_name = os.getenv("AGENSGRAPH_DB")
     db_user = os.getenv("AGENSGRAPH_USERNAME")
     db_password = os.getenv("AGENSGRAPH_PASSWORD", "")
@@ -128,51 +134,73 @@ async def setup(graphname):
         raise ValueError(
             "Set AGENSGRAPH_DB and AGENSGRAPH_USERNAME to run the tests that need a server."
         )
+    return f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
 
-    db_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
-    agensgraph_driver = create_pool(db_url)
 
-    await agensgraph_driver.open()
+@pytest_asyncio.fixture(scope="function", autouse=True)
+async def setup(graphname, db_url):
+    """A pool reading the test graph, opened and closed inside one test's event loop.
 
-    # Ensure graph exists
-    async with get_pool_connection(agensgraph_driver) as conn:
-        async with conn.cursor(row_factory=namedtuple_row) as cursor:
-            await cursor.execute(f"CREATE GRAPH IF NOT EXISTS {graphname}")
-            await conn.commit()
+    Per test rather than per module, because a pool returns a connection through a worker task
+    on the loop that opened it, and each test here runs in a loop of its own. A pool outliving
+    its loop is handed nothing back: measured, the second test in a module waited the pool's
+    full 30 s and was given no connection at all.
+    """
+    # Before the pool: its connections each select the graph as they are made, so a graph that
+    # is not there yet fails all of them.
+    await ensure_graph(db_url, graphname)
+    pool = create_pool(db_url, graphname, min_size=1, max_size=4, read_timeout=30)
 
-    yield agensgraph_driver
+    await pool.open()
+    await pool.wait()
 
-    await agensgraph_driver.close()
+    yield pool
+
+    await pool.close()
 
 
 @pytest_asyncio.fixture(scope="function")
 async def mcp_server(setup, graphname):
-    mcp = create_mcp_server(setup, graphname=graphname)
-
-    return mcp
+    return create_mcp_server(
+        setup, graphname=graphname, allow_server_programs=ALLOW_SERVER_PROGRAMS
+    )
 
 
 @pytest_asyncio.fixture(scope="function")
-async def mcp_server_short_timeout(setup, graphname):
-    """MCP server with very short timeout for testing timeout behavior."""
-    mcp = create_mcp_server(setup, graphname=graphname, read_timeout=0.01)
-    return mcp
+async def mcp_server_short_timeout(setup, graphname, db_url):
+    """MCP server whose reads have almost no time at all.
+
+    A pool of its own, because how long a read may take is the connections' own
+    ``statement_timeout`` rather than something the server sets per call.
+    """
+    pool = create_pool(db_url, graphname, min_size=1, max_size=2, read_timeout=0.01)
+    await pool.open()
+    await pool.wait()
+    try:
+        yield create_mcp_server(
+            pool, graphname=graphname, allow_server_programs=ALLOW_SERVER_PROGRAMS
+        )
+    finally:
+        await pool.close()
 
 
 @pytest_asyncio.fixture(scope="function")
 async def mcp_server_tiny_sample(setup, graphname):
     """MCP server whose schema sample is smaller than one label's node count."""
-    mcp = create_mcp_server(setup, graphname=graphname, schema_sample=2)
-    return mcp
+    return create_mcp_server(
+        setup,
+        graphname=graphname,
+        schema_sample=2,
+        allow_server_programs=ALLOW_SERVER_PROGRAMS,
+    )
 
 
 @pytest_asyncio.fixture(scope="function")
 async def two_label_data(setup, clear_data: Any, graphname):
     """Two labels, the first with more nodes than the tiny sample, plus a relationship
     type that reaches both labels."""
-    async with get_pool_connection(setup) as conn:
-        async with conn.cursor(row_factory=namedtuple_row) as cursor:
-            await cursor.execute(f"SET graph_path = {graphname}")
+    async with setup.connection() as conn:
+        async with conn.cursor() as cursor:
             query = """
                 CREATE (a:Person {name: 'Alice', age: 30}),
                        (b:Person {name: 'Bob', age: 25}),
@@ -189,11 +217,8 @@ async def two_label_data(setup, clear_data: Any, graphname):
 
 @pytest_asyncio.fixture(scope="function")
 async def init_data(setup, clear_data: Any, graphname):
-    async with get_pool_connection(setup) as conn:
-        async with conn.cursor(row_factory=namedtuple_row) as cursor:
-            # Create test data
-            await cursor.execute(f"CREATE GRAPH IF NOT EXISTS {graphname}")
-            await cursor.execute(f"SET graph_path = {graphname}")
+    async with setup.connection() as conn:
+        async with conn.cursor() as cursor:
             query = """
                 CREATE (a:Person {name: 'Alice', age: 30}),
                        (b:Person {name: 'Bob', age: 25}),
@@ -209,10 +234,9 @@ async def init_data(setup, clear_data: Any, graphname):
 
 @pytest_asyncio.fixture(scope="function")
 async def clear_data(setup, graphname):
-    async with get_pool_connection(setup) as conn:
-        async with conn.cursor(row_factory=namedtuple_row) as cursor:
-            # Clear existing data in the configured graph
-            await cursor.execute(f"SET graph_path = {graphname}")
+    async with setup.connection() as conn:
+        async with conn.cursor() as cursor:
+            # Clear existing data in the graph the pool is reading
             await cursor.execute("MATCH (n) DETACH DELETE n")
             await conn.commit()
 

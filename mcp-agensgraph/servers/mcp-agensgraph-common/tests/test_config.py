@@ -3,10 +3,13 @@ import argparse
 import pytest
 
 from mcp_agensgraph_common.config import (
+    DEFAULT_POOL_MAX_SIZE,
+    DEFAULT_POOL_MIN_SIZE,
     DEFAULT_TOKEN_LIMIT,
     connection_config,
     format_namespace,
     parse_boolean_safely,
+    pool_config,
     read_controls,
     transport_config,
 )
@@ -105,6 +108,43 @@ def test_a_role_that_can_run_programs_is_only_accepted_when_asked_for():
     """The server refuses to start as one otherwise, so this is the deliberate override."""
     assert read_controls(ns())["allow_server_programs"] is False
     assert read_controls(ns(allow_server_programs=True))["allow_server_programs"] is True
+
+
+@pytest.mark.parametrize("given", [0, -1, "0", "-5"])
+def test_a_read_timeout_that_is_not_a_limit_is_refused(given):
+    """PostgreSQL reads a statement_timeout of nought as no limit, so 0 is the worst value.
+
+    Measured with it: a read timeout of 0 let a two-second ``pg_sleep`` run to completion.
+    """
+    with pytest.raises(ValueError, match="more than nothing"):
+        read_controls(ns(read_timeout=given))
+
+
+def test_a_read_timeout_that_is_not_a_number_falls_back():
+    assert read_controls(ns(read_timeout="soon"))["read_timeout"] == 30
+
+
+def test_the_pool_is_sized_at_both_ends():
+    assert pool_config(ns()) == {
+        "pool_min_size": DEFAULT_POOL_MIN_SIZE,
+        "pool_max_size": DEFAULT_POOL_MAX_SIZE,
+    }
+    assert DEFAULT_POOL_MAX_SIZE > DEFAULT_POOL_MIN_SIZE, (
+        "a pool given only a lower bound is that wide at the top as well"
+    )
+
+
+def test_pool_size_comes_from_the_environment(monkeypatch):
+    monkeypatch.setenv("AGENSGRAPH_POOL_MIN_SIZE", "2")
+    monkeypatch.setenv("AGENSGRAPH_POOL_MAX_SIZE", "32")
+    assert pool_config(ns()) == {"pool_min_size": 2, "pool_max_size": 32}
+
+
+def test_a_pool_cannot_hold_more_than_it_may_open(monkeypatch):
+    monkeypatch.setenv("AGENSGRAPH_POOL_MIN_SIZE", "8")
+    monkeypatch.setenv("AGENSGRAPH_POOL_MAX_SIZE", "2")
+    with pytest.raises(ValueError):
+        pool_config(ns())
 
 
 def test_read_controls_token_limit_is_bounded_unless_turned_off():

@@ -7,13 +7,10 @@ import pytest
 from fastmcp import Client
 from fastmcp.exceptions import ToolError
 from fastmcp.server import FastMCP
-from psycopg.rows import namedtuple_row
-
 from mcp_agensgraph_common.results import OMITTED
 from mcp_agensgraph_cypher.server import (
     create_mcp_server,
     ensure_graph,
-    get_pool_connection,
     server_has_gql_clauses,
 )
 
@@ -29,7 +26,7 @@ async def _call(server: FastMCP, name: str, args: dict | None = None):
 
 
 async def _sizes(pool) -> tuple[int, int]:
-    async with get_pool_connection(pool) as conn:
+    async with pool.connection() as conn:
         async with conn.cursor() as cur:
             await cur.execute(CATALOG_SIZES)
             row = await cur.fetchone()
@@ -37,10 +34,9 @@ async def _sizes(pool) -> tuple[int, int]:
     return row
 
 
-async def _run(pool, graphname: str, statement: str) -> None:
-    async with get_pool_connection(pool) as conn:
-        async with conn.cursor(row_factory=namedtuple_row) as cur:
-            await cur.execute(f"SET graph_path = {graphname}")
+async def _run(pool, statement: str) -> None:
+    async with pool.connection() as conn:
+        async with conn.cursor() as cur:
             await cur.execute(statement)
         await conn.commit()
 
@@ -48,7 +44,7 @@ async def _run(pool, graphname: str, statement: str) -> None:
 class TestInstallsNothing:
     @pytest.mark.asyncio(loop_scope="function")
     async def test_a_full_startup_leaves_the_catalogs_the_size_they_were(
-        self, setup, graphname
+        self, setup, graphname, db_url
     ):
         """Serving a graph is not a reason to create anything in somebody's database.
 
@@ -57,9 +53,11 @@ class TestInstallsNothing:
         nobody asked for.
         """
         before = await _sizes(setup)
-        await ensure_graph(setup, graphname)
+        await ensure_graph(db_url, graphname)
         gql = await server_has_gql_clauses(setup)
-        server = create_mcp_server(setup, graphname=graphname, gql_clauses=gql)
+        server = create_mcp_server(
+            setup, allow_server_programs=True, graphname=graphname, gql_clauses=gql
+        )
         async with Client(server) as client:
             for name in (
                 "get_agensgraph_schema",
@@ -80,7 +78,6 @@ class TestSchema:
     ):
         await _run(
             setup,
-            graphname,
             'CREATE UNIQUE PROPERTY INDEX IF NOT EXISTS person_name_uq ON "Person" (name)',
         )
         try:
@@ -89,7 +86,7 @@ class TestSchema:
             assert schema["Person"]["properties"]["name"]["unique"] is True
             assert schema["Person"]["properties"]["age"]["indexed"] is False
         finally:
-            await _run(setup, graphname, "DROP PROPERTY INDEX person_name_uq")
+            await _run(setup, "DROP PROPERTY INDEX person_name_uq")
 
     @pytest.mark.asyncio(loop_scope="function")
     async def test_a_uniqueness_assertion_is_found_too(
@@ -98,14 +95,13 @@ class TestSchema:
         """A uniqueness assertion is kept as an exclusion, which the index view hides."""
         await _run(
             setup,
-            graphname,
             'CREATE CONSTRAINT person_age_uq ON "Person" ASSERT age IS UNIQUE',
         )
         try:
             schema = await _call(mcp_server, "get_agensgraph_schema")
             assert schema["Person"]["properties"]["age"]["unique"] is True
         finally:
-            await _run(setup, graphname, 'DROP CONSTRAINT person_age_uq ON "Person"')
+            await _run(setup, 'DROP CONSTRAINT person_age_uq ON "Person"')
 
     @pytest.mark.asyncio(loop_scope="function")
     async def test_a_relationship_reports_the_properties_it_carries(
@@ -113,7 +109,6 @@ class TestSchema:
     ):
         await _run(
             setup,
-            graphname,
             "CREATE (a:\"Person\" {name: 'Ann'})-[:\"FRIEND\" {since: 2020}]->"
             "(b:\"Person\" {name: 'Ben'})",
         )
@@ -148,7 +143,6 @@ class TestSuppressedValues:
         """A model asking for a value and receiving nothing cannot tell which happened."""
         await _run(
             setup,
-            graphname,
             'CREATE (:"Bulky" {v: [' + ",".join(str(i) for i in range(200)) + "]})",
         )
         out = await _call(
@@ -164,10 +158,11 @@ class TestBoundedResponses:
     async def test_whole_rows_are_dropped_and_the_reply_still_parses(
         self, setup, graphname, clear_data: Any
     ):
-        server = create_mcp_server(setup, graphname=graphname, token_limit=200)
+        server = create_mcp_server(
+            setup, allow_server_programs=True, graphname=graphname, token_limit=200
+        )
         await _run(
             setup,
-            graphname,
             "UNWIND range(1, 60)::jsonb AS i CREATE (:\"Wordy\" {t: 'word word word word'})",
         )
         out = await _call(
@@ -183,7 +178,9 @@ class TestBoundedResponses:
     async def test_nothing_is_dropped_when_it_all_fits(
         self, setup, graphname, init_data: Any
     ):
-        server = create_mcp_server(setup, graphname=graphname, token_limit=10_000)
+        server = create_mcp_server(
+            setup, allow_server_programs=True, graphname=graphname, token_limit=10_000
+        )
         out = await _call(
             server,
             "read_agensgraph_cypher",
@@ -380,8 +377,12 @@ class TestToolSurface:
 
     @pytest.mark.asyncio(loop_scope="function")
     async def test_the_gql_spellings_are_advertised_only_where_they_exist(self, setup, graphname):
-        with_gql = create_mcp_server(setup, graphname=graphname, gql_clauses=True)
-        without = create_mcp_server(setup, graphname=graphname, gql_clauses=False)
+        with_gql = create_mcp_server(
+            setup, allow_server_programs=True, graphname=graphname, gql_clauses=True
+        )
+        without = create_mcp_server(
+            setup, allow_server_programs=True, graphname=graphname, gql_clauses=False
+        )
 
         async with Client(with_gql) as client:
             named = {t.name: t for t in await client.list_tools()}

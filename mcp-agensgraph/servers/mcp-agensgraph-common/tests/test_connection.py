@@ -3,7 +3,7 @@
 import pytest
 from psycopg.types.json import Jsonb
 
-from mcp_agensgraph_common.connection import build_dsn, jsonb_params
+from mcp_agensgraph_common.connection import build_dsn, jsonb_params, paged_statement
 
 
 def test_build_dsn_carries_awkward_credentials_intact():
@@ -72,3 +72,52 @@ def test_jsonb_params_does_not_double_wrap():
     already = Jsonb([1, 2, 3])
     out = jsonb_params({"x": already})
     assert out["x"] is already  # Jsonb isn't a list/dict, so it's not re-wrapped
+
+
+def test_a_page_of_one_query_part_is_appended_to_it():
+    paged = paged_statement('MATCH (n:"Person") RETURN n', limit=5, offset=10)
+    assert paged == 'MATCH (n:"Person") RETURN n\nSKIP 10 LIMIT 6'
+
+
+def test_a_mid_query_limit_is_left_where_the_caller_put_it():
+    """The read-clause continuation set has no arm for LIMIT after WITH, so this cannot wrap."""
+    query = "MATCH (p:Person)\nWITH p LIMIT 3\nRETURN p.name AS person"
+    assert paged_statement(query, limit=5, offset=0).endswith("\nSKIP 0 LIMIT 6")
+
+
+def test_a_union_is_paged_from_outside():
+    """Appended, SKIP and LIMIT bind to the last arm: a five-row page of a two-arm union had
+    the server produce 50,006 rows, and Python then kept five."""
+    query = "MATCH (a:X) RETURN a.n AS x\nUNION ALL\nMATCH (b:Y) RETURN b.n AS x"
+    paged = paged_statement(query, limit=5, offset=0)
+    assert paged.startswith("SELECT * FROM (")
+    assert paged.endswith(") AS _page LIMIT 6 OFFSET 0")
+
+
+def test_the_callers_own_paging_is_paged_from_outside():
+    paged = paged_statement("MATCH (n) RETURN n LIMIT 10", limit=2, offset=0)
+    assert paged.startswith("SELECT * FROM (")
+
+
+def test_a_query_ending_in_a_comment_still_closes():
+    """`--` is a comment in AgensGraph, so the closing bracket goes on a line of its own."""
+    paged = paged_statement("MATCH (n) RETURN n LIMIT 10 -- capped", limit=2, offset=0)
+    assert paged.endswith("\n) AS _page LIMIT 3 OFFSET 0")
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "MATCH (n) RETURN n.a AS x NEXT RETURN x LIMIT 10",
+        "MATCH (a:X) RETURN a.n AS x UNION MATCH (b:Y) RETURN b.n AS x NEXT RETURN x",
+    ],
+)
+def test_a_page_that_can_be_neither_appended_nor_wrapped_is_refused(query):
+    with pytest.raises(ValueError, match="top of a statement"):
+        paged_statement(query, limit=5, offset=0)
+
+
+def test_a_clause_name_inside_a_literal_is_not_a_clause():
+    """`next` as a property and NEXT as a clause are not the same word."""
+    query = "MATCH (n) WHERE n.t = 'NEXT' RETURN n.next AS x LIMIT 4"
+    assert paged_statement(query, limit=1, offset=0).startswith("SELECT * FROM (")

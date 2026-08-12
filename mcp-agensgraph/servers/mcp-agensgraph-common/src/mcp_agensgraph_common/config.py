@@ -6,6 +6,7 @@ to documented defaults. Composable so each server pulls only the sections it nee
 - ``connection_config``  — db_url / username / password / database / graphname
 - ``transport_config``   — namespace / transport / host / port / path / origins / hosts
 - ``read_controls``      — read_timeout / token_limit / read_only  (cypher only)
+- ``pool_config``        — pool_min_size / pool_max_size
 
 Canonical environment variables (standardized across all servers):
 
@@ -14,6 +15,8 @@ Canonical environment variables (standardized across all servers):
     AGENSGRAPH_TRANSPORT      AGENSGRAPH_MCP_SERVER_HOST / _PORT / _PATH
     AGENSGRAPH_MCP_SERVER_ALLOW_ORIGINS / _ALLOWED_HOSTS
     AGENSGRAPH_READ_TIMEOUT   AGENSGRAPH_RESPONSE_TOKEN_LIMIT   AGENSGRAPH_READ_ONLY
+    AGENSGRAPH_POOL_MIN_SIZE  AGENSGRAPH_POOL_MAX_SIZE
+    AGENSGRAPH_ALLOW_SERVER_PROGRAMS
 """
 
 from __future__ import annotations
@@ -155,17 +158,43 @@ def transport_config(args: argparse.Namespace) -> dict[str, Any]:
 # ``0`` turns the bound off for a caller who means to take everything.
 DEFAULT_TOKEN_LIMIT = 10_000
 
+# How long a read may take. It becomes the connection's own `statement_timeout`, so every read
+# on it is bounded before the first one is sent.
+DEFAULT_READ_TIMEOUT = 30
+
+# How many connections the pool holds, and how many it may ever open.
+DEFAULT_POOL_MIN_SIZE = 4
+DEFAULT_POOL_MAX_SIZE = 16
+
 
 def read_controls(args: argparse.Namespace) -> dict[str, Any]:
     """Read-query controls (cypher server): timeout, token limit, read-only."""
     cfg: dict[str, Any] = {}
 
     read_timeout = _pick(getattr(args, "read_timeout", None), "AGENSGRAPH_READ_TIMEOUT")
-    try:
-        cfg["read_timeout"] = int(read_timeout) if read_timeout is not None else 30
-    except (TypeError, ValueError):
-        logger.warning("Invalid read timeout %r; using default 30s", read_timeout)
-        cfg["read_timeout"] = 30
+    if read_timeout is None:
+        cfg["read_timeout"] = DEFAULT_READ_TIMEOUT
+    else:
+        try:
+            seconds = int(read_timeout)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Read timeout %r is not a number of seconds; using %d",
+                read_timeout,
+                DEFAULT_READ_TIMEOUT,
+            )
+            seconds = DEFAULT_READ_TIMEOUT
+        if seconds <= 0:
+            # PostgreSQL reads a `statement_timeout` of nought as no limit at all, so this is
+            # the one wrong value that looks like the strictest one. Measured: a read timeout of
+            # 0 let a two-second `pg_sleep` run to completion, and one of -5 failed every call
+            # with 22023. A server is not told to bound a read by being given no bound.
+            raise ValueError(
+                f"a read timeout is how many seconds a read may take, so it has to be more "
+                f"than nothing; got {seconds}. PostgreSQL reads nought as no limit at all, "
+                f"which is the opposite of what asking for one means."
+            )
+        cfg["read_timeout"] = seconds
 
     token_limit = _pick(
         getattr(args, "token_limit", None),
@@ -191,6 +220,34 @@ def read_controls(args: argparse.Namespace) -> dict[str, Any]:
 
     cfg.update(server_program_control(args))
 
+    return cfg
+
+
+def pool_config(args: argparse.Namespace) -> dict[str, Any]:
+    """How many connections the server holds, and how many it may ever open.
+
+    Both ends, because a pool given only the lower one is that wide at the top as well: four
+    connections however much arrives at once, and a trivial read measured waiting 7.77 s behind
+    eighteen slow ones. What the right numbers are depends on the database server, so they are
+    settings rather than a guess written into the code.
+    """
+    cfg: dict[str, Any] = {}
+    for key, env, default in (
+        ("pool_min_size", "AGENSGRAPH_POOL_MIN_SIZE", DEFAULT_POOL_MIN_SIZE),
+        ("pool_max_size", "AGENSGRAPH_POOL_MAX_SIZE", DEFAULT_POOL_MAX_SIZE),
+    ):
+        given = _pick(getattr(args, key, None), env, default=default)
+        try:
+            size = int(given)
+        except (TypeError, ValueError):
+            logger.warning("%s is not a number of connections; using %d", env, default)
+            size = default
+        cfg[key] = max(1, size)
+    if cfg["pool_max_size"] < cfg["pool_min_size"]:
+        raise ValueError(
+            f"a pool cannot hold {cfg['pool_min_size']} connections and open at most "
+            f"{cfg['pool_max_size']}"
+        )
     return cfg
 
 

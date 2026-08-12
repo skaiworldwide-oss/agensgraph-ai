@@ -11,6 +11,7 @@ from typing import Any
 
 from mcp_agensgraph_common.config import (
     connection_config,
+    pool_config,
     read_controls,
     transport_config,
 )
@@ -22,4 +23,5 @@ def process_config(args: argparse.Namespace) -> dict[str, Any]:
         **connection_config(args, default_graphname="agens"),
         **transport_config(args),
         **read_controls(args),
+        **pool_config(args),
     }

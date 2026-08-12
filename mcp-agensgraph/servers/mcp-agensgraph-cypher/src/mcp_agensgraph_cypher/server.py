@@ -16,33 +16,36 @@ import re
 from typing import Any, Dict, List, Literal, Optional
 
 import psycopg
+from agensgraph import AsyncConnectionPool
 from agensgraph.cypher import check_single_statement, writable_counters
 from agensgraph.introspect import index_properties
 from fastmcp.exceptions import ToolError
 from fastmcp.server import FastMCP
 from mcp.types import ToolAnnotations
 from psycopg import sql
-from psycopg.rows import namedtuple_row
-from psycopg_pool import AsyncConnectionPool, PoolTimeout
+from psycopg_pool import PoolTimeout
 from pydantic import Field
 
-from mcp_agensgraph_common.config import format_namespace
+from mcp_agensgraph_common.config import (
+    DEFAULT_POOL_MAX_SIZE,
+    DEFAULT_POOL_MIN_SIZE,
+    format_namespace,
+)
 from mcp_agensgraph_common.connection import (
     build_dsn,
-    create_pool,
     check_role_cannot_run_programs,
+    create_pool,
     ensure_graph,
-    get_pool_connection,
     jsonb_params,
-    run_paginated_query,
+    read_page,
     run_query,
     unwrappable_clause,
 )
 from mcp_agensgraph_common.results import (
-    as_builtins,
     count_tokens,
     fit_rows,
-    record_to_dict,
+    mapping_rows,
+    rows_of,
     value_sanitize,
 )
 from mcp_agensgraph_common.safety import quote_identifiers
@@ -194,7 +197,11 @@ def _shape_properties(
 
 
 async def _describe_graph(
-    pool: AsyncConnectionPool, graphname: str, sample: int, timeout: Optional[float]
+    pool: AsyncConnectionPool,
+    graphname: str,
+    sample: int,
+    *,
+    allow_server_programs: bool = False,
 ) -> Dict[str, Any]:
     """What is in the graph, in the shape a prompt wants: one entry per vertex label.
 
@@ -207,16 +214,10 @@ async def _describe_graph(
     the planner keeps -- falling back to a scan of the edges only when nothing has gathered
     that catalog since the last write to the graph.
     """
-    async with get_pool_connection(pool) as conn:
-        try:
-            # Must precede any snapshot-taking statement in the transaction.
-            await conn.execute("SET TRANSACTION READ ONLY")
-            if timeout is not None:
-                await conn.execute(
-                    sql.SQL("SET LOCAL statement_timeout = {}").format(
-                        sql.Literal(int(timeout * 1000))
-                    )
-                )
+    async with pool.connection() as conn:
+        async with conn.read_only_transaction(
+            allow_server_programs=allow_server_programs
+        ):
             description = await conn.describe(sample=sample, graph=graphname)
             indexes = await conn.indexes(graph=graphname)
             constraints = await conn.constraints(graph=graphname)
@@ -229,10 +230,6 @@ async def _describe_graph(
                         _relationship_scan_query(graphname), {"graph": graphname}
                     )
                     triples = [(*row, None) for row in await cur.fetchall()]
-        finally:
-            # A read-only transaction has nothing to commit, and what it *can* do is SET --
-            # which on a pooled connection would be inherited by whoever borrows it next.
-            await conn.rollback()
 
     indexed, unique = _unique_and_indexed(indexes, constraints)
     kinds = {label.name: label.kind for label in description.labels}
@@ -283,13 +280,18 @@ async def _describe_graph(
 
 
 async def _execute_write(
-    pool: AsyncConnectionPool, graphname: str, query: str, params: Optional[Dict[str, Any]]
+    pool: AsyncConnectionPool, query: str, params: Optional[Dict[str, Any]]
 ) -> Dict[str, Any]:
     """Run a write, read what it changed in the same transaction, and commit.
 
     The counters live on the connection and describe the last write on it, so the reading has
     to happen before anything else runs there -- which is what ``counts_`` does, inside the
     same transaction as the write.
+
+    Bounded by the connection's ``statement_timeout``, like every other statement the server
+    sends. Lifting it here for the write alone was measured costing a round trip -- six per call
+    against five -- and what it buys is a model-authored statement that may hold a pooled
+    connection for as long as it likes.
 
     **Nothing raises once the commit has landed.** A failure after it is a failure to describe
     work the database has already kept, and reporting that as a failed write tells the caller
@@ -298,10 +300,8 @@ async def _execute_write(
     are read first, the commit is last, and anything that goes wrong after it is logged and
     reported as a write that succeeded and could not be summarised.
     """
-    set_path = sql.SQL("SET LOCAL graph_path = {}").format(sql.Identifier(graphname))
-    async with get_pool_connection(pool) as conn:
-        try:
-            await conn.execute(set_path)
+    async with pool.connection() as conn:
+        async with conn.transaction():
             # `None` rather than an empty mapping: psycopg reads `%` as a placeholder marker
             # whenever parameters are given, and a Cypher literal may hold one.
             result = await conn.execute_query(
@@ -315,14 +315,7 @@ async def _execute_write(
                 "deletededges": counts.deleted_edges,
                 "updatedproperties": counts.updated_properties,
             }
-            rows = [
-                {key: as_builtins(value) for key, value in zip(result.keys, record)}
-                for record in result.records
-            ]
-        except BaseException:
-            await conn.rollback()
-            raise
-        await conn.commit()
+            rows = rows_of(result)
     try:
         stats["rows"] = [value_sanitize(row) for row in rows]
         stats["row_count"] = len(rows)
@@ -360,11 +353,11 @@ def _bounded(
 
 async def _walk_result(
     pool: AsyncConnectionPool,
-    graphname: str,
     query: str,
     params: Optional[Dict[str, Any]],
-    timeout: Optional[float],
     keep: int,
+    *,
+    allow_server_programs: bool = False,
 ) -> tuple[List[Dict[str, Any]], int]:
     """Read a whole result once, keeping the first ``keep`` rows and counting all of them.
 
@@ -384,31 +377,23 @@ async def _walk_result(
         )
     kept: List[Dict[str, Any]] = []
     total = 0
-    async with get_pool_connection(pool) as conn:
-        # A stream takes its cursor from the connection, so the columns are named there. Put
-        # back afterwards: the connection goes on to serve somebody else's call.
+    async with pool.connection() as conn:
+        # A stream takes its cursor from the connection, so the rows are shaped there. Put back
+        # afterwards: the connection goes on to serve somebody else's call.
         previous_factory = conn.row_factory
-        conn.row_factory = namedtuple_row
+        conn.row_factory = mapping_rows
         try:
-            await conn.execute("SET TRANSACTION READ ONLY")
-            if timeout is not None:
-                await conn.execute(
-                    sql.SQL("SET LOCAL statement_timeout = {}").format(
-                        sql.Literal(int(timeout * 1000))
-                    )
-                )
-            await conn.execute(
-                sql.SQL("SET LOCAL graph_path = {}").format(sql.Identifier(graphname))
-            )
-            async for record in conn.stream(
-                query, jsonb_params(params) or None, size=STREAM_CHUNK
+            async with conn.read_only_transaction(
+                allow_server_programs=allow_server_programs
             ):
-                total += 1
-                if len(kept) < keep:
-                    kept.append(record_to_dict(record))
+                async for record in conn.stream(
+                    query, jsonb_params(params) or None, size=STREAM_CHUNK
+                ):
+                    total += 1
+                    if len(kept) < keep:
+                        kept.append(record)
         finally:
             conn.row_factory = previous_factory
-            await conn.rollback()
     return kept, total
 
 
@@ -423,6 +408,7 @@ def create_mcp_server(
     page_size: int = DEFAULT_PAGE_SIZE,
     max_page_size: int = MAX_PAGE_SIZE,
     gql_clauses: bool = False,
+    allow_server_programs: bool = False,
 ) -> FastMCP:
     """Create the FastMCP server with the schema / read / write / plan / health tools.
 
@@ -430,6 +416,13 @@ def create_mcp_server(
     and write tools tell a model they accept. 2.17 has none of those clauses, so advertising
     them there would be advertising syntax errors; :func:`main` asks the connection rather than
     assuming.
+
+    ``allow_server_programs`` is the operator's answer to the same question :func:`main` asked
+    before serving anything: it carries through to every read-only transaction, so a server that
+    was allowed to start as a privileged role is not then refused at each call.
+
+    ``read_timeout`` is the pool's rather than this server's -- it is the connections'
+    ``statement_timeout`` -- and is taken here only to be reported to the caller.
     """
     mcp = FastMCP("mcp-agensgraph-cypher")
     prefix = format_namespace(namespace)
@@ -473,10 +466,9 @@ def create_mcp_server(
         Counts, relationships and indexes are exact.
         """
         try:
-            schema = await _describe_graph(
-                pool, graphname, sample, float(read_timeout)
+            return await _describe_graph(
+                pool, graphname, sample, allow_server_programs=allow_server_programs
             )
-            return schema
         except Exception as e:
             raise _failure("Schema read failed", e) from None
 
@@ -555,11 +547,10 @@ def create_mcp_server(
             if walk:
                 rows, total = await _walk_result(
                     pool,
-                    graphname,
                     statement,
                     params,
-                    float(read_timeout),
                     page_limit,
+                    allow_server_programs=allow_server_programs,
                 )
                 payload: Dict[str, Any] = {
                     "row_count": len(rows),
@@ -573,15 +564,13 @@ def create_mcp_server(
                     "next_offset": None,
                 }
             else:
-                rows, has_more = await run_paginated_query(
+                rows, has_more = await read_page(
                     pool,
-                    graphname,
                     statement,
-                    params=params,
-                    read_only=True,
-                    timeout=float(read_timeout),
+                    params,
                     limit=page_limit,
                     offset=page_offset,
+                    allow_server_programs=allow_server_programs,
                 )
                 payload = {
                     "row_count": len(rows),
@@ -628,10 +617,9 @@ def create_mcp_server(
         try:
             rows = await run_query(
                 pool,
-                graphname,
                 explain_statement(quote_identifiers(query), analyze).as_string(),
                 read_only=True,
-                timeout=float(read_timeout),
+                allow_server_programs=allow_server_programs,
             )
             return next(iter(rows[0].values())) if rows else []
         except Exception as e:
@@ -669,18 +657,19 @@ def create_mcp_server(
             graph_param = {"graph": graphname}
             plan_rows = await run_query(
                 pool,
-                graphname,
                 explain_statement(quote_identifiers(query), False).as_string(),
                 params,
                 read_only=True,
-                timeout=float(read_timeout),
+                allow_server_programs=allow_server_programs,
             )
             plan = next(iter(plan_rows[0].values()))
             labels = await run_query(
-                pool, graphname, label_stats_query(), graph_param, read_only=True
+                pool, label_stats_query(), graph_param, read_only=True,
+                allow_server_programs=allow_server_programs,
             )
             indexes = await run_query(
-                pool, graphname, existing_indexes_query(), graph_param, read_only=True
+                pool, existing_indexes_query(), graph_param, read_only=True,
+                allow_server_programs=allow_server_programs,
             )
             findings = analyze_plan(
                 plan, relname_to_label(labels), indexed_properties(indexes)
@@ -711,9 +700,9 @@ def create_mcp_server(
         try:
             extensions = await run_query(
                 pool,
-                graphname,
                 extensions_query(),
                 read_only=True,
+                allow_server_programs=allow_server_programs,
             )
             report["extensions"] = {r["name"]: r["installed"] for r in extensions}
         except Exception:
@@ -721,7 +710,8 @@ def create_mcp_server(
         for name, statement in health_queries().items():
             try:
                 report[name] = await run_query(
-                    pool, graphname, statement, read_only=True
+                    pool, statement, read_only=True,
+                    allow_server_programs=allow_server_programs,
                 )
             except Exception as e:
                 report[name] = {"error": str(e)}
@@ -750,10 +740,10 @@ def create_mcp_server(
         try:
             rows = await run_query(
                 pool,
-                graphname,
                 top_cypher_queries_query(),
                 {"limit": int(limit)},
                 read_only=True,
+                allow_server_programs=allow_server_programs,
             )
             return rows
         except Exception:
@@ -794,7 +784,7 @@ def create_mcp_server(
                     "for one that only reads."
                 )
             try:
-                stats = await _execute_write(pool, graphname, quote_identifiers(query), params)
+                stats = await _execute_write(pool, quote_identifiers(query), params)
             except Exception as e:
                 raise _failure("Write query failed", e) from None
             return stats
@@ -819,8 +809,15 @@ async def main(
     token_limit: Optional[int] = None,
     read_only: bool = False,
     allow_server_programs: bool = False,
+    pool_min_size: int = DEFAULT_POOL_MIN_SIZE,
+    pool_max_size: int = DEFAULT_POOL_MAX_SIZE,
 ) -> None:
     """Open the pool, bootstrap the graph, and serve over the chosen transport.
+
+    The graph is made on a connection of its own, before the pool: the pool's connections each
+    select the graph as they are made, and a graph that is not there yet fails all of them. A
+    read-only server makes nothing, so it is also the point at which a graph name with a typo in
+    it is reported -- rather than creating an empty graph whose every read returns nothing.
 
     Nothing is installed in the database. Asked what a JSON value holds, this used to create a
     plpgsql function in whatever database it was pointed at, on every start; the driver reads
@@ -832,24 +829,37 @@ async def main(
     page_size = int(os.getenv("AGENSGRAPH_PAGE_SIZE", DEFAULT_PAGE_SIZE))
     max_page_size = int(os.getenv("AGENSGRAPH_MAX_PAGE_SIZE", MAX_PAGE_SIZE))
 
-    pool = create_pool(build_dsn(db_url, username, password, database))
+    dsn = build_dsn(db_url, username, password, database)
+    if read_only:
+        logger.info("Read-only: the graph is not created if it is missing")
+    else:
+        await ensure_graph(dsn, graphname)
+    pool = create_pool(
+        dsn,
+        graphname,
+        min_size=pool_min_size,
+        max_size=pool_max_size,
+        read_timeout=read_timeout,
+    )
     try:
         await pool.open()
-        logger.info("Connection pool opened")
+        # Waited for, so that a database that cannot be reached or a graph that is not there is
+        # reported here rather than by the first tool call.
+        await pool.wait()
+        logger.info(
+            "Connection pool opened, %d-%d connections reading graph %r",
+            pool_min_size, pool_max_size, graphname,
+        )
         # Before anything is served, because a role that can run a command on the server's host
         # makes every read tool below a claim this server cannot keep.
         await check_role_cannot_run_programs(
             pool, allow_server_programs=allow_server_programs
         )
-        if read_only:
-            logger.info("Read-only: the graph is not created if it is missing")
-        else:
-            await ensure_graph(pool, graphname)
         gql_clauses = await server_has_gql_clauses(pool)
 
         mcp = create_mcp_server(
             pool, graphname, namespace, read_timeout, token_limit, read_only,
-            schema_sample, page_size, max_page_size, gql_clauses,
+            schema_sample, page_size, max_page_size, gql_clauses, allow_server_programs,
         )
         await run_server(
             mcp,
@@ -873,7 +883,7 @@ async def server_has_gql_clauses(pool: AsyncConnectionPool) -> bool:
     tool description is written when the tool is registered. The version arrives in the startup
     packet, so this costs no statement.
     """
-    async with get_pool_connection(pool) as conn:
+    async with pool.connection() as conn:
         found = bool(conn.capabilities.has_gql_clauses())
         await conn.rollback()
     return found

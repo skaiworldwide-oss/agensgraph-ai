@@ -10,6 +10,7 @@ from langchain_agensgraph.graphs.graph_document import (
     Node,
     Relationship,
 )
+from langchain_agensgraph.observability import log_queries
 from langchain_agensgraph.vectorstores.agensgraph_vector import AgensgraphVector
 
 __version__ = "0.2.0"
@@ -25,6 +26,7 @@ __all__ = [
     "Node",
     "Relationship",
     "create_cypher_tool",
+    "log_queries",
     "__version__",
 ]
 

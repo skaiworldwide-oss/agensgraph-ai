@@ -66,6 +66,11 @@ packages = ["src/mcp_agensgraph_common"]
 [tool.hatch.build.targets.sdist]
 include = ["/src", "/tests", "/README.md", "/LICENSE", "/NOTICE"]
 
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
 [tool.uv]
 dev-dependencies = [
     "pyright>=1.1.389",

@@ -792,13 +792,15 @@ dependencies = [
     { name = "fastmcp" },
     { name = "pydantic" },
     { name = "starlette" },
-    { name = "tiktoken" },
 ]
 
 [package.optional-dependencies]
 db = [
     { name = "psycopg", extra = ["binary", "pool"] },
     { name = "psycopg-pool" },
+]
+tokens = [
+    { name = "tiktoken" },
 ]
 
 [package.dev-dependencies]
@@ -819,9 +821,9 @@ requires-dist = [
     { name = "psycopg-pool", marker = "extra == 'db'", specifier = ">=3.2.6,<4.0.0" },
     { name = "pydantic", specifier = ">=2.10.1" },
     { name = "starlette", specifier = ">=0.47.0" },
-    { name = "tiktoken", specifier = ">=0.11.0" },
+    { name = "tiktoken", marker = "extra == 'tokens'", specifier = ">=0.11.0" },
 ]
-provides-extras = ["db"]
+provides-extras = ["db", "tokens"]
 
 [package.metadata.requires-dev]
 dev = [

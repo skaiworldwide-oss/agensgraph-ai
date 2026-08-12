@@ -44,6 +44,7 @@ def server_arguments(where, extra=()):
         "uv",
         "run",
         "mcp-agensgraph-memory",
+        "--allow-server-programs",
         *extra,
         "--db-url",
         f"postgresql://{where['host']}:{where['port']}",

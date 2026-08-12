@@ -22,6 +22,7 @@ async def test_stdio_transport(graphname):
         "uv",
         "run",
         "mcp-agensgraph-cypher",
+        "--allow-server-programs",
         "--transport",
         "stdio",
         "--db-url",

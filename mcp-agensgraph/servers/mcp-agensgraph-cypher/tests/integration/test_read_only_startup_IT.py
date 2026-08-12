@@ -34,6 +34,7 @@ async def graph_exists(pool, name: str) -> bool:
 async def spawn(db_url: str, graphname: str, *extra: str):
     return await asyncio.create_subprocess_exec(
         "uv", "run", "mcp-agensgraph-cypher",
+        "--allow-server-programs",
         "--transport", "http",
         "--server-host", "127.0.0.1",
         "--server-port", str(free_port()),

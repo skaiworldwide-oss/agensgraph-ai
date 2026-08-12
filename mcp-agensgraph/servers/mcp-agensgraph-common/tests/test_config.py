@@ -90,9 +90,21 @@ def test_read_controls_defaults_and_cli():
         "read_timeout": 30,
         "token_limit": DEFAULT_TOKEN_LIMIT,
         "read_only": False,
+        "allow_server_programs": False,
     }
     cfg = read_controls(ns(read_timeout=10, token_limit=500, read_only=True))
-    assert cfg == {"read_timeout": 10, "token_limit": 500, "read_only": True}
+    assert cfg == {
+        "read_timeout": 10,
+        "token_limit": 500,
+        "read_only": True,
+        "allow_server_programs": False,
+    }
+
+
+def test_a_role_that_can_run_programs_is_only_accepted_when_asked_for():
+    """The server refuses to start as one otherwise, so this is the deliberate override."""
+    assert read_controls(ns())["allow_server_programs"] is False
+    assert read_controls(ns(allow_server_programs=True))["allow_server_programs"] is True
 
 
 def test_read_controls_token_limit_is_bounded_unless_turned_off():

@@ -30,6 +30,7 @@ from mcp_agensgraph_common.config import format_namespace
 from mcp_agensgraph_common.connection import (
     build_dsn,
     create_pool,
+    check_role_cannot_run_programs,
     ensure_graph,
     get_pool_connection,
     jsonb_params,
@@ -817,6 +818,7 @@ async def main(
     read_timeout: int = 30,
     token_limit: Optional[int] = None,
     read_only: bool = False,
+    allow_server_programs: bool = False,
 ) -> None:
     """Open the pool, bootstrap the graph, and serve over the chosen transport.
 
@@ -834,7 +836,15 @@ async def main(
     try:
         await pool.open()
         logger.info("Connection pool opened")
-        await ensure_graph(pool, graphname)
+        # Before anything is served, because a role that can run a command on the server's host
+        # makes every read tool below a claim this server cannot keep.
+        await check_role_cannot_run_programs(
+            pool, allow_server_programs=allow_server_programs
+        )
+        if read_only:
+            logger.info("Read-only: the graph is not created if it is missing")
+        else:
+            await ensure_graph(pool, graphname)
         gql_clauses = await server_has_gql_clauses(pool)
 
         mcp = create_mcp_server(

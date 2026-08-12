@@ -43,6 +43,14 @@ def main():
         action="store_true",
         help="Allow only read-only queries (default: False)",
     )
+    parser.add_argument(
+        "--allow-server-programs",
+        action="store_true",
+        help=(
+            "Serve even though this role can run a command on the server's host through "
+            "COPY ... TO PROGRAM, which a read-only transaction does not stop (default: False)"
+        ),
+    )
     parser.add_argument("--token-limit", type=int, default=None, help="Response token limit")
 
     args = parser.parse_args()

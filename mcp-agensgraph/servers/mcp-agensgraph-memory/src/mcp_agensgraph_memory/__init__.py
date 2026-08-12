@@ -45,6 +45,15 @@ def main():
         help="Comma-separated list of allowed hosts for DNS rebinding protection",
     )
 
+    parser.add_argument(
+        "--allow-server-programs",
+        action="store_true",
+        help=(
+            "Serve even though this role can run a command on the server's host through "
+            "COPY ... TO PROGRAM, which a read-only transaction does not stop (default: False)"
+        ),
+    )
+
     args = parser.parse_args()
 
     config = process_config(args)

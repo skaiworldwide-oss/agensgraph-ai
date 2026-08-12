@@ -10,7 +10,7 @@ from mcp.types import TextContent, ToolAnnotations
 from pydantic import Field
 
 from mcp_agensgraph_common.config import format_namespace
-from mcp_agensgraph_common.connection import build_dsn
+from mcp_agensgraph_common.connection import build_dsn, check_role_cannot_run_programs
 from mcp_agensgraph_common.transport import run_server
 
 from .agensgraph_memory import (
@@ -563,6 +563,7 @@ async def main(
     path: Optional[str] = None,
     allow_origins: Optional[List[str]] = None,
     allowed_hosts: Optional[List[str]] = None,
+    allow_server_programs: bool = False,
 ) -> None:
     """Open the pool, make what the graph needs, and serve over the chosen transport."""
     logger.info("Starting AgensGraph MCP Memory Server")
@@ -572,6 +573,11 @@ async def main(
     pool = make_pool(dsn, graphname)
     try:
         await pool.open()
+        # Before anything is served: a role that can run a command on the server's host makes
+        # every read tool below a claim this server cannot keep.
+        await check_role_cannot_run_programs(
+            pool, allow_server_programs=allow_server_programs
+        )
         await pool.wait()
         logger.info("Connection pool opened")
         # Not best-effort. Without the labels and the unique index, every write makes

@@ -181,4 +181,20 @@ def read_controls(args: argparse.Namespace) -> dict[str, Any]:
         env_ro = os.getenv("AGENSGRAPH_READ_ONLY")
         cfg["read_only"] = parse_boolean_safely(env_ro) if env_ro is not None else False
 
+    cfg.update(server_program_control(args))
+
     return cfg
+
+
+def server_program_control(args: argparse.Namespace) -> dict[str, Any]:
+    """Whether the operator has accepted a role that can run a command on the server's host.
+
+    Off unless it is asked for. `COPY ... TO PROGRAM` is not stopped by a read-only transaction,
+    so a server advertising a read-only tool while connected as such a role is making a claim it
+    cannot keep -- it refuses to start instead, and this is how that is overridden deliberately.
+    """
+    asked = getattr(args, "allow_server_programs", False)
+    if asked:
+        return {"allow_server_programs": True}
+    env = os.getenv("AGENSGRAPH_ALLOW_SERVER_PROGRAMS")
+    return {"allow_server_programs": parse_boolean_safely(env) if env is not None else False}

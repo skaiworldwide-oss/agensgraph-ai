@@ -40,15 +40,43 @@ class TestExplain:
         assert "Actual Total Time" in plan[0]["Plan"]
 
     @pytest.mark.asyncio(loop_scope="function")
+    @pytest.mark.parametrize(
+        "statement",
+        [
+            'CREATE (:"Person" {name: \'analyze_probe\'})',
+            'INSERT (:"Person" {name: \'analyze_probe\'})',
+            "INSERT INTO analyze_probe_tbl VALUES ('x')",
+            "MATCH (n:\"Person\") RETURN n; CREATE (:\"Person\")",
+        ],
+    )
     async def test_analyze_is_refused_for_a_write(
+        self, mcp_server: FastMCP, init_data: Any, statement: str
+    ):
+        """ANALYZE executes, so it must not be a way to run a write through a read tool.
+
+        Refused by the read-only transaction rather than by a reading of the text, which is why
+        the GQL spelling and the SQL one are refused alongside the Cypher one.
+        """
+        tool = await mcp_server.get_tool("explain_agensgraph_cypher")
+        with pytest.raises(ToolError):
+            await tool.run({"query": statement, "analyze": True})
+
+    @pytest.mark.asyncio(loop_scope="function")
+    async def test_and_the_write_it_refused_did_not_happen(
         self, mcp_server: FastMCP, init_data: Any
     ):
-        """ANALYZE executes, so it must not be a way to run a write through a read tool."""
-        tool = await mcp_server.get_tool("explain_agensgraph_cypher")
-        with pytest.raises(ToolError, match="runs the statement"):
-            await tool.run(
-                {"query": 'CREATE (:"Person" {name: \'X\'})', "analyze": True}
+        """The refusal is only worth anything if nothing landed."""
+        read = await mcp_server.get_tool("read_agensgraph_cypher")
+        explain = await mcp_server.get_tool("explain_agensgraph_cypher")
+        before = await read.run(
+            {"query": 'MATCH (n:"Person") RETURN count(*) AS c'}
+        )
+        with pytest.raises(ToolError):
+            await explain.run(
+                {"query": 'CREATE (:"Person" {name: \'never\'})', "analyze": True}
             )
+        after = await read.run({"query": 'MATCH (n:"Person") RETURN count(*) AS c'})
+        assert before.content[0].text == after.content[0].text
 
     @pytest.mark.asyncio(loop_scope="function")
     async def test_malformed_cypher_is_reported(self, mcp_server: FastMCP, init_data: Any):

@@ -11,7 +11,7 @@ async def test_stdio_transport(graphname):
 
     db_name = os.getenv("AGENSGRAPH_DB")
     db_user = os.getenv("AGENSGRAPH_USERNAME")
-    db_password = os.getenv("AGENSGRAPH_PASSWORD")
+    db_password = os.getenv("AGENSGRAPH_PASSWORD", "")
     db_host = os.getenv("AGENSGRAPH_HOST", "localhost")
     db_port = os.getenv("AGENSGRAPH_PORT", "5432")
 

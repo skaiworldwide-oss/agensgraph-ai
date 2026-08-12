@@ -84,12 +84,17 @@ def graphname():
 async def setup(graphname):
     db_name = os.getenv("AGENSGRAPH_DB")
     db_user = os.getenv("AGENSGRAPH_USERNAME")
-    db_password = os.getenv("AGENSGRAPH_PASSWORD")
+    db_password = os.getenv("AGENSGRAPH_PASSWORD", "")
     db_host = os.getenv("AGENSGRAPH_HOST", "localhost")
     db_port = os.getenv("AGENSGRAPH_PORT", "5432")
 
-    if not db_name or not db_user or not db_password:
-        raise ValueError("Environment variables AGENSGRAPH_DB, AGENSGRAPH_USERNAME, and AGENSGRAPH_PASSWORD must be set.")
+    if not db_name or not db_user:
+        # No password is required to reach a server -- trust and peer authentication have
+        # none, and a local one usually does. Requiring one here is what kept these tests from
+        # running anywhere.
+        raise ValueError(
+            "Set AGENSGRAPH_DB and AGENSGRAPH_USERNAME to run the tests that need a server."
+        )
 
     db_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
     agensgraph_driver = AsyncConnectionPool(db_url, open=False)
@@ -191,7 +196,7 @@ async def http_server(setup, graphname):
 
     db_name = os.getenv("AGENSGRAPH_DB")
     db_user = os.getenv("AGENSGRAPH_USERNAME")
-    db_password = os.getenv("AGENSGRAPH_PASSWORD")
+    db_password = os.getenv("AGENSGRAPH_PASSWORD", "")
     db_host = os.getenv("AGENSGRAPH_HOST", "localhost")
     db_port = os.getenv("AGENSGRAPH_PORT", "5432")
 
@@ -242,7 +247,7 @@ async def http_server_read_only(setup, graphname):
 
     db_name = os.getenv("AGENSGRAPH_DB")
     db_user = os.getenv("AGENSGRAPH_USERNAME")
-    db_password = os.getenv("AGENSGRAPH_PASSWORD")
+    db_password = os.getenv("AGENSGRAPH_PASSWORD", "")
     db_host = os.getenv("AGENSGRAPH_HOST", "localhost")
     db_port = os.getenv("AGENSGRAPH_PORT", "5432")
 
@@ -300,7 +305,7 @@ async def http_server_restricted_cors(setup, graphname):
 
     db_name = os.getenv("AGENSGRAPH_DB")
     db_user = os.getenv("AGENSGRAPH_USERNAME")
-    db_password = os.getenv("AGENSGRAPH_PASSWORD")
+    db_password = os.getenv("AGENSGRAPH_PASSWORD", "")
     db_host = os.getenv("AGENSGRAPH_HOST", "localhost")
     db_port = os.getenv("AGENSGRAPH_PORT", "5432")
 
@@ -353,7 +358,7 @@ async def http_server_custom_hosts(setup, graphname):
 
     db_name = os.getenv("AGENSGRAPH_DB")
     db_user = os.getenv("AGENSGRAPH_USERNAME")
-    db_password = os.getenv("AGENSGRAPH_PASSWORD")
+    db_password = os.getenv("AGENSGRAPH_PASSWORD", "")
     db_host = os.getenv("AGENSGRAPH_HOST", "localhost")
     db_port = os.getenv("AGENSGRAPH_PORT", "5432")
 
@@ -406,7 +411,7 @@ async def sse_server(setup, graphname):
 
     db_name = os.getenv("AGENSGRAPH_DB")
     db_user = os.getenv("AGENSGRAPH_USERNAME")
-    db_password = os.getenv("AGENSGRAPH_PASSWORD")
+    db_password = os.getenv("AGENSGRAPH_PASSWORD", "")
     db_host = os.getenv("AGENSGRAPH_HOST", "localhost")
     db_port = os.getenv("AGENSGRAPH_PORT", "5432")
 

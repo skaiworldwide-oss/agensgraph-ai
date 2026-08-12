@@ -33,7 +33,8 @@ from mcp_agensgraph_common.connection import (
     run_paginated_query,
     run_query,
 )
-from mcp_agensgraph_common.safety import is_write_query, quote_identifiers, quote_label
+from agensgraph.cypher import check_single_statement, writable_counters
+from mcp_agensgraph_common.safety import quote_identifiers, quote_label
 from mcp_agensgraph_common.transport import run_server
 
 from mcp_agensgraph_cypher.perf import (
@@ -51,6 +52,19 @@ from mcp_agensgraph_cypher.perf import (
 )
 
 logger = logging.getLogger("mcp_agensgraph_cypher")
+
+
+def _refuse_unless_one_statement(query: str) -> None:
+    """Refuse text that is more than one statement, in terms the caller can act on.
+
+    The driver's message names the part of the caller's own text that is the reason, which is
+    exactly what a model needs to correct itself, so it is passed through rather than replaced.
+    """
+    try:
+        check_single_statement(query)
+    except ValueError as exc:
+        raise ToolError(str(exc)) from None
+
 
 # Default cap on nodes sampled *per label* when introspecting the schema (bounds cost on
 # large graphs); overridable via AGENSGRAPH_SCHEMA_SAMPLE.
@@ -387,8 +401,12 @@ def create_mcp_server(
         how to fetch the next page. Returns a JSON object:
         `{"rows": [...], "row_count", "offset", "limit", "has_more", "next_offset"}`.
         """
-        if is_write_query(query):
-            raise ToolError("Only read (MATCH/RETURN) queries are allowed by this tool.")
+        _refuse_unless_one_statement(query)
+        if writable_counters(query):
+            raise ToolError(
+                "This tool only reads. Use the write tool for a statement that changes the "
+                "graph -- CREATE or its GQL spelling INSERT, MERGE, SET, REMOVE, DELETE."
+            )
         page_limit = min(max(1, int(limit)), max_page)
         page_offset = max(0, int(offset))
         try:
@@ -434,27 +452,26 @@ def create_mcp_server(
         analyze: bool = Field(
             False,
             description=(
-                "Run the statement and report actual timings. Refused in read-only mode "
-                "and for write statements, since it executes."
+                "Also run the statement and report actual timings. It runs in a read-only "
+                "transaction, so a statement that would write is refused by the database."
             ),
         ),
     ) -> list[ToolResult]:
         """Show how AgensGraph would run a Cypher statement.
 
-        Without `analyze` the statement is only planned, never executed. Use this to see
-        whether a query reaches an index before it is run against real data.
+        Without `analyze` the statement is planned and not executed. With it the statement is
+        executed to collect real timings, inside a read-only transaction either way -- so a
+        statement that writes is refused by the server rather than by a reading of its text.
+        Measured: `EXPLAIN (ANALYZE) INSERT ...` is refused with 25006 and leaves no row, and
+        the Cypher writes are refused the same way.
         """
-        if analyze and (read_only or is_write_query(query)):
-            raise ToolError(
-                "analyze runs the statement. It is not available in read-only mode or "
-                "for a write."
-            )
+        _refuse_unless_one_statement(query)
         try:
             rows = await run_query(
                 pool,
                 graphname,
                 explain_statement(quote_identifiers(query), analyze).as_string(),
-                read_only=not analyze,
+                read_only=True,
                 timeout=float(read_timeout),
             )
             plan = next(iter(rows[0].values())) if rows else None
@@ -612,10 +629,16 @@ def create_mcp_server(
                 default_factory=dict, description="Parameters to pass to the Cypher query."
             ),
         ) -> list[ToolResult]:
-            """Execute a write Cypher query (CREATE/MERGE/SET/DELETE/REMOVE) and return stats."""
-            if not is_write_query(query):
+            """Execute a Cypher statement that changes the graph and return what it changed.
+
+            Takes one statement, and one that writes: CREATE or its GQL spelling INSERT, MERGE,
+            SET, REMOVE, DELETE.
+            """
+            _refuse_unless_one_statement(query)
+            if not writable_counters(query):
                 raise ToolError(
-                    "This tool is for write queries; use the read tool for MATCH/RETURN."
+                    "This tool is for a statement that changes the graph; use the read tool "
+                    "for one that only reads."
                 )
             try:
                 stats = await _execute_write(pool, graphname, quote_identifiers(query), params)

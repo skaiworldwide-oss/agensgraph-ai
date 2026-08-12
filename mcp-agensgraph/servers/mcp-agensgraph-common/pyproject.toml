@@ -3,7 +3,7 @@ name = "mcp-agensgraph-common"
 version = "0.2.0"
 description = "Shared core for the AgensGraph MCP servers (config, connection, results, safety, transport)."
 readme = "README.md"
-requires-python = ">=3.10,<4.0"
+requires-python = ">=3.11,<4.0"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 authors = [
@@ -27,6 +27,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
+    "agensgraph-python",
     "fastmcp>=3.0.0,<4.0.0",
     "pydantic>=2.10.1",
     "tiktoken>=0.11.0",
@@ -45,6 +46,9 @@ db = [
 Homepage = "https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/mcp-agensgraph"
 Repository = "https://github.com/skaiworldwide-oss/agensgraph-ai"
 Issues = "https://github.com/skaiworldwide-oss/agensgraph-ai/issues"
+
+[tool.uv.sources]
+agensgraph-python = { path = "../../../../agensgraph-python", editable = true }
 
 [build-system]
 requires = ["hatchling"]

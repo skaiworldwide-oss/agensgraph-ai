@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import re
 
+from agensgraph.cypher import without_literals
+
 # Mixed-case labels: :Label -> :"Label" (skip already-quoted :"...").
 _LABEL_RE = re.compile(r':(?!")([A-Z][a-zA-Z0-9_]*)')
 # Mixed-case property keys in a map literal: {Prop:  or , Prop:  -> "Prop":
@@ -36,13 +38,39 @@ _VALID_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 def quote_identifiers(query: str) -> str:
     """Quote mixed-case labels and property names in a Cypher query string.
 
-    AgensGraph folds unquoted identifiers to lowercase (PostgreSQL semantics), so a
-    label like ``:Person`` must be written ``:"Person"`` to preserve case.
+    AgensGraph folds an unquoted identifier to lower case, so a label written ``:Person``
+    reaches the server as ``person`` and matches nothing in a graph whose labels were created
+    with their case kept. A statement written by a model says ``:Person``, and this is what
+    makes it find what the data-modeling tools created.
+
+    Nothing inside a string, a comment or an already-quoted name is rewritten. The rewriting is
+    located against the statement with those blanked out -- the driver blanks them to spaces of
+    the same length, so a position in the blanked text is the same position in the original --
+    and applied to the original at the positions found. Without that, a value being searched for
+    is edited: ``WHERE n.tag = 'a:Bcd'`` became ``'a:"Bcd"'``, and a row that existed stopped
+    being found.
     """
-    query = _LABEL_RE.sub(r':"\1"', query)
-    query = _PROP_KEY_RE.sub(r'\1"\2":', query)
-    query = _PROP_ACCESS_RE.sub(r'."\1"', query)
-    return query
+    blanked = without_literals(query)
+    edits: list[tuple[int, int, str]] = []
+    for pattern, render in (
+        (_LABEL_RE, lambda m: f':"{m.group(1)}"'),
+        (_PROP_KEY_RE, lambda m: f'{m.group(1)}"{m.group(2)}":'),
+        (_PROP_ACCESS_RE, lambda m: f'."{m.group(1)}"'),
+    ):
+        for found in pattern.finditer(blanked):
+            edits.append((found.start(), found.end(), render(found)))
+    if not edits:
+        return query
+    out: list[str] = []
+    at = 0
+    for start, end, replacement in sorted(edits):
+        if start < at:
+            continue  # Overlapping with an edit already taken.
+        out.append(query[at:start])
+        out.append(replacement)
+        at = end
+    out.append(query[at:])
+    return "".join(out)
 
 
 def quote_label(label: str) -> str:

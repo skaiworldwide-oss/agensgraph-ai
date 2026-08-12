@@ -218,11 +218,10 @@ class AgensChatMessageHistory(BaseChatMessageHistory):
     def _name_session_query(self) -> Any:
         """Tell a session's messages which session they belong to.
 
-        A message written before it carried its session is reachable only by the edge from
-        the session vertex, which is what the read here no longer does. Walked once and
-        never again, and asked for on its own account rather than alongside the numbering:
-        the two arrived at different times, so a session can carry the number and not the
-        names, and that is exactly the session whose messages cannot be found.
+        A message carrying no session of its own is reachable only by the edge from the
+        session vertex, so it is walked once here and named. Asked for separately from the
+        numbering, because a session can carry the number and not the names -- and that is
+        exactly the session whose messages would otherwise not be found.
         """
         return sql.SQL(
             "MATCH (s:{sl} {{id: %(sid)s}})-[:{rl}]->(m:{ml}) SET m.session = %(sid)s"

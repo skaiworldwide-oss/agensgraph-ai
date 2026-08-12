@@ -19,11 +19,10 @@ Usage::
 When no engine is supplied, ``AgensGraph``/``AgensgraphVector`` behave exactly as before
 (a single dedicated connection).
 
-**The graph is bound once per connection, not once per checkout.** The previous
-implementation issued ``SET graph_path`` *and a commit* on every borrow, so one logical
-query cost three round trips before it ran. The driver's pool distinguishes a hook that
-runs when a connection is made from one that runs when it is lent, and selecting a graph
-belongs to the first.
+**The graph is bound once per connection, not once per checkout.** The driver's pool
+distinguishes a hook that runs when a connection is made from one that runs when it is
+lent, and selecting a graph belongs to the first: it costs a statement and a commit, and
+neither is worth paying on every borrow.
 """
 
 from __future__ import annotations
@@ -159,8 +158,7 @@ class AgensEngine:
         graph a connection is on is something the driver knows without asking the server
         -- it holds the label table for it. So a pool serving one graph pays for the
         selection once per connection, and a pool shared between callers on different
-        graphs pays only when the graph actually changes. The previous implementation
-        issued ``SET graph_path`` *and a commit* on every single checkout.
+        graphs pays only when the graph actually changes.
         """
         with self._pool.connection(deadline=_budget(deadline)) as conn:
             wanted = graph_path if graph_path is not None else self._graph

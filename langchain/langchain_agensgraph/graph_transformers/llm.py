@@ -92,6 +92,12 @@ class LLMGraphTransformer:
         self.allowed_relationships = allowed_relationships or []
         self.node_properties = node_properties
         self.strict_mode = strict_mode
+        # A type is admitted whatever its case, and then written in the case the caller
+        # asked for. A model that answers "PERSON" where the list says "Person" is naming
+        # the allowed type, but a label is case-sensitive, so keeping the model's spelling
+        # would put those elements on a second label that no query for the first will find.
+        self._node_case = {name.lower(): name for name in self.allowed_nodes}
+        self._rel_case = {name.lower(): name for name in self.allowed_relationships}
         self._system_prompt = prompt or self._default_prompt()
         self._structured = llm.with_structured_output(_GraphSchema)
 
@@ -136,15 +142,30 @@ class LLMGraphTransformer:
             return True
         return type_.lower() in {a.lower() for a in self.allowed_relationships}
 
+    def _node_type(self, type_: str) -> str:
+        """The node type as the caller spelled it, for one they named."""
+        return self._node_case.get(type_.lower(), type_)
+
+    def _rel_type(self, type_: str) -> str:
+        """The relationship type as the caller spelled it, for one they named."""
+        return self._rel_case.get(type_.lower(), type_)
+
     def _to_graph_document(
         self, schema: _GraphSchema, source: Document
     ) -> GraphDocument:
+        # Keyed by the type as the caller spells it, which is also how a relationship's
+        # endpoint is looked up. A model naming the same entity `Person` here and
+        # `PERSON` in a relationship is naming one entity, and keying on what it wrote
+        # would miss the lookup and build a second node of the same type carrying none of
+        # the properties -- which then wins, being written last.
         nodes: dict = {}
         for n in schema.nodes:
             if self.strict_mode and not self._keep_node(n.type):
                 continue
             props = _props_to_dict(n.properties) if self.node_properties else {}
-            nodes[(n.id, n.type)] = Node(id=n.id, type=n.type, properties=props)
+            nodes[(n.id, self._node_type(n.type))] = Node(
+                id=n.id, type=self._node_type(n.type), properties=props
+            )
 
         rels: List[Relationship] = []
         for r in schema.relationships:
@@ -154,18 +175,18 @@ class LLMGraphTransformer:
                 self._keep_node(r.source_type) and self._keep_node(r.target_type)
             ):
                 continue
-            source_node = nodes.get((r.source_id, r.source_type)) or Node(
-                id=r.source_id, type=r.source_type
-            )
-            target_node = nodes.get((r.target_id, r.target_type)) or Node(
-                id=r.target_id, type=r.target_type
-            )
+            source_node = nodes.get(
+                (r.source_id, self._node_type(r.source_type))
+            ) or Node(id=r.source_id, type=self._node_type(r.source_type))
+            target_node = nodes.get(
+                (r.target_id, self._node_type(r.target_type))
+            ) or Node(id=r.target_id, type=self._node_type(r.target_type))
             props = _props_to_dict(r.properties) if self.node_properties else {}
             rels.append(
                 Relationship(
                     source=source_node,
                     target=target_node,
-                    type=r.type,
+                    type=self._rel_type(r.type),
                     properties=props,
                 )
             )
@@ -201,10 +222,15 @@ class LLMGraphTransformer:
     ) -> List[GraphDocument]:
         """Convert documents concurrently, isolating per-document failures.
 
-        Extractions run with ``return_exceptions=True`` so a single document that
-        errors (e.g. an LLM response that hits the output-token limit) is logged
-        and skipped rather than aborting the whole batch. Returns the
-        successfully-extracted documents (possibly fewer than ``documents``).
+        Extractions run with ``return_exceptions=True`` so a single document that errors
+        -- an answer that hit the output-token limit, say -- is logged and skipped rather
+        than abandoning the whole batch. Returns the documents that were extracted, which
+        may be fewer than were asked for.
+
+        Cancellation is not one of those failures. ``CancelledError`` is a
+        ``BaseException`` rather than an ``Exception``, so it arrives here like any other
+        result, and it is raised on rather than logged: a caller that cancelled this is
+        owed the cancellation, not a shorter list.
         """
         results = await asyncio.gather(
             *(self.aprocess_response(d) for d in documents),
@@ -212,7 +238,9 @@ class LLMGraphTransformer:
         )
         out: List[GraphDocument] = []
         for result in results:
-            if isinstance(result, Exception):
+            if isinstance(result, asyncio.CancelledError):
+                raise result
+            if isinstance(result, BaseException):
                 logger.warning(
                     "LLMGraphTransformer: skipping a document after extraction "
                     "error: %s",

@@ -6,6 +6,8 @@ import aiohttp
 import pytest
 import pytest_asyncio
 
+from conftest import Spawned, free_port
+
 
 async def _tools_by_name(server):
     """Tools keyed by name."""
@@ -46,6 +48,7 @@ class TestHTTPEndpoints:
         server_dir = os.getcwd()
 
         # Start server process from the correct directory
+        port = free_port()
         process = await asyncio.create_subprocess_exec(
             "uv",
             "run",
@@ -55,7 +58,7 @@ class TestHTTPEndpoints:
             "--server-host",
             "127.0.0.1",
             "--server-port",
-            "8007",
+            str(port),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             cwd=server_dir,
@@ -64,7 +67,7 @@ class TestHTTPEndpoints:
         # Wait for server to start
         await asyncio.sleep(3)
 
-        yield process
+        yield Spawned(process, port)
 
         # Cleanup
         try:
@@ -78,7 +81,7 @@ class TestHTTPEndpoints:
         """Test that tools/list endpoint works."""
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "http://127.0.0.1:8007/mcp/",
+                http_server.url,
                 json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
                 headers={
                     "Accept": "application/json, text/event-stream",
@@ -99,7 +102,7 @@ class TestHTTPEndpoints:
         """Test that validate_node endpoint works."""
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "http://127.0.0.1:8007/mcp/",
+                http_server.url,
                 json={
                     "jsonrpc": "2.0",
                     "id": 1,
@@ -130,7 +133,7 @@ class TestHTTPEndpoints:
         """Test that validate_data_model endpoint works."""
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "http://127.0.0.1:8007/mcp/",
+                http_server.url,
                 json={
                     "jsonrpc": "2.0",
                     "id": 1,
@@ -169,7 +172,7 @@ class TestHTTPEndpoints:
         """Test that get_mermaid_config_str endpoint works."""
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "http://127.0.0.1:8007/mcp/",
+                http_server.url,
                 json={
                     "jsonrpc": "2.0",
                     "id": 1,
@@ -208,7 +211,7 @@ class TestHTTPEndpoints:
         """Test that resource endpoints work."""
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "http://127.0.0.1:8007/mcp/",
+                http_server.url,
                 json={"jsonrpc": "2.0", "id": 1, "method": "resources/list"},
                 headers={
                     "Accept": "application/json, text/event-stream",
@@ -232,6 +235,7 @@ class TestErrorHandling:
         # Get the current directory - we're already in the server directory
         server_dir = os.getcwd()
 
+        port = free_port()
         process = await asyncio.create_subprocess_exec(
             "uv",
             "run",
@@ -241,14 +245,14 @@ class TestErrorHandling:
             "--server-host",
             "127.0.0.1",
             "--server-port",
-            "8008",
+            str(port),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             cwd=server_dir,
         )
 
         await asyncio.sleep(3)
-        yield process
+        yield Spawned(process, port)
         process.terminate()
         await process.wait()
 
@@ -257,7 +261,7 @@ class TestErrorHandling:
         """Test handling of invalid JSON."""
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "http://127.0.0.1:8008/mcp/",
+                http_server.url,
                 data="invalid json",
                 headers={
                     "Accept": "application/json, text/event-stream",
@@ -272,7 +276,7 @@ class TestErrorHandling:
         """Test handling of invalid method."""
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "http://127.0.0.1:8008/mcp/",
+                http_server.url,
                 json={"jsonrpc": "2.0", "id": 1, "method": "invalid_method"},
                 headers={
                     "Accept": "application/json, text/event-stream",
@@ -291,7 +295,7 @@ class TestErrorHandling:
         """Test handling of invalid tool call."""
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "http://127.0.0.1:8008/mcp/",
+                http_server.url,
                 json={
                     "jsonrpc": "2.0",
                     "id": 1,
@@ -314,7 +318,7 @@ class TestErrorHandling:
         """Test handling of invalid node data."""
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "http://127.0.0.1:8008/mcp/",
+                http_server.url,
                 json={
                     "jsonrpc": "2.0",
                     "id": 1,
@@ -339,7 +343,7 @@ class TestErrorHandling:
         """Test handling of invalid data model."""
         async with aiohttp.ClientSession() as session:
             async with session.post(
-                "http://127.0.0.1:8008/mcp/",
+                http_server.url,
                 json={
                     "jsonrpc": "2.0",
                     "id": 1,
@@ -371,6 +375,7 @@ class TestHTTPTransportIntegration:
         # Get the current directory - we're already in the server directory
         server_dir = os.getcwd()
 
+        port = free_port()
         process = await asyncio.create_subprocess_exec(
             "uv",
             "run",
@@ -380,7 +385,7 @@ class TestHTTPTransportIntegration:
             "--server-host",
             "127.0.0.1",
             "--server-port",
-            "8009",
+            str(port),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             cwd=server_dir,
@@ -392,7 +397,7 @@ class TestHTTPTransportIntegration:
             async with aiohttp.ClientSession() as session:
                 # 1. List tools
                 async with session.post(
-                    "http://127.0.0.1:8009/mcp/",
+                    f"http://127.0.0.1:{port}/mcp/",
                     json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
                     headers={
                         "Accept": "application/json, text/event-stream",
@@ -405,7 +410,7 @@ class TestHTTPTransportIntegration:
 
                 # 2. List resources
                 async with session.post(
-                    "http://127.0.0.1:8009/mcp/",
+                    f"http://127.0.0.1:{port}/mcp/",
                     json={"jsonrpc": "2.0", "id": 2, "method": "resources/list"},
                     headers={
                         "Accept": "application/json, text/event-stream",
@@ -418,7 +423,7 @@ class TestHTTPTransportIntegration:
 
                 # 3. Validate a node
                 async with session.post(
-                    "http://127.0.0.1:8009/mcp/",
+                    f"http://127.0.0.1:{port}/mcp/",
                     json={
                         "jsonrpc": "2.0",
                         "id": 3,
@@ -450,7 +455,7 @@ class TestHTTPTransportIntegration:
 
                 # 4. Validate a data model
                 async with session.post(
-                    "http://127.0.0.1:8009/mcp/",
+                    f"http://127.0.0.1:{port}/mcp/",
                     json={
                         "jsonrpc": "2.0",
                         "id": 4,
@@ -500,6 +505,7 @@ class TestMiddleware:
 
         server_dir = os.getcwd()
 
+        port = free_port()
         process = await asyncio.create_subprocess_exec(
             "uv",
             "run",
@@ -509,7 +515,7 @@ class TestMiddleware:
             "--server-host",
             "127.0.0.1",
             "--server-port",
-            "8010",
+            str(port),
             "--allow-origins",
             "https://example.com,https://test.com",
             "--allowed-hosts",
@@ -520,7 +526,7 @@ class TestMiddleware:
         )
 
         await asyncio.sleep(3)
-        yield process
+        yield Spawned(process, port)
         process.terminate()
         await process.wait()
 
@@ -529,7 +535,7 @@ class TestMiddleware:
         """Test CORS middleware is working."""
         async with aiohttp.ClientSession() as session:
             async with session.options(
-                "http://127.0.0.1:8010/mcp/",
+                http_server_with_middleware.url,
                 headers={
                     "Origin": "https://example.com",
                     "Access-Control-Request-Method": "POST",
@@ -547,12 +553,12 @@ class TestMiddleware:
         async with aiohttp.ClientSession() as session:
             # This should work with valid host
             async with session.post(
-                "http://127.0.0.1:8010/mcp/",
+                http_server_with_middleware.url,
                 json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
                 headers={
                     "Accept": "application/json, text/event-stream",
                     "Content-Type": "application/json",
-                    "Host": "127.0.0.1:8010",
+                    "Host": f"127.0.0.1:{http_server_with_middleware.port}",
                 },
             ) as response:
                 assert response.status == 200
@@ -560,7 +566,7 @@ class TestMiddleware:
             # This should be blocked by TrustedHost middleware
             try:
                 async with session.post(
-                    "http://127.0.0.1:8010/mcp/",
+                    http_server_with_middleware.url,
                     json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
                     headers={
                         "Accept": "application/json, text/event-stream",

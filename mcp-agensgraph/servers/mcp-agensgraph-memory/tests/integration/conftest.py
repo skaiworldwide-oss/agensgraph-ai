@@ -1,6 +1,7 @@
 import asyncio
 import os
 import signal
+import socket
 import subprocess
 import time
 
@@ -57,6 +58,39 @@ def server_arguments(where, extra=()):
     ]
 
 
+def free_port() -> int:
+    """A port the kernel chose, rather than one written down here.
+
+    Every transport fixture used to name a port -- 8001 for the plain HTTP server, which is
+    the same one the cypher server's fixtures name. So the two suites cannot run at once,
+    and when they did, a cypher test asserting on a tools list was answered by *this* server
+    and passed against the wrong list. Binding 0 and reading back what was assigned means
+    each fixture takes a port nothing else holds.
+    """
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        return int(taken.getsockname()[1])
+
+
+class Spawned:
+    """A server process and where it is listening.
+
+    The tests need the port, not just the process, now that no one writes it down.
+    """
+
+    def __init__(self, process, port: int) -> None:
+        self.process = process
+        self.port = port
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}/mcp/"
+
+    @property
+    def returncode(self):
+        return self.process.returncode
+
+
 async def port_is_open(port: int) -> bool:
     try:
         _, writer = await asyncio.open_connection("127.0.0.1", port)
@@ -97,8 +131,6 @@ async def wait_for_server(process, port: int, what: str, timeout: float = 60.0) 
 
 
 async def start_server(where, extra, what, port=None, stdin=None):
-    if port is not None:
-        await wait_for_port_free(port)
     process = await asyncio.create_subprocess_exec(
         *server_arguments(where, extra),
         stdin=stdin,
@@ -159,34 +191,37 @@ async def mcp_server():
 async def sse_server():
     """Start the MCP server in SSE mode."""
     where = settings()
+    port = free_port()
     process = await start_server(
         where,
-        ["--transport", "sse", "--server-host", "127.0.0.1", "--server-port", "8002"],
+        ["--transport", "sse", "--server-host", "127.0.0.1", "--server-port", str(port)],
         "SSE server",
-        port=8002,
+        port=port,
     )
-    yield process
-    await stop_server(process, 8002)
+    yield Spawned(process, port)
+    await stop_server(process, port)
 
 
 @pytest_asyncio.fixture
 async def http_server():
     """Start the MCP server in HTTP mode."""
     where = settings()
+    port = free_port()
     process = await start_server(
         where,
-        ["--transport", "http", "--server-host", "127.0.0.1", "--server-port", "8001"],
+        ["--transport", "http", "--server-host", "127.0.0.1", "--server-port", str(port)],
         "HTTP server",
-        port=8001,
+        port=port,
     )
-    yield process
-    await stop_server(process, 8001)
+    yield Spawned(process, port)
+    await stop_server(process, port)
 
 
 @pytest_asyncio.fixture
 async def http_server_restricted_cors():
     """Start the MCP server in HTTP mode with restricted CORS origins."""
     where = settings()
+    port = free_port()
     process = await start_server(
         where,
         [
@@ -195,21 +230,22 @@ async def http_server_restricted_cors():
             "--server-host",
             "127.0.0.1",
             "--server-port",
-            "8003",
+            str(port),
             "--allow-origins",
             "http://localhost:3000,https://trusted-site.com",
         ],
         "Restricted CORS server",
-        port=8003,
+        port=port,
     )
-    yield process
-    await stop_server(process, 8003)
+    yield Spawned(process, port)
+    await stop_server(process, port)
 
 
 @pytest_asyncio.fixture
 async def http_server_custom_hosts():
     """Start the MCP server in HTTP mode with custom allowed hosts."""
     where = settings()
+    port = free_port()
     process = await start_server(
         where,
         [
@@ -218,15 +254,15 @@ async def http_server_custom_hosts():
             "--server-host",
             "127.0.0.1",
             "--server-port",
-            "8004",
+            str(port),
             "--allowed-hosts",
             "example.com,test.local",
         ],
         "Custom hosts server",
-        port=8004,
+        port=port,
     )
-    yield process
-    await stop_server(process, 8004)
+    yield Spawned(process, port)
+    await stop_server(process, port)
 
 
 # ===== Database Testing Fixtures =====

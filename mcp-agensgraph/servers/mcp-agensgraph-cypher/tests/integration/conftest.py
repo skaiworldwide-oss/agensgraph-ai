@@ -1,6 +1,7 @@
 import asyncio
 import os
 import signal
+import socket
 import time
 from typing import Any
 import pytest
@@ -13,6 +14,39 @@ from mcp_agensgraph_cypher.server import (
 )
 from mcp_agensgraph_common.safety import quote_identifiers as _quote_identifiers
 from psycopg.rows import namedtuple_row  # type: ignore
+
+
+def free_port() -> int:
+    """A port the kernel chose, rather than one written down here.
+
+    Every fixture below used to name a port -- 8001 for the plain HTTP server, and the
+    memory server's fixtures name the same one. So the two suites cannot run at once, and
+    when they did, the cypher test that asserts on a tools list was answered by the memory
+    server and passed against the wrong list. Binding 0 and reading back what was assigned
+    means each fixture takes a port nothing else holds, and the suites are independent.
+    """
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        return int(taken.getsockname()[1])
+
+
+class Spawned:
+    """A server process and where it is listening.
+
+    The tests need the port, not just the process, now that no one writes it down.
+    """
+
+    def __init__(self, process: Any, port: int) -> None:
+        self.process = process
+        self.port = port
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}/mcp/"
+
+    @property
+    def returncode(self):
+        return self.process.returncode
 
 
 async def _wait_for_port_free(port: int, timeout: float = 30.0) -> None:
@@ -185,7 +219,7 @@ async def clear_data(setup, graphname):
 
 @pytest_asyncio.fixture(scope="function")
 async def http_server(setup, graphname):
-    """HTTP server fixture on port 8001 with default settings."""
+    """HTTP server fixture on a free port with default settings."""
     import asyncio
     import subprocess
 
@@ -197,7 +231,7 @@ async def http_server(setup, graphname):
 
     db_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
 
-    await _wait_for_port_free(8001)
+    port = free_port()
 
     # Start server process in HTTP mode using the installed binary
     process = await asyncio.create_subprocess_exec(
@@ -209,7 +243,7 @@ async def http_server(setup, graphname):
         "--server-host",
         "127.0.0.1",
         "--server-port",
-        "8001",
+        str(port),
         "--db-url",
         db_url,
         "--username",
@@ -226,17 +260,17 @@ async def http_server(setup, graphname):
         start_new_session=True,
     )
 
-    await _wait_for_server(process, 8001)
+    await _wait_for_server(process, port)
 
-    yield process
+    yield Spawned(process, port)
 
     # Cleanup
-    await _stop_server(process, 8001)
+    await _stop_server(process, port)
 
 
 @pytest_asyncio.fixture(scope="function")
 async def http_server_read_only(setup, graphname):
-    """HTTP server fixture on port 8005 with read-only mode enabled."""
+    """HTTP server fixture on a free port with read-only mode enabled."""
     import asyncio
     import subprocess
 
@@ -248,7 +282,7 @@ async def http_server_read_only(setup, graphname):
 
     db_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
 
-    await _wait_for_port_free(8005)
+    port = free_port()
 
     # Start server process in HTTP mode with read-only
     process = await asyncio.create_subprocess_exec(
@@ -260,7 +294,7 @@ async def http_server_read_only(setup, graphname):
         "--server-host",
         "127.0.0.1",
         "--server-port",
-        "8005",
+        str(port),
         "--read-only",
         "--db-url",
         db_url,
@@ -280,21 +314,21 @@ async def http_server_read_only(setup, graphname):
         start_new_session=True,
     )
 
-    await _wait_for_server(process, 8005)
+    await _wait_for_server(process, port)
 
     # Check if process is still running
     if process.returncode is not None:
         raise RuntimeError(f"Read-only server failed to start with return code: {process.returncode}")
 
-    yield process
+    yield Spawned(process, port)
 
     # Cleanup
-    await _stop_server(process, 8005)
+    await _stop_server(process, port)
 
 
 @pytest_asyncio.fixture(scope="function")
 async def http_server_restricted_cors(setup, graphname):
-    """HTTP server fixture on port 8003 with restricted CORS settings."""
+    """HTTP server fixture on a free port with restricted CORS settings."""
     import asyncio
     import subprocess
 
@@ -306,7 +340,7 @@ async def http_server_restricted_cors(setup, graphname):
 
     db_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
 
-    await _wait_for_port_free(8003)
+    port = free_port()
 
     # Start server process in HTTP mode with restricted CORS
     process = await asyncio.create_subprocess_exec(
@@ -318,7 +352,7 @@ async def http_server_restricted_cors(setup, graphname):
         "--server-host",
         "127.0.0.1",
         "--server-port",
-        "8003",
+        str(port),
         "--allow-origins",
         "http://localhost:3000,https://trusted-site.com",
         "--db-url",
@@ -337,17 +371,17 @@ async def http_server_restricted_cors(setup, graphname):
         start_new_session=True,
     )
 
-    await _wait_for_server(process, 8003)
+    await _wait_for_server(process, port)
 
-    yield process
+    yield Spawned(process, port)
 
     # Cleanup
-    await _stop_server(process, 8003)
+    await _stop_server(process, port)
 
 
 @pytest_asyncio.fixture(scope="function")
 async def http_server_custom_hosts(setup, graphname):
-    """HTTP server fixture on port 8004 with custom allowed hosts."""
+    """HTTP server fixture on a free port with custom allowed hosts."""
     import asyncio
     import subprocess
 
@@ -359,7 +393,7 @@ async def http_server_custom_hosts(setup, graphname):
 
     db_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
 
-    await _wait_for_port_free(8004)
+    port = free_port()
 
     # Start server process in HTTP mode with custom allowed hosts
     process = await asyncio.create_subprocess_exec(
@@ -371,7 +405,7 @@ async def http_server_custom_hosts(setup, graphname):
         "--server-host",
         "127.0.0.1",
         "--server-port",
-        "8004",
+        str(port),
         "--allowed-hosts",
         "example.com,test.local",
         "--db-url",
@@ -390,12 +424,12 @@ async def http_server_custom_hosts(setup, graphname):
         start_new_session=True,
     )
 
-    await _wait_for_server(process, 8004)
+    await _wait_for_server(process, port)
 
-    yield process
+    yield Spawned(process, port)
 
     # Cleanup
-    await _stop_server(process, 8004)
+    await _stop_server(process, port)
 
 
 @pytest_asyncio.fixture(scope="function")
@@ -412,7 +446,7 @@ async def sse_server(setup, graphname):
 
     db_url = f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
 
-    await _wait_for_port_free(8002)
+    port = free_port()
 
     process = await asyncio.create_subprocess_exec(
         "uv",
@@ -423,7 +457,7 @@ async def sse_server(setup, graphname):
         "--server-host",
         "127.0.0.1",
         "--server-port",
-        "8002",
+        str(port),
         "--db-url",
         db_url,
         "--username",
@@ -440,7 +474,7 @@ async def sse_server(setup, graphname):
         start_new_session=True,
     )
 
-    await _wait_for_server(process, 8002)
+    await _wait_for_server(process, port)
 
     if process.returncode is not None:
         stdout, stderr = await process.communicate()
@@ -448,6 +482,6 @@ async def sse_server(setup, graphname):
             f"Server failed to start. stdout: {stdout.decode()}, stderr: {stderr.decode()}"
         )
 
-    yield process
+    yield Spawned(process, port)
 
-    await _stop_server(process, 8002)
+    await _stop_server(process, port)

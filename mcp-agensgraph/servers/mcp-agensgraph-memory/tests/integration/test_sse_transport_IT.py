@@ -10,7 +10,7 @@ async def test_sse_endpoint(sse_server):
     """
     async with aiohttp.ClientSession() as session:
         async with session.get(
-            "http://127.0.0.1:8002/mcp/", timeout=aiohttp.ClientTimeout(total=10)
+            sse_server.url, timeout=aiohttp.ClientTimeout(total=10)
         ) as response:
             assert response.status == 200, f"Unexpected status: {response.status}"
             assert response.headers["content-type"].startswith("text/event-stream")

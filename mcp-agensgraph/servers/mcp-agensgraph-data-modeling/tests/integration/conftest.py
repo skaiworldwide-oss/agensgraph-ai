@@ -1,5 +1,6 @@
 import asyncio
 import os
+import socket
 import subprocess
 
 import pytest
@@ -52,6 +53,37 @@ def get_pool_connection(pool: AsyncConnectionPool):
     return pool.connection()
 
 
+def free_port() -> int:
+    """A port the kernel chose, rather than one written down here.
+
+    The SSE fixture named 8002, which is the port the cypher and memory suites' SSE
+    fixtures name too, so no two of the three could run at once. Binding 0 and reading back
+    what was assigned means each fixture takes a port nothing else holds.
+    """
+    with socket.socket() as taken:
+        taken.bind(("127.0.0.1", 0))
+        return int(taken.getsockname()[1])
+
+
+class Spawned:
+    """A server process and where it is listening.
+
+    The tests need the port, not just the process, now that no one writes it down.
+    """
+
+    def __init__(self, process, port: int) -> None:
+        self.process = process
+        self.port = port
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self.port}/mcp/"
+
+    @property
+    def returncode(self):
+        return self.process.returncode
+
+
 # ===== Transport Testing Fixtures =====
 
 
@@ -65,6 +97,7 @@ async def mcp_server():
 @pytest_asyncio.fixture
 async def sse_server():
     """Start the MCP server in SSE mode."""
+    port = free_port()
     process = await asyncio.create_subprocess_exec(
         "uv",
         "run",
@@ -74,7 +107,7 @@ async def sse_server():
         "--server-host",
         "127.0.0.1",
         "--server-port",
-        "8002",
+        str(port),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         cwd=os.getcwd(),
@@ -88,7 +121,7 @@ async def sse_server():
             f"Server failed to start. stdout: {stdout.decode()}, stderr: {stderr.decode()}"
         )
 
-    yield process
+    yield Spawned(process, port)
 
     try:
         process.terminate()

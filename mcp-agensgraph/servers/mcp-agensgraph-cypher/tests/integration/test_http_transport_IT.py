@@ -25,7 +25,7 @@ async def test_http_tools_list(http_server):
     session_id = str(uuid.uuid4())
     async with aiohttp.ClientSession() as session:
         async with session.post(
-            "http://127.0.0.1:8001/mcp/",
+            http_server.url,
             json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
             headers={
                 "Accept": "application/json, text/event-stream",
@@ -56,7 +56,7 @@ async def test_http_tools_list_read_only_mode(http_server_read_only):
     session_id = str(uuid.uuid4())
     async with aiohttp.ClientSession() as session:
         async with session.post(
-            "http://127.0.0.1:8005/mcp/",
+            http_server_read_only.url,
             json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
             headers={
                 "Accept": "application/json, text/event-stream",
@@ -91,7 +91,7 @@ async def test_http_write_tool_call_read_only_mode(http_server_read_only):
     session_id = str(uuid.uuid4())
     async with aiohttp.ClientSession() as session:
         async with session.post(
-            "http://127.0.0.1:8005/mcp/",
+            http_server_read_only.url,
             json={
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -126,7 +126,7 @@ async def test_http_read_tool_call_read_only_mode(http_server_read_only):
     session_id = str(uuid.uuid4())
     async with aiohttp.ClientSession() as session:
         async with session.post(
-            "http://127.0.0.1:8005/mcp/",
+            http_server_read_only.url,
             json={
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -159,7 +159,7 @@ async def test_http_get_schema(http_server):
     """Test that get_agensgraph_schema works over HTTP."""
     async with aiohttp.ClientSession() as session:
         async with session.post(
-            "http://127.0.0.1:8001/mcp/",
+            http_server.url,
             json={
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -184,7 +184,7 @@ async def test_http_write_query(http_server):
     """Test that write_agensgraph_cypher works over HTTP."""
     async with aiohttp.ClientSession() as session:
         async with session.post(
-            "http://127.0.0.1:8001/mcp/",
+            http_server.url,
             json={
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -211,7 +211,7 @@ async def test_http_read_query(http_server):
     """Test that read_agensgraph_cypher works over HTTP."""
     async with aiohttp.ClientSession() as session:
         async with session.post(
-            "http://127.0.0.1:8001/mcp/",
+            http_server.url,
             json={
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -238,7 +238,7 @@ async def test_http_invalid_method(http_server):
     """Test handling of invalid method over HTTP."""
     async with aiohttp.ClientSession() as session:
         async with session.post(
-            "http://127.0.0.1:8001/mcp/",
+            http_server.url,
             json={"jsonrpc": "2.0", "id": 1, "method": "invalid_method"},
             headers={
                 "Accept": "application/json, text/event-stream",
@@ -259,7 +259,7 @@ async def test_http_invalid_tool(http_server):
     """Test handling of invalid tool over HTTP."""
     async with aiohttp.ClientSession() as session:
         async with session.post(
-            "http://127.0.0.1:8001/mcp/",
+            http_server.url,
             json={
                 "jsonrpc": "2.0",
                 "id": 1,
@@ -286,7 +286,7 @@ async def test_http_full_workflow(http_server):
     async with aiohttp.ClientSession() as session:
         # 1. List tools
         async with session.post(
-            "http://127.0.0.1:8001/mcp/",
+            http_server.url,
             json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
             headers={
                 "Accept": "application/json, text/event-stream",
@@ -300,7 +300,7 @@ async def test_http_full_workflow(http_server):
 
         # 2. Write data
         async with session.post(
-            "http://127.0.0.1:8001/mcp/",
+            http_server.url,
             json={
                 "jsonrpc": "2.0",
                 "id": 2,
@@ -324,7 +324,7 @@ async def test_http_full_workflow(http_server):
 
         # 3. Read data
         async with session.post(
-            "http://127.0.0.1:8001/mcp/",
+            http_server.url,
             json={
                 "jsonrpc": "2.0",
                 "id": 3,
@@ -355,7 +355,7 @@ async def test_cors_preflight_empty_default_origins(http_server):
     """Test CORS preflight request with empty default allowed origins."""
     async with aiohttp.ClientSession() as session:
         async with session.options(
-            "http://127.0.0.1:8001/mcp/",
+            http_server.url,
             headers={
                 "Origin": "http://localhost:3000",
                 "Access-Control-Request-Method": "POST",
@@ -377,7 +377,7 @@ async def test_cors_preflight_any_origin_blocked(http_server):
     """Test CORS preflight request - all origins should be blocked with empty default."""
     async with aiohttp.ClientSession() as session:
         async with session.options(
-            "http://127.0.0.1:8001/mcp/",
+            http_server.url,
             headers={
                 "Origin": "http://127.0.0.1:3000",
                 "Access-Control-Request-Method": "POST",
@@ -396,7 +396,7 @@ async def test_cors_preflight_malicious_origin_blocked(http_server):
     """Test CORS preflight request with malicious origin (should be blocked)."""
     async with aiohttp.ClientSession() as session:
         async with session.options(
-            "http://127.0.0.1:8001/mcp/",
+            http_server.url,
             headers={
                 "Origin": "http://malicious-site.com",
                 "Access-Control-Request-Method": "POST",
@@ -419,7 +419,7 @@ async def test_cors_actual_request_no_cors_headers(http_server):
     session_id = str(uuid.uuid4())
     async with aiohttp.ClientSession() as session:
         async with session.post(
-            "http://127.0.0.1:8001/mcp/",
+            http_server.url,
             json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
             headers={
                 "Accept": "application/json, text/event-stream",
@@ -440,7 +440,7 @@ async def test_cors_actual_request_with_origin_blocked(http_server):
     session_id = str(uuid.uuid4())
     async with aiohttp.ClientSession() as session:
         async with session.post(
-            "http://127.0.0.1:8001/mcp/",
+            http_server.url,
             json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
             headers={
                 "Accept": "application/json, text/event-stream",
@@ -464,7 +464,7 @@ async def test_cors_restricted_server_allowed_origin(http_server_restricted_cors
     """Test CORS with restricted server and allowed origin."""
     async with aiohttp.ClientSession() as session:
         async with session.options(
-            "http://127.0.0.1:8003/mcp/",
+            http_server_restricted_cors.url,
             headers={
                 "Origin": "http://localhost:3000",
                 "Access-Control-Request-Method": "POST",
@@ -492,7 +492,7 @@ async def test_cors_restricted_server_disallowed_origin(http_server_restricted_c
     async with aiohttp.ClientSession() as session:
         async with (
             session.options(
-                "http://127.0.0.1:8003/mcp/",
+                http_server_restricted_cors.url,
                 headers={
                     "Origin": "http://127.0.0.1:3000",  # This should be disallowed on restricted server
                     "Access-Control-Request-Method": "POST",
@@ -519,7 +519,7 @@ async def test_cors_restricted_server_trusted_site(http_server_restricted_cors):
     """Test CORS with restricted server and trusted site origin."""
     async with aiohttp.ClientSession() as session:
         async with session.options(
-            "http://127.0.0.1:8003/mcp/",
+            http_server_restricted_cors.url,
             headers={
                 "Origin": "https://trusted-site.com",
                 "Access-Control-Request-Method": "POST",
@@ -541,12 +541,12 @@ async def test_dns_rebinding_protection_trusted_hosts(http_server):
     async with aiohttp.ClientSession() as session:
         # Test with localhost - should be allowed (in default allowed_hosts)
         async with session.post(
-            "http://127.0.0.1:8001/mcp/",
+            http_server.url,
             json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
             headers={
                 "Accept": "application/json, text/event-stream",
                 "Content-Type": "application/json",
-                "Host": "localhost:8001",
+                "Host": f"localhost:{http_server.port}",
                 "mcp-session-id": session_id,
             },
         ) as response:
@@ -569,7 +569,7 @@ async def test_dns_rebinding_protection_untrusted_hosts(http_server):
     async with aiohttp.ClientSession() as session:
         # Test with malicious host - should be blocked
         async with session.post(
-            "http://127.0.0.1:8001/mcp/",
+            http_server.url,
             json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
             headers={
                 "Accept": "application/json, text/event-stream",
@@ -592,7 +592,7 @@ async def test_dns_rebinding_custom_allowed_hosts(http_server_custom_hosts):
     async with aiohttp.ClientSession() as session:
         # Test with custom allowed host - should work
         async with session.post(
-            "http://127.0.0.1:8004/mcp/",
+            http_server_custom_hosts.url,
             json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
             headers={
                 "Accept": "application/json, text/event-stream",
@@ -614,17 +614,18 @@ async def test_dns_rebinding_custom_allowed_hosts(http_server_custom_hosts):
 
         # Test with another custom allowed host with port - should work
         async with session.post(
-            "http://127.0.0.1:8004/mcp/",
+            http_server_custom_hosts.url,
             json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
             headers={
                 "Accept": "application/json, text/event-stream",
                 "Content-Type": "application/json",
-                "Host": "test.local:8004",
+                "Host": f"test.local:{http_server_custom_hosts.port}",
                 "mcp-session-id": session_id,
             },
         ) as response:
             print(
-                f"Custom allowed host (test.local:8004) response status: {response.status}"
+                f"Custom allowed host (test.local:{http_server_custom_hosts.port}) "
+                f"response status: {response.status}"
             )
             print(f"Custom allowed host response headers: {dict(response.headers)}")
 
@@ -636,12 +637,12 @@ async def test_dns_rebinding_custom_allowed_hosts(http_server_custom_hosts):
 
         # Test with localhost (not in custom allowed list) - should be blocked
         async with session.post(
-            "http://127.0.0.1:8004/mcp/",
+            http_server_custom_hosts.url,
             json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
             headers={
                 "Accept": "application/json, text/event-stream",
                 "Content-Type": "application/json",
-                "Host": "localhost:8004",
+                "Host": f"localhost:{http_server_custom_hosts.port}",
                 "mcp-session-id": session_id,
             },
         ) as response:

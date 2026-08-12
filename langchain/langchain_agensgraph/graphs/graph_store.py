@@ -7,13 +7,13 @@ that Cypher graph-QA chains expect.
 
 from __future__ import annotations
 
-from abc import abstractmethod
+from abc import ABC, abstractmethod
 from typing import Any, Dict, List
 
 from langchain_agensgraph.graphs.graph_document import GraphDocument
 
 
-class GraphStore:
+class GraphStore(ABC):
     """Abstract interface for a graph database backing a LangChain graph store."""
 
     @property

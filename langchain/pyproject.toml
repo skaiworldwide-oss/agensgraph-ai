@@ -35,11 +35,12 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
+    "agensgraph-python>=2.0.0",
     "langchain-core>=1.0.0,<2.0.0",
     "langgraph>=1.0.0,<2.0.0",
     "numpy>=1.21,<3",
-    "psycopg[binary]>=3.2.9,<4.0.0",
-    "psycopg-pool>=3.2.1,<4.0.0",
+    "psycopg[binary]>=3.3.4,<4.0.0",
+    "psycopg-pool>=3.3.1,<4.0.0",
 ]
 
 [project.urls]

@@ -1,0 +1,15 @@
+# What working here leaves behind. Two of these were untracked only by accident: a developer's
+# own `~/.config/git/ignore` kept `.claude/` out, and `.ruff_cache/` was kept out by the ignore
+# file ruff writes into it -- neither of which exists on a colleague's clone, where both would
+# be committed on the first `git add`. `.claude/settings.local.json` in particular hard-codes
+# the path a developer's checkout happens to live at.
+.claude/
+.ruff_cache/
+
+# The demo notebooks are committed with their outputs; the checkpoints Jupyter writes beside
+# them are the same notebook a few keystrokes ago.
+.ipynb_checkpoints/
+
+# OpenFlights, downloaded on first run. CC-BY-SA, so vendoring it would carry share-alike into
+# a repository that is Apache-2.0.
+examples/demos/.data/

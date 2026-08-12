@@ -66,7 +66,15 @@ def _split_csv(value: Optional[str]) -> list[str]:
 def connection_config(
     args: argparse.Namespace, *, default_graphname: str = "agens"
 ) -> dict[str, Any]:
-    """Connection settings for DB-backed servers (cypher, memory)."""
+    """Connection settings for DB-backed servers (cypher, memory).
+
+    The password has no default. A default one is a credential in the source: it was ``agens``,
+    which is the packaged instance's, so a server pointed at a machine running one connected as
+    it without anybody choosing to. Left unset, nothing is sent, and libpq resolves it the way
+    it resolves everything else -- ``PGPASSWORD``, ``.pgpass``, ``PGSERVICE``, or an
+    authentication method that needs no password at all, none of which was reachable while a
+    guess was always sent ahead of them.
+    """
     cfg: dict[str, Any] = {}
     cfg["db_url"] = _pick(
         getattr(args, "db_url", None),
@@ -78,7 +86,7 @@ def connection_config(
         getattr(args, "username", None), "AGENSGRAPH_USERNAME", default="agens"
     )
     cfg["password"] = _pick(
-        getattr(args, "password", None), "AGENSGRAPH_PASSWORD", default="agens"
+        getattr(args, "password", None), "AGENSGRAPH_PASSWORD", default=""
     )
     cfg["database"] = _pick(
         getattr(args, "database", None), "AGENSGRAPH_DATABASE", "AGENSGRAPH_DB",

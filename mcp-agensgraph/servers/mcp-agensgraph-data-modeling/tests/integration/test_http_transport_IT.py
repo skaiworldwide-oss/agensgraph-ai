@@ -6,7 +6,7 @@ import aiohttp
 import pytest
 import pytest_asyncio
 
-from conftest import Spawned, free_port
+from conftest import Spawned, free_port, wait_for_server
 
 
 async def _tools_by_name(server):
@@ -65,7 +65,7 @@ class TestHTTPEndpoints:
         )
 
         # Wait for server to start
-        await asyncio.sleep(3)
+        await wait_for_server(process, port)
 
         yield Spawned(process, port)
 
@@ -251,7 +251,7 @@ class TestErrorHandling:
             cwd=server_dir,
         )
 
-        await asyncio.sleep(3)
+        await wait_for_server(process, port)
         yield Spawned(process, port)
         process.terminate()
         await process.wait()
@@ -391,7 +391,7 @@ class TestHTTPTransportIntegration:
             cwd=server_dir,
         )
 
-        await asyncio.sleep(3)
+        await wait_for_server(process, port)
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -525,7 +525,7 @@ class TestMiddleware:
             cwd=server_dir,
         )
 
-        await asyncio.sleep(3)
+        await wait_for_server(process, port)
         yield Spawned(process, port)
         process.terminate()
         await process.wait()

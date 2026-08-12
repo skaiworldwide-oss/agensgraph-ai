@@ -2,6 +2,7 @@ import asyncio
 import os
 import socket
 import subprocess
+import time
 
 import pytest
 import pytest_asyncio
@@ -84,6 +85,37 @@ class Spawned:
         return self.process.returncode
 
 
+async def port_is_open(port: int) -> bool:
+    try:
+        _, writer = await asyncio.open_connection("127.0.0.1", port)
+    except OSError:
+        return False
+    writer.close()
+    await writer.wait_closed()
+    return True
+
+
+async def wait_for_server(process, port: int, timeout: float = 60.0) -> None:
+    """Wait until the server accepts connections, or say why it will not.
+
+    These fixtures slept three seconds and then posted. A server ready sooner was waited on
+    anyway, and one that needed longer was reported as a connection refused to a port nobody
+    was listening on -- which is what `test_trusted_host_security` failed with, intermittently,
+    because two of these servers start one after the other in the same suite.
+    """
+    deadline = time.monotonic() + timeout
+    while not await port_is_open(port):
+        if process.returncode is not None:
+            stdout, stderr = await process.communicate()
+            raise RuntimeError(
+                f"server exited before taking port {port}. "
+                f"stdout: {stdout.decode()}, stderr: {stderr.decode()}"
+            )
+        if time.monotonic() >= deadline:
+            raise RuntimeError(f"server did not take port {port} within {timeout}s")
+        await asyncio.sleep(0.05)
+
+
 # ===== Transport Testing Fixtures =====
 
 
@@ -113,13 +145,7 @@ async def sse_server():
         cwd=os.getcwd(),
     )
 
-    await asyncio.sleep(3)
-
-    if process.returncode is not None:
-        stdout, stderr = await process.communicate()
-        raise RuntimeError(
-            f"Server failed to start. stdout: {stdout.decode()}, stderr: {stderr.decode()}"
-        )
+    await wait_for_server(process, port)
 
     yield Spawned(process, port)
 

@@ -219,6 +219,7 @@ def read_controls(args: argparse.Namespace) -> dict[str, Any]:
         cfg["read_only"] = parse_boolean_safely(env_ro) if env_ro is not None else False
 
     cfg.update(server_program_control(args))
+    cfg.update(graph_ddl_control(args))
 
     return cfg
 
@@ -249,6 +250,18 @@ def pool_config(args: argparse.Namespace) -> dict[str, Any]:
             f"{cfg['pool_max_size']}"
         )
     return cfg
+
+
+def graph_ddl_control(args: argparse.Namespace) -> dict[str, Any]:
+    """Whether the tools may change a graph's shape as well as its contents.
+
+    Off unless it is asked for. A tool that ingests data needs to write elements, not to drop a
+    graph, and the two arrive through the same free-text parameter.
+    """
+    if getattr(args, "allow_graph_ddl", False):
+        return {"allow_graph_ddl": True}
+    env = os.getenv("AGENSGRAPH_ALLOW_GRAPH_DDL")
+    return {"allow_graph_ddl": parse_boolean_safely(env) if env is not None else False}
 
 
 def server_program_control(args: argparse.Namespace) -> dict[str, Any]:

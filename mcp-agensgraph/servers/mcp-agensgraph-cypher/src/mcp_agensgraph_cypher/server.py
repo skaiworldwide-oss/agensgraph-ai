@@ -41,6 +41,7 @@ from mcp_agensgraph_common.connection import (
     run_query,
     unwrappable_clause,
 )
+from mcp_agensgraph_common.policy import PolicyRefusal, check_statement_is_allowed
 from mcp_agensgraph_common.results import (
     count_tokens,
     fit_rows,
@@ -85,6 +86,14 @@ STREAM_CHUNK = 1000
 # exclusion constraint rather than an index -- which is why the property-index view does not
 # show it and ``constraints()`` is asked separately.
 _ASSERTED_UNIQUE = re.compile(r"\(([^()]+)\)\s+IS\s+UNIQUE", re.IGNORECASE)
+
+
+def _refuse_unless_offered(query: str, *, allow_graph_ddl: bool = False) -> None:
+    """Refuse a statement this tool does not offer, in terms the caller can act on."""
+    try:
+        check_statement_is_allowed(query, allow_graph_ddl=allow_graph_ddl)
+    except PolicyRefusal as exc:
+        raise ToolError(str(exc)) from None
 
 
 def _refuse_unless_one_statement(query: str) -> None:
@@ -408,6 +417,7 @@ def create_mcp_server(
     page_size: int = DEFAULT_PAGE_SIZE,
     max_page_size: int = MAX_PAGE_SIZE,
     gql_clauses: bool = False,
+    allow_graph_ddl: bool = False,
     allow_server_programs: bool = False,
 ) -> FastMCP:
     """Create the FastMCP server with the schema / read / write / plan / health tools.
@@ -535,6 +545,7 @@ def create_mcp_server(
         parses.
         """
         _refuse_unless_one_statement(query)
+        _refuse_unless_offered(query)
         if writable_counters(query):
             raise ToolError(
                 f"This tool only reads. Use the write tool for a statement that changes the "
@@ -614,6 +625,7 @@ def create_mcp_server(
         the Cypher writes are refused the same way.
         """
         _refuse_unless_one_statement(query)
+        _refuse_unless_offered(query)
         try:
             rows = await run_query(
                 pool,
@@ -653,6 +665,7 @@ def create_mcp_server(
         response says so.
         """
         _refuse_unless_one_statement(query)
+        _refuse_unless_offered(query)
         try:
             graph_param = {"graph": graphname}
             plan_rows = await run_query(
@@ -778,6 +791,7 @@ def create_mcp_server(
             ),
         ) -> Dict[str, Any]:
             _refuse_unless_one_statement(query)
+            _refuse_unless_offered(query, allow_graph_ddl=allow_graph_ddl)
             if not writable_counters(query):
                 raise ToolError(
                     "This tool is for a statement that changes the graph; use the read tool "
@@ -809,6 +823,7 @@ async def main(
     token_limit: Optional[int] = None,
     read_only: bool = False,
     allow_server_programs: bool = False,
+    allow_graph_ddl: bool = False,
     pool_min_size: int = DEFAULT_POOL_MIN_SIZE,
     pool_max_size: int = DEFAULT_POOL_MAX_SIZE,
 ) -> None:
@@ -859,7 +874,7 @@ async def main(
 
         mcp = create_mcp_server(
             pool, graphname, namespace, read_timeout, token_limit, read_only,
-            schema_sample, page_size, max_page_size, gql_clauses, allow_server_programs,
+            schema_sample, page_size, max_page_size, gql_clauses, allow_graph_ddl, allow_server_programs,
         )
         await run_server(
             mcp,

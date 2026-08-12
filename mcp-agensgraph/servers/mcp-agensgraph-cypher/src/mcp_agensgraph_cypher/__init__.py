@@ -44,6 +44,14 @@ def main():
         help="Allow only read-only queries (default: False)",
     )
     parser.add_argument(
+        "--allow-graph-ddl",
+        action="store_true",
+        help=(
+            "Let the write tool change a graph's shape -- create or drop graphs, labels, "
+            "indexes and constraints -- as well as its contents (default: False)"
+        ),
+    )
+    parser.add_argument(
         "--allow-server-programs",
         action="store_true",
         help=(

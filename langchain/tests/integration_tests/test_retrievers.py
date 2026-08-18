@@ -8,9 +8,11 @@ import pytest
 from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 
+from langchain_agensgraph.graphs.agensgraph import AgensGraph
 from langchain_agensgraph.observability import log_queries
 from langchain_agensgraph.retrievers import (
     AgensGraphContextRetriever,
+    AgensText2CypherRetriever,
     AgensVectorRetriever,
     render_graph_context,
 )
@@ -30,6 +32,14 @@ url = os.environ.get(
         os.getenv("AGENSGRAPH_DB"),
     ),
 )
+
+conf = {
+    "dbname": os.getenv("AGENSGRAPH_DB"),
+    "user": os.getenv("AGENSGRAPH_USER"),
+    "password": os.getenv("AGENSGRAPH_PASSWORD"),
+    "host": os.getenv("AGENSGRAPH_HOST", "localhost"),
+    "port": int(os.getenv("AGENSGRAPH_PORT", 5432)),
+}
 
 GRAPH = "retriever_it"
 
@@ -330,3 +340,111 @@ class TestAgensGraphContextRetriever:
         assert "Graph context:" in docs[0].page_content
         assert "-[relates]->" in docs[0].page_content
         cleanup(store)
+
+
+READ_PEOPLE = "MATCH (n:person) RETURN n.name AS name ORDER BY name"
+BROKEN = "MATCH (n:person RETURN n"
+
+
+def make_qa_graph() -> AgensGraph:
+    graph = AgensGraph("retriever_t2c", conf, create=True, refresh_schema=False)
+    graph.query("CREATE VLABEL IF NOT EXISTS person")
+    graph.query("MATCH (n:person) DETACH DELETE n")
+    graph.query("CREATE (:person {name: 'Ada'}), (:person {name: 'Bob'})")
+    graph.refresh_schema(force=True)
+    return graph
+
+
+def fake_llm(*responses: str):
+    from langchain_core.language_models import FakeListChatModel
+
+    return FakeListChatModel(responses=list(responses))
+
+
+class TestAgensText2CypherRetriever:
+    def test_rows_become_documents_with_their_cypher(self) -> None:
+        graph = make_qa_graph()
+        retriever = AgensText2CypherRetriever(
+            graph=graph, llm=fake_llm(READ_PEOPLE), allow_server_programs=True
+        )
+        docs = retriever.invoke("who is here?")
+        assert len(docs) == 2
+        assert '"Ada"' in docs[0].page_content
+        assert docs[0].metadata["cypher"] == READ_PEOPLE
+        assert docs[0].metadata["__retriever"] == "AgensText2CypherRetriever"
+        graph.close()
+
+    def test_a_generated_write_is_refused_and_nothing_changes(self) -> None:
+        graph = make_qa_graph()
+        retriever = AgensText2CypherRetriever(
+            graph=graph, llm=fake_llm("CREATE (:person {name: 'Eve'})")
+        )
+        with pytest.raises(ValueError, match="Refusing"):
+            retriever.invoke("add Eve")
+        rows = graph.query("MATCH (n:person) RETURN count(*) AS n")
+        assert rows[0]["n"] == 2
+        graph.close()
+
+    def test_an_execution_error_feeds_a_correction_round(self) -> None:
+        graph = make_qa_graph()
+        llm = fake_llm(BROKEN, READ_PEOPLE)
+        retriever = AgensText2CypherRetriever(
+            graph=graph, llm=llm, max_retries=1, allow_server_programs=True
+        )
+        docs = retriever.invoke("who is here?")
+        assert len(docs) == 2
+        assert docs[0].metadata["cypher"] == READ_PEOPLE
+        graph.close()
+
+    def test_no_correction_happens_unasked(self) -> None:
+        graph = make_qa_graph()
+        llm = fake_llm(BROKEN, READ_PEOPLE)
+        retriever = AgensText2CypherRetriever(
+            graph=graph, llm=llm, allow_server_programs=True
+        )
+        with pytest.raises(ValueError, match="not runnable"):
+            retriever.invoke("who is here?")
+        # Only the generation call happened; no correction round was paid for.
+        assert llm.i == 1
+        graph.close()
+
+    def test_a_spent_budget_refuses_another_attempt(self) -> None:
+        graph = make_qa_graph()
+        llm = fake_llm(BROKEN, READ_PEOPLE)
+        retriever = AgensText2CypherRetriever(
+            graph=graph,
+            llm=llm,
+            max_retries=5,
+            timeout=0.001,
+            allow_server_programs=True,
+        )
+        with pytest.raises(Exception):
+            retriever.invoke("who is here?")
+        assert llm.i == 1
+        graph.close()
+
+    def test_k_bounds_the_rows(self) -> None:
+        graph = make_qa_graph()
+        retriever = AgensText2CypherRetriever(
+            graph=graph,
+            llm=fake_llm(READ_PEOPLE),
+            k=1,
+            allow_server_programs=True,
+        )
+        assert len(retriever.invoke("who?")) == 1
+        # The constructor's k also fed the statement's own LIMIT, so a larger
+        # invoke-time k cannot return more than was fetched.
+        assert len(retriever.invoke("who?", k=5)) == 1
+        graph.close()
+
+    async def test_the_async_path_agrees(self) -> None:
+        graph = make_qa_graph()
+        wanted = AgensText2CypherRetriever(
+            graph=graph, llm=fake_llm(READ_PEOPLE), allow_server_programs=True
+        ).invoke("who?")
+        got = await AgensText2CypherRetriever(
+            graph=graph, llm=fake_llm(READ_PEOPLE), allow_server_programs=True
+        ).ainvoke("who?")
+        assert [d.page_content for d in got] == [d.page_content for d in wanted]
+        await graph.aclose()
+        graph.close()

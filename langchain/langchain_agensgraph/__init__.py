@@ -13,6 +13,7 @@ from langchain_agensgraph.graphs.graph_document import (
 from langchain_agensgraph.observability import log_queries
 from langchain_agensgraph.retrievers import (
     AgensGraphContextRetriever,
+    AgensText2CypherRetriever,
     AgensVectorRetriever,
 )
 from langchain_agensgraph.vectorstores.agensgraph_vector import AgensgraphVector
@@ -25,6 +26,7 @@ __all__ = [
     "AgensEngine",
     "AgensGraph",
     "AgensGraphContextRetriever",
+    "AgensText2CypherRetriever",
     "AgensVectorRetriever",
     "AgensgraphVector",
     "GraphDocument",

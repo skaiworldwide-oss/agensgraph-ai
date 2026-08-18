@@ -527,7 +527,16 @@ class TestReconcilingIndexesIsNotPaidPerRequest:
         assert len(reads) == 2, "one read per label, and no more"
         for read in reads:
             # Narrowed to the label, which is what makes it affordable to ask every time.
-            assert "labname::text = " in str(read.statement)
+            # Asked of the predicate, not of one spelling of it. The driver moved
+            # the cast off the column onto the parameter -- `l.labname = %s::name`
+            # where it was `labname::text = %s` -- because casting the indexed
+            # column left nothing indexed to match. The narrowing is what this test
+            # is about and it is still there; the change made 1.029 ms into 0.035
+            # on a database of 3,619 labels.
+            statement = str(read.statement)
+            after = statement.split("labname", 1)
+            narrowed = len(after) == 2 and "%s" in after[1]
+            assert narrowed, f"narrowed to one label, not graph-wide: {statement}"
             assert read.elapsed < 0.01, (
                 f"a per-label read, not a graph-wide one: {read.elapsed}"
             )

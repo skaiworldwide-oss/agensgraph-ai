@@ -34,6 +34,12 @@ class TestBuildExpansionQuery:
         assert "%(max_context_nodes)s" in query
         assert "%(max_context_rels)s" in query
 
+    def test_the_seed_identity_travels_with_the_context(self) -> None:
+        # An edge can point at the seed itself, and the seed is never among
+        # its own neighbours -- the id is what lets a renderer name it.
+        assert "id(node) AS seed_id" in build_expansion_query(hops=1, hybrid=False)
+        assert "id(seed) AS seed_id" in build_expansion_query(hops=1, hybrid=True)
+
     @pytest.mark.parametrize("hops", [0, 4, -1])
     def test_out_of_range_hops_are_refused(self, hops: int) -> None:
         with pytest.raises(ValueError, match="between 1 and 3"):
@@ -60,12 +66,15 @@ class TestRenderGraphContext:
             id="d1",
             page_content="seed",
             metadata={
+                "title": "The Seed",
+                "_seed_id_": "9.9",
                 "_context_nodes_": [
                     {"id": "3.1", "label": "person", "properties": {"name": "Ada"}},
                     {"id": "3.2", "label": "person", "properties": {}},
                 ],
                 "_context_rels_": [
-                    {"type": "knows", "start": "3.1", "end": "3.2", "properties": {}}
+                    {"type": "knows", "start": "3.1", "end": "3.2", "properties": {}},
+                    {"type": "wrote", "start": "3.1", "end": "9.9", "properties": {}},
                 ],
             },
         )
@@ -74,5 +83,7 @@ class TestRenderGraphContext:
         assert "- person:Ada" in rendered.page_content
         assert "- person:3.2" in rendered.page_content
         assert "- person:Ada -[knows]-> person:3.2" in rendered.page_content
+        # The edge into the seed names the seed, not its graph id.
+        assert "- person:Ada -[wrote]-> The Seed" in rendered.page_content
         assert rendered.id == "d1"
         assert rendered.metadata == doc.metadata

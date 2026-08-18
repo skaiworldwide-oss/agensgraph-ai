@@ -31,7 +31,7 @@ _RELATIONSHIP_TYPE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # validation. Braces other than the store's own format keys must not appear.
 _EXPANSION = """
     OPTIONAL MATCH ({anchor})-[rels{rel_type}*1..{hops}]-(peer)
-    WITH node, score,
+    WITH node, score, id({anchor}) AS seed_id,
          collect(DISTINCT CASE WHEN peer IS NULL THEN NULL ELSE
              jsonb_build_object('id', id(peer), 'label', label(peer),
                  'properties', properties(peer) ||
@@ -45,6 +45,7 @@ _EXPANSION = """
     RETURN node.{text_property} AS text, score, node.__id__ AS doc_id,
            node || jsonb_build_object({text_property_literal}, Null,
                {embedding_property_literal}, Null, '__id__', Null,
+               '_seed_id_', seed_id,
                '_context_nodes_', ctx_nodes, '_context_rels_', ctx_rels) AS metadata
 """
 
@@ -183,6 +184,11 @@ def render_graph_context(doc: Document) -> Document:
         )
         for node in nodes
     }
+    # An edge whose far side is the seed itself would otherwise show a bare
+    # graph id -- the seed is never among its own neighbours.
+    seed_id = doc.metadata.get("_seed_id_")
+    if seed_id is not None and seed_id not in named:
+        named[seed_id] = name_of(doc.metadata, doc.id or "this document")
     lines = [f"- {named[node_id]}" for node_id in named]
     for rel in rels:
         start = named.get(rel["start"], str(rel["start"]))

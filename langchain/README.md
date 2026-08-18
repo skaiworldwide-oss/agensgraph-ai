@@ -113,6 +113,49 @@ await db.aadd_texts(["..."], batch_size=500)
 await db.aclose()
 ```
 
+### Retrievers
+
+Three `BaseRetriever`s over the same store and pool, each one server round trip
+per retrieval, sync and async alike:
+
+```python
+from langchain_agensgraph import (
+    AgensGraphContextRetriever,
+    AgensText2CypherRetriever,
+    AgensVectorRetriever,
+)
+from langchain_agensgraph.retrievers import render_graph_context
+
+# Seed-only: the store's vector (or server-side hybrid RRF) search, scored.
+retriever = AgensVectorRetriever(store=db, k=6)
+docs = retriever.invoke("what failed over the weekend?")
+docs[0].metadata["score"]
+
+# Seeds plus their neighbourhood within N hops, fetched in the SAME statement
+# as the seed search — measured 3–4.5x over querying each seed's context
+# separately. metadata carries _context_nodes_ / _context_rels_; the ready-made
+# formatter renders them under the text for a prompt.
+retriever = AgensGraphContextRetriever(
+    store=db, k=4, expand_by_hops=2, document_formatter=render_graph_context
+)
+
+# A model writes the Cypher; the server contains it (write refusal, EXPLAIN
+# check, read-only transaction, one deadline across the attempt). max_retries
+# feeds an execution error back for a corrected attempt, on the same budget.
+retriever = AgensText2CypherRetriever(graph=graph, llm=llm, max_retries=1)
+rows = retriever.invoke("How many people joined after 2024?")
+rows[0].metadata["cypher"]
+
+# Every knob is a per-call override too:
+retriever.invoke("...", k=10)
+await retriever.ainvoke("...")
+```
+
+`AgensVectorRetriever` also takes a `retrieval_query` that shapes what each hit
+returns — several retrievers can share one store while each reads a different
+context (the query sees `node` and `score`; braces are doubled, as in the
+store's own contract).
+
 ### AgensStore (LangGraph long-term memory)
 
 `AgensSaver` persists a single thread's state; `AgensStore` is the other half — cross-thread

@@ -54,6 +54,17 @@ def main():
         ),
     )
 
+    parser.add_argument(
+        "--adopt-existing-graph",
+        action="store_true",
+        help=(
+            "Start on a graph that already holds a Memory label this server did not make, "
+            "taking its contents as this server's own. Starting up folds elements sharing a "
+            "name into one and moves relationships onto another label, so it stops rather than "
+            "do that to data it may not own (default: False)"
+        ),
+    )
+
     args = parser.parse_args()
 
     config = process_config(args)

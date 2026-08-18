@@ -13,6 +13,7 @@ from typing import Any
 from mcp_agensgraph_common.config import (
     connection_config,
     format_namespace,  # re-exported for back-compat
+    graph_adoption_control,
     server_program_control,
     transport_config,
 )
@@ -26,4 +27,5 @@ def process_config(args: argparse.Namespace) -> dict[str, Any]:
         **connection_config(args, default_graphname="memory"),
         **transport_config(args),
         **server_program_control(args),
+        **graph_adoption_control(args),
     }

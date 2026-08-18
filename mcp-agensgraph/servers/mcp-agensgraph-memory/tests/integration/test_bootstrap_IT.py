@@ -9,8 +9,10 @@ import pytest
 import pytest_asyncio
 
 from mcp_agensgraph_memory.agensgraph_memory import AgensGraphMemory
+from agensgraph.cypher import quote_identifier
 from mcp_agensgraph_memory.bootstrap import (
     FULLTEXT_INDEX,
+    MEMORY_LABEL,
     bootstrap,
     edge_index_name,
     ensure_graph,
@@ -225,3 +227,208 @@ async def test_a_memory_whose_names_are_not_unique_is_refused(old_store):
         with pytest.raises(RuntimeError, match="unique"):
             await verify(conn, graphname)
         await conn.rollback()
+
+
+@pytest_asyncio.fixture(scope="function")
+async def shared_graph():
+    """A graph holding another application's data as well as this server's."""
+    where = settings()
+    graphname = f"{where['graphname']}_shared"
+    connection = dsn(where)
+    await ensure_graph(connection, graphname)
+    pool = make_pool(connection, graphname)
+    await pool.open()
+    async with pool.connection() as conn:
+        await conn.execute_query("MATCH (n) DETACH DELETE n")
+        for label in await conn.labels():
+            if not label.is_builtin:
+                await conn.execute_query(
+                    f'drop {"elabel" if label.is_edge else "vlabel"} "{label.name}" cascade'
+                )
+        for mode in ("air", "sea"):
+            await conn.execute_query(
+                f"""CREATE (:"Depot" {{n: '{mode}-from'}})
+                    -[:"shipsTo" {{mode: '{mode}'}}]->
+                    (:"Depot" {{n: '{mode}-to'}})"""
+            )
+        await conn.commit()
+    yield pool, graphname
+    await pool.close()
+
+
+class TestAGraphThisServerShares:
+    """Starting up rewrites and drops labels, so it must touch only the ones it wrote.
+
+    Reading every label in the graph handed the migrations another application's edges: a graph
+    holding two distinct ``shipsTo`` relationships came back holding one, the report saying it
+    had relabelled one and mentioning nothing lost.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_label_this_server_did_not_write_is_left_alone(self, shared_graph):
+        pool, graphname = shared_graph
+        report = await bootstrap(pool, graphname, adopt=True)
+        assert report.relabelled == {}
+        async with pool.connection() as conn:
+            kept = await conn.execute_query(
+                'MATCH ()-[r:"shipsTo"]->() RETURN r.mode ORDER BY r.mode'
+            )
+            labels = {label.name for label in await conn.labels()}
+            await conn.rollback()
+        assert [mode for mode, in kept.records] == ["air", "sea"]
+        assert "shipsTo" in labels
+
+    @pytest.mark.asyncio
+    async def test_two_relationships_of_one_label_both_survive_being_moved(self, shared_graph):
+        """Moving relationships onto a canonical spelling keeps one for one.
+
+        Merging on the pair instead leaves a single relationship carrying the last one's
+        properties, so a pair differing only in what it holds comes out as one.
+        """
+        pool, graphname = shared_graph
+        async with pool.connection() as conn:
+            for name in ("x", "y"):
+                await conn.execute_query(f"CREATE (:\"Memory\" {{name: '{name}'}})")
+            for since in (2020, 2024):
+                await conn.execute_query(
+                    f"""MATCH (a:"Memory" {{name: 'x'}}), (b:"Memory" {{name: 'y'}})
+                        CREATE (a)-[:"Works_At" {{since: {since}}}]->(b)"""
+                )
+            await conn.commit()
+        report = await bootstrap(pool, graphname, adopt=True)
+        assert report.relabelled == {"Works_At": 2}
+
+
+class TestAGraphWhereAnotherApplicationAlsoUsesTheLabel:
+    """``Memory`` is a generic name, so another application can be using it too.
+
+    Ownership was read from one relationship joining two ``Memory`` vertices, and the move that
+    followed had no such constraint -- so a type carrying one relationship of that shape had all
+    of them moved, including the ones reaching elsewhere, and the label was then dropped.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_type_reaching_beyond_this_server_is_not_migrated(self, shared_graph):
+        pool, graphname = shared_graph
+        async with pool.connection() as conn:
+            await conn.execute_query(
+                """CREATE (:"Memory" {name: 'm1'}), (:"Memory" {name: 'm2'}),
+                          (:"Company" {n: 'c'})"""
+            )
+            await conn.execute_query(
+                """MATCH (a:"Memory" {name: 'm1'}), (b:"Memory" {name: 'm2'})
+                   CREATE (a)-[:"partnersWith" {k: 1}]->(b)"""
+            )
+            await conn.execute_query(
+                """MATCH (a:"Memory" {name: 'm1'}), (b:"Company")
+                   CREATE (a)-[:"partnersWith" {k: 2}]->(b)"""
+            )
+            await conn.commit()
+        report = await bootstrap(pool, graphname, adopt=True)
+        assert "partnersWith" not in report.relabelled
+        async with pool.connection() as conn:
+            kept = await conn.execute_query(
+                'MATCH ()-[r:"partnersWith"]->() RETURN r.k ORDER BY r.k'
+            )
+            labels = {label.name for label in await conn.labels()}
+            await conn.rollback()
+        assert [k for k, in kept.records] == [1, 2]
+        assert "partnersWith" in labels
+
+
+class TestWhoseGraphItIs:
+    """Starting up rewrites what is already there, so it asks whose data that is.
+
+    The question was answered by looking for the ``Memory`` label, which is a generic name any
+    application might use. One that had used it first had two vertices sharing a name folded into
+    one -- a vertex destroyed -- and its relationships adopted and then collapsed to one per pair.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_graph_someone_else_filled_is_refused(self, shared_graph):
+        pool, graphname = shared_graph
+        async with pool.connection() as conn:
+            await conn.execute_query(
+                """CREATE (:"Memory" {name: 'shared', payload: 'A'}),
+                          (:"Memory" {name: 'shared', payload: 'B'})"""
+            )
+            await conn.commit()
+        with pytest.raises(RuntimeError, match="did not make"):
+            await bootstrap(pool, graphname)
+        async with pool.connection() as conn:
+            kept = await conn.execute_query('MATCH (n:"Memory") RETURN count(n)')
+            await conn.rollback()
+        assert kept.records[0][0] == 2
+
+    @pytest.mark.asyncio
+    async def test_it_is_taken_when_the_operator_says_so(self, shared_graph):
+        pool, graphname = shared_graph
+        async with pool.connection() as conn:
+            await conn.execute_query('CREATE (:"Memory" {name: \'mine\'})')
+            await conn.commit()
+        report = await bootstrap(pool, graphname, adopt=True)
+        assert report.adopted is True
+
+    @pytest.mark.asyncio
+    async def test_a_graph_it_made_itself_needs_no_saying(self, shared_graph):
+        pool, graphname = shared_graph
+        first = await bootstrap(pool, graphname)
+        second = await bootstrap(pool, graphname)
+        assert first.adopted is True
+        assert second.adopted is False
+
+    @pytest.mark.asyncio
+    async def test_a_store_an_earlier_version_left_is_taken_as_its_own(self, old_store):
+        """No marker, but the full-text index only this server builds is already there."""
+        pool, graphname = old_store
+        report = await bootstrap(pool, graphname)
+        assert report.adopted is True
+
+    @pytest.mark.asyncio
+    async def test_an_index_of_the_same_name_is_not_the_same_claim(self, shared_graph):
+        """``<label>_fulltext_idx`` is the ordinary way to name such an index.
+
+        So another application with a ``Memory`` label and a full-text index over it would most
+        likely have named it exactly what this server names its own. The expression is this
+        server's own and is what the claim is read from.
+        """
+        pool, graphname = shared_graph
+        async with pool.connection() as conn:
+            await conn.execute_query(f'CREATE VLABEL {quote_identifier(MEMORY_LABEL)}')
+            await conn.execute_query(
+                f'CREATE (:{quote_identifier(MEMORY_LABEL)} '
+                f"{{name: 'theirs', payload: 'keep me'}})"
+            )
+            await conn.commit()
+            await conn.execute(
+                f'create index {FULLTEXT_INDEX} on {quote_identifier(graphname)}.'
+                f"{quote_identifier(MEMORY_LABEL)} using gin "
+                f"(to_tsvector('english', coalesce(properties->>'body', '')))"
+            )
+            await conn.commit()
+        with pytest.raises(RuntimeError, match="did not make"):
+            await bootstrap(pool, graphname)
+        async with pool.connection() as conn:
+            kept = await conn.execute_query(
+                f'MATCH (n:{quote_identifier(MEMORY_LABEL)}) RETURN count(n)'
+            )
+            await conn.rollback()
+        assert kept.records[0][0] == 1
+
+
+class TestOrderingByRecencyIsIndexed:
+    """A page of the most recently written is what a capped read of a memory often wants.
+
+    Without an index it is a scan of the whole label and a top-N sort -- 195 ms on twenty
+    thousand entities against 8.6 with one -- and the index costs 1.24x on a write, measured
+    server-side on a create of twenty: 0.566 ms against 0.704.
+    """
+
+    @pytest.mark.asyncio
+    async def test_starting_up_indexes_what_a_page_is_ordered_by(self, old_store):
+        pool, graphname = old_store
+        await bootstrap(pool, graphname)
+        async with pool.connection() as conn:
+            found = await conn.indexes(MEMORY_LABEL, graph=graphname)
+            await conn.rollback()
+        assert any("updated" in index.definition for index in found)

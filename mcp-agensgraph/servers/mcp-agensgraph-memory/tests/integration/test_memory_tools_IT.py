@@ -26,6 +26,7 @@ async def test_every_read_advertises_its_ceiling(memory: AgensGraphMemory):
 
 @pytest.mark.asyncio
 async def test_a_refused_relationship_type_is_explained(memory: AgensGraphMemory):
+    """The refusal names what the server would have done instead."""
     tools = await tools_of(memory)
     await memory.create_entities(
         [
@@ -33,9 +34,15 @@ async def test_a_refused_relationship_type_is_explained(memory: AgensGraphMemory
             Entity(name="A2", type="person", observations=[]),
         ]
     )
+    # A quoted label takes a quote in it, so the refusal is about length, which the server
+    # answers by truncating rather than refusing -- two long types would come back as one.
     with pytest.raises(ToolError, match="relationship type"):
         await tools["create_relations"].run(
-            {"relations": [{"source": "A1", "target": "A2", "relationType": 'a"b'}]}
+            {
+                "relations": [
+                    {"source": "A1", "target": "A2", "relationType": "A" * 64}
+                ]
+            }
         )
 
 

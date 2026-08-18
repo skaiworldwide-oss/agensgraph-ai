@@ -14,6 +14,8 @@ from mcp_agensgraph_common.connection import build_dsn, check_role_cannot_run_pr
 from mcp_agensgraph_common.transport import run_server
 
 from .agensgraph_memory import (
+    BY_NAME,
+    BY_RECENCY,
     MAX_LIMIT,
     AgensGraphMemory,
     Entity,
@@ -100,10 +102,18 @@ def create_mcp_server(
                 "search_memories."
             ),
         ),
+        order: str = Field(
+            BY_NAME,
+            description=(
+                f"'{BY_NAME}' returns the page in name order, '{BY_RECENCY}' returns what was "
+                f"written most recently first. Name is the default because it is the order the "
+                f"memory is indexed in; asking for recency sorts instead."
+            ),
+        ),
     ) -> ToolResult:
         """Read a page of the knowledge graph (entities + relationships) from memory.
 
-        Returns the first `limit` entities by name, and the relationships whose **both** ends
+        Returns `limit` entities in the order asked for, and the relationships whose **both** ends
         are among them — so no relationship names an entity that is not in the response. Use
         this for an overview; for a large memory, prefer search_memories to narrow.
 
@@ -124,7 +134,7 @@ def create_mcp_server(
         """
         logger.info("MCP tool: read_graph")
         try:
-            result = await memory.read_graph(limit=limit)
+            result = await memory.read_graph(limit=limit, order=order)
             return ToolResult(
                 content=[TextContent(type="text", text=result.model_dump_json())],
                 structured_content=result,
@@ -469,6 +479,13 @@ def create_mcp_server(
                 f"{MAX_LIMIT}); the response's `truncated` flag is set if there are more."
             ),
         ),
+        order: str = Field(
+            BY_NAME,
+            description=(
+                f"'{BY_NAME}' returns the matches in name order, '{BY_RECENCY}' returns what "
+                f"was written most recently first."
+            ),
+        ),
     ) -> ToolResult:
         """Search the knowledge graph by words in an entity's name, type or observations.
 
@@ -494,7 +511,7 @@ def create_mcp_server(
         """
         logger.info("MCP tool: search_memories")
         try:
-            result = await memory.search_memories(query, limit=limit)
+            result = await memory.search_memories(query, limit=limit, order=order)
             return ToolResult(
                 content=[TextContent(type="text", text=result.model_dump_json())],
                 structured_content=result,
@@ -564,6 +581,7 @@ async def main(
     allow_origins: Optional[List[str]] = None,
     allowed_hosts: Optional[List[str]] = None,
     allow_server_programs: bool = False,
+    adopt_existing_graph: bool = False,
 ) -> None:
     """Open the pool, make what the graph needs, and serve over the chosen transport."""
     logger.info("Starting AgensGraph MCP Memory Server")
@@ -583,7 +601,7 @@ async def main(
         # Not best-effort. Without the labels and the unique index, every write makes
         # duplicates and every search answers from an index that is not there, and a server
         # that swallowed the failure would report itself healthy while doing both.
-        await bootstrap(pool, graphname)
+        await bootstrap(pool, graphname, adopt=adopt_existing_graph)
 
         memory_limit = memory_limit_from_env()
         memory = AgensGraphMemory(pool, graphname, max_limit=MAX_LIMIT)

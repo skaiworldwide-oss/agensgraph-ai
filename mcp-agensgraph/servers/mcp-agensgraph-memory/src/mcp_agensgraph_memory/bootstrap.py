@@ -24,11 +24,10 @@ from dataclasses import dataclass, field
 from hashlib import sha1
 from typing import Any, Sequence
 
-import agensgraph
 from agensgraph import AsyncConnection, AsyncConnectionPool, DesiredIndex, DesiredLabel
 from agensgraph.cypher import quote_identifier
 from agensgraph.introspect import MAX_IDENTIFIER
-from mcp_agensgraph_common.connection import ensure_graph
+from mcp_agensgraph_common.connection import create_pool, ensure_graph
 from psycopg.types.json import Jsonb
 
 __all__ = [
@@ -49,6 +48,15 @@ logger = logging.getLogger("mcp_agensgraph_memory")
 
 MEMORY_LABEL = "Memory"
 """The one vertex label the memory graph holds."""
+
+RECENCY_INDEX = DesiredIndex(MEMORY_LABEL, ("updated",))
+"""What makes a page of the most recently written cost what a page of the first ones does.
+
+Ordering by anything the graph is not indexed for is a scan of the whole label and a top-N sort:
+on twenty thousand entities, 195 ms against 8.6 with this index, and 0.4 ms at plan level against
+179. Writing costs 1.24x for it, measured server-side on a create of twenty entities -- 0.566 ms
+against 0.704 -- which is what an index over a property expression costs to keep.
+"""
 
 NAME_INDEX = DesiredIndex(MEMORY_LABEL, ("name",), unique=True)
 """What makes a name identify one element.
@@ -118,6 +126,9 @@ class BootstrapReport:
     merged_relations: int = 0
     """How many duplicate relationships were folded into the one written first."""
 
+    adopted: bool = False
+    """Whether this start was the one that claimed the graph."""
+
     reindexed: bool = False
     """Whether the full-text index was rebuilt without the installed helper function."""
 
@@ -147,15 +158,88 @@ class BootstrapReport:
         return ", ".join(parts)
 
 
-async def bootstrap(pool: AsyncConnectionPool, graphname: str) -> BootstrapReport:
+OWNERSHIP_LABEL = "MemoryServerMarker"
+"""Written the first time a graph is made, and looked for on every start afterwards.
+
+Starting up is destructive: it folds elements sharing a name into one, moves relationships onto a
+canonical spelling and drops the label they came off, and imposes one relationship per pair of
+endpoints. All of that is justified by owning the data and by nothing else.
+
+Ownership was read from the ``Memory`` label instead, which is a generic name carrying no claim.
+An application that had used it first had two of its vertices folded into one and a vertex
+destroyed outright, and its relationships adopted and then collapsed. Asking whether this server
+made the graph is a question with an answer; asking whether the data looks like this server's is
+not.
+"""
+
+
+async def check_ownership(conn: AsyncConnection, graphname: str, *, adopt: bool) -> bool:
+    """Refuse a graph holding someone else's data, and say what to do about it.
+
+    Returns whether the marker had to be written, so a caller can report a graph being taken
+    over. ``adopt`` is the operator saying the data is theirs after all, which is the only thing
+    that can settle it -- a graph another application filled is not distinguishable from this
+    one's by reading it.
+    """
+    labels = {label.name for label in await conn.labels(graph=graphname)}
+    if OWNERSHIP_LABEL in labels:
+        return False
+    # A store an earlier version of this server left has no marker, but it does carry the
+    # full-text index this server builds. That is the same claim the marker makes, made by
+    # something already there, so an existing store is adopted rather than refused.
+    #
+    # Asked of the index on the Memory label rather than of a name: `<label>_fulltext_idx` is the
+    # ordinary way to name such an index, so another application with a Memory label and a
+    # full-text index over it would most likely have named it exactly this. What is checked is
+    # the expression, which is this server's own and which nothing else has reason to write --
+    # short of another implementation of this same schema, whose index over a name, a type and a
+    # list of observations would be built on the same expression and would be adopted. The
+    # servers this one is a port of use those three names too, so that is not far-fetched; a
+    # graph shared with one of them needs a graph of its own instead.
+    built = await conn.execute_query(
+        "select 1 from pg_indexes i "
+        "join pg_catalog.ag_label l on l.labname = %s "
+        "join pg_catalog.ag_graph g on l.graphid = g.oid and g.graphname = %s "
+        "where i.schemaname = %s and i.tablename = l.labname "
+        "and i.indexdef like %s",
+        (MEMORY_LABEL, graphname, graphname, "%to_tsvector%observations%"),
+    )
+    if built.records:
+        await conn.execute_query(f"create vlabel {quote_identifier(OWNERSHIP_LABEL)}")
+        return True
+    if MEMORY_LABEL in labels and not adopt:
+        raise RuntimeError(
+            f"graph {graphname!r} already holds a {MEMORY_LABEL!r} label that this server did "
+            f"not make. Starting up would fold elements sharing a name into one, move "
+            f"relationships onto another label and drop the one they came off -- so it stops "
+            f"here instead. Point --graphname at a graph of this server's own, or pass "
+            f"--adopt-existing-graph if the data in this one is this server's."
+        )
+    await conn.execute_query(f"create vlabel {quote_identifier(OWNERSHIP_LABEL)}")
+    return True
+
+
+async def bootstrap(
+    pool: AsyncConnectionPool, graphname: str, *, adopt: bool = False
+) -> BootstrapReport:
     """Make the labels and indexes the tools write through, migrating what is in the way.
 
-    In this order, and it matters: the labels first, so that the migration can move
-    relationships onto a canonical one; the duplicates next, because a unique index cannot be
-    built over a name two elements share; then the indexes.
+    In this order, and it matters: whose graph it is first, because everything after it rewrites
+    what is already there; then the labels, so that the migration can move relationships onto a
+    canonical one; the duplicates next, because a unique index cannot be built over a name two
+    elements share; then the indexes.
     """
     report = BootstrapReport()
     async with pool.connection() as conn:
+        report.adopted = await check_ownership(conn, graphname, adopt=adopt)
+        if report.adopted and adopt:
+            # Marking is permanent: every start after this one migrates without asking again.
+            logger.warning(
+                "Graph %r was not made by this server and has been marked as its own because "
+                "--adopt-existing-graph was given. Later starts will migrate it without asking.",
+                graphname,
+            )
+        await conn.commit()
         report.statements += await conn.ensure_labels(
             [DesiredLabel(MEMORY_LABEL, "v")]
             + [DesiredLabel(name, "e") for name in RELATION_VOCABULARY]
@@ -164,7 +248,7 @@ async def bootstrap(pool: AsyncConnectionPool, graphname: str) -> BootstrapRepor
         await _canonicalise_relation_labels(conn, report)
         await conn.commit()
 
-        report.statements += await conn.ensure_indexes([NAME_INDEX])
+        report.statements += await conn.ensure_indexes([NAME_INDEX, RECENCY_INDEX])
         await ensure_edge_uniqueness(conn, graphname, await edge_labels(conn), report)
         await _install_fulltext_index(conn, report)
         await conn.commit()
@@ -175,8 +259,49 @@ async def bootstrap(pool: AsyncConnectionPool, graphname: str) -> BootstrapRepor
 
 
 async def edge_labels(conn: AsyncConnection) -> list[str]:
-    """Every relationship label a caller could have written to."""
-    return [label.name for label in await conn.labels() if label.is_edge and not label.is_builtin]
+    """The relationship labels this server's own data is held under.
+
+    A graph can hold more than one application's data, and the migrations below rewrite and drop
+    what they are given. Reading every label in the graph handed them another application's
+    edges: pointed at a graph holding two distinct ``shipsTo`` edges, the run reported relabelling
+    one and left one, having destroyed the other.
+
+    So a label counts as this server's when **every** relationship under it joins two ``Memory``
+    vertices, which is the only shape any tool here writes. One such relationship is not enough:
+    a type carrying one Memory-to-Memory relationship and one reaching elsewhere had all of them
+    moved, the second included. The declared vocabulary is included whether or not anything has
+    been written under it yet.
+
+    A graph where another application also labels its vertices ``Memory`` cannot be told apart
+    from this one's by any of this, so the relationships that are moved are constrained to that
+    shape as well, and a label is dropped only once nothing is left under it.
+    """
+    present = [
+        label.name
+        for label in await conn.labels()
+        if label.is_edge and not label.is_builtin
+    ]
+    # Reading the label table is a catalog lookup; deciding by shape is a scan of every
+    # relationship in the graph -- 0.8 milliseconds against 488 on four hundred thousand of them.
+    # A label this server declared needs no deciding, so a store holding only those is answered
+    # without the scan, which is every store this server has to itself.
+    undeclared = [name for name in present if name not in RELATION_VOCABULARY]
+    if not undeclared:
+        return present
+
+    # Two counts rather than one grouped by the labels at both ends. Naming those labels reads
+    # both vertex tables for every relationship, where a pattern naming Memory restricts by the
+    # label's graphid range instead: on two hundred thousand relationships the single grouped
+    # count cost 2591 milliseconds against 534 for the pair.
+    memory = quote_identifier(MEMORY_LABEL)
+    every = await conn.execute_query("MATCH ()-[r]->() RETURN label(r) AS name, count(*) AS n")
+    ours = await conn.execute_query(
+        f"MATCH (:{memory})-[r]->(:{memory}) RETURN label(r) AS name, count(*) AS n"
+    )
+    mine = {name: n for name, n in ours.records}
+    owned = {name for name, n in every.records if mine.get(name) == n}
+    owned.update(RELATION_VOCABULARY)
+    return [name for name in present if name in owned]
 
 
 async def verify(conn: AsyncConnection, graphname: str) -> None:
@@ -282,6 +407,8 @@ async def _merge_duplicate_entities(conn: AsyncConnection, report: BootstrapRepo
         types = [value for value, _ in held.records if value is not None]
         if len(set(types)) > 1:
             report.conflicting_types.append(name)
+        if not held.records:
+            continue
         report.merged_observations += len(observations) - len(held.records[0][1] or [])
         for label in edges:
             for outgoing in (True, False):
@@ -298,10 +425,17 @@ async def _merge_duplicate_entities(conn: AsyncConnection, report: BootstrapRepo
 
 
 def _relabel(old: str, new: str) -> str:
-    """Move every relationship of one label onto another, properties and all."""
+    """Move every relationship of one label onto another, properties and all.
+
+    One new relationship per old one. Merging on the pair instead folds every relationship
+    between the same two vertices into a single survivor holding the last one's properties, so
+    two edges that differ only in what they carry leave one -- measured, a pair distinguished
+    only by a property came back as one edge.
+    """
+    memory = quote_identifier(MEMORY_LABEL)
     return f"""
-        MATCH (a)-[r:{quote_identifier(old)}]->(b)
-        MERGE (a)-[n:{quote_identifier(new)}]->(b)
+        MATCH (a:{memory})-[r:{quote_identifier(old)}]->(b:{memory})
+        CREATE (a)-[n:{quote_identifier(new)}]->(b)
         SET n = properties(r)
         DELETE r
     """
@@ -317,17 +451,21 @@ async def _canonicalise_relation_labels(
     one matches nothing and reports success -- three spellings of one relationship were measured
     leaving three relationships that no delete could reach.
     """
-    miscased = [
-        label.name
-        for label in await conn.labels()
-        if label.is_edge and not label.is_builtin and label.name != label.name.upper()
-    ]
+    miscased = [name for name in await edge_labels(conn) if name != name.upper()]
     if not miscased:
         return
     await conn.ensure_labels([DesiredLabel(name.upper(), "e") for name in miscased])
     for name in miscased:
         moved = await conn.execute_query(_relabel(name, name.upper()), counts_=True)
         report.relabelled[name] = moved.counts.inserted_edges or 0
+        remaining = await conn.execute_query(
+            f"MATCH ()-[r:{quote_identifier(name)}]->() RETURN count(r) AS n"
+        )
+        if remaining.records[0][0]:
+            raise RuntimeError(
+                f"moving relationships off {name!r} onto {name.upper()!r} left "
+                f"{remaining.records[0][0]} behind, so dropping it would destroy them"
+            )
         await conn.execute_query(f"drop elabel {quote_identifier(name)}")
     logger.warning("Moved relationships off %s onto their upper-case spelling", miscased)
 
@@ -449,12 +587,22 @@ async def _install_fulltext_index(conn: AsyncConnection, report: BootstrapReport
     report.statements.append(statement)
 
 
-def make_pool(dsn: str, graphname: str, **kwargs: object) -> AsyncConnectionPool:
-    """A pool whose connections are already reading the memory graph.
+DEFAULT_TIMEOUT = 30.0
+"""How long any one statement may hold a connection, in seconds.
+
+Without it every one of these tools is unbounded: a write ran for 35 seconds, and a call behind
+a lock waited past forty. The connections carry it from the moment they are made.
+"""
+
+
+def make_pool(
+    dsn: str, graphname: str, *, read_timeout: float = DEFAULT_TIMEOUT, **kwargs: Any
+) -> AsyncConnectionPool:
+    """A pool whose connections are already reading the memory graph, under a time limit.
 
     Selecting a graph is a statement, so doing it per call is a round trip per call -- measured
     as an exact doubling, since every one of these tools sends one statement at a time. The pool
     runs it once for each connection it makes instead. The driver does not read a graph path set
     by hand, so this is also the only way to tell it which graph its label table describes.
     """
-    return agensgraph.AsyncConnectionPool(dsn, graph=graphname, **kwargs)  # type: ignore[arg-type]
+    return create_pool(dsn, graphname, read_timeout=read_timeout, **kwargs)

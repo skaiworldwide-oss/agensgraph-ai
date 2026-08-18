@@ -1,6 +1,7 @@
 import pytest
 
 from mcp_agensgraph_memory.agensgraph_memory import (
+    BY_RECENCY,
     AgensGraphMemory,
     Entity,
     KnowledgeGraph,
@@ -252,3 +253,87 @@ async def test_read_graph_limit_and_truncation(memory: AgensGraphMemory):
     found = await memory.search_memories("thing", limit=3)
     assert len(found.entities) == 3
     assert found.truncated is True
+
+
+class TestALimitBoundsWhatComesBack:
+    """The limit bounds the response, not the request.
+
+    Bounding the names alone left the response to whatever those names were connected to: one
+    entity with three hundred neighbours answered with 301 entities and ninety-eight kilobytes,
+    saying it had truncated nothing. Names dropped for being past the limit went unreported too,
+    so a caller heard about entities it had not asked after and not about the ones it had.
+    """
+
+    @pytest.mark.asyncio
+    async def test_a_hub_is_cut_to_the_limit_and_says_so(self, memory):
+        await memory.create_entities(
+            [Entity(name="hub", type="Person", observations=[])]
+            + [Entity(name=f"n{i}", type="Person", observations=[]) for i in range(60)]
+        )
+        await memory.create_relations(
+            [Relation(source="hub", target=f"n{i}", relationType="KNOWS") for i in range(60)]
+        )
+        found = await memory.find_memories_by_name(["hub"], limit=10)
+        assert len(found.relations) == 10
+        assert len(found.entities) == 11
+        assert found.truncated is True
+
+    @pytest.mark.asyncio
+    async def test_a_name_dropped_for_being_past_the_limit_is_reported(self, memory):
+        await memory.create_entities(
+            [Entity(name=f"e{i}", type="Person", observations=[]) for i in range(20)]
+        )
+        found = await memory.find_memories_by_name([f"e{i}" for i in range(20)], limit=5)
+        assert len(found.entities) == 5
+        assert found.truncated is True
+
+    @pytest.mark.asyncio
+    async def test_nothing_cut_is_not_reported_as_cut(self, memory):
+        await memory.create_entities(
+            [Entity(name="solo", type="Person", observations=[])]
+        )
+        found = await memory.find_memories_by_name(["solo"], limit=10)
+        assert [e.name for e in found.entities] == ["solo"]
+        assert found.truncated is False
+
+
+class TestWhenSomethingWasWritten:
+    """A capped read had no answer to "what did I learn most recently".
+
+    Nothing recorded when an entity was written, so a page was the alphabetically-first slice
+    and the memory could only be read in one arbitrary order.
+    """
+
+    @pytest.mark.asyncio
+    async def test_writing_an_entity_records_when(self, memory):
+        await memory.create_entities([Entity(name="a", type="t", observations=[])])
+        written = (await memory.read_graph(limit=1)).entities[0]
+        assert written.updated is not None
+        assert written.updated.endswith("+00:00")
+
+    @pytest.mark.asyncio
+    async def test_adding_an_observation_moves_it(self, memory):
+        await memory.create_entities([Entity(name="a", type="t", observations=[])])
+        first = (await memory.read_graph(limit=1)).entities[0].updated
+        await memory.add_observations(
+            [ObservationAddition(entityName="a", observations=["later"])]
+        )
+        second = (await memory.read_graph(limit=1)).entities[0].updated
+        assert second > first
+
+    @pytest.mark.asyncio
+    async def test_a_page_can_be_the_most_recent_rather_than_the_first(self, memory):
+        for name in ("zebra", "apple", "mango"):
+            await memory.create_entities([Entity(name=name, type="t", observations=[])])
+        by_name = [e.name for e in (await memory.read_graph(limit=3)).entities]
+        by_recency = [
+            e.name for e in (await memory.read_graph(limit=3, order=BY_RECENCY)).entities
+        ]
+        assert by_name == ["apple", "mango", "zebra"]
+        assert by_recency[0] == "mango"
+        assert by_recency[-1] == "zebra"
+
+    @pytest.mark.asyncio
+    async def test_an_order_nobody_offers_is_refused(self, memory):
+        with pytest.raises(ValueError, match="ordered"):
+            await memory.read_graph(order="sideways")

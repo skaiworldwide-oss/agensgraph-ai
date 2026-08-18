@@ -132,8 +132,19 @@ def create_pool(
     """
     options = kwargs.pop("kwargs", None) or {}
     if read_timeout is not None:
-        setting = f"-c statement_timeout={int(read_timeout * 1000)}"
-        options = {**options, "options": f"{options.get('options', '')} {setting}".strip()}
+        milliseconds = int(read_timeout * 1000)
+        # Three limits, because a statement is only one of the ways a caller holds a connection.
+        # A statement that waits on a lock it will never get is bounded by lock_timeout; a
+        # transaction whose caller went away between statements is bounded by the third, which
+        # statement_timeout does not see because nothing is running.
+        settings = " ".join(
+            (
+                f"-c statement_timeout={milliseconds}",
+                f"-c lock_timeout={milliseconds}",
+                f"-c idle_in_transaction_session_timeout={milliseconds}",
+            )
+        )
+        options = {**options, "options": f"{options.get('options', '')} {settings}".strip()}
     return agensgraph.AsyncConnectionPool(
         dsn,
         graph=graphname,

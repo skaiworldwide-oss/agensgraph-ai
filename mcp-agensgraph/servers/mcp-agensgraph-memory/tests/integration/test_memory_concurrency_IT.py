@@ -322,8 +322,16 @@ async def test_finding_by_name_returns_the_entities_its_relations_name(
 
 
 def test_a_relationship_type_is_canonicalised_or_refused():
+    """Folded to one spelling, and refused only for what the server will not store.
+
+    A quoted label takes a space, a quote, a leading digit and a script other than Latin --
+    each was measured being created and read back as written. What it will not take is a null
+    byte, and more than 63 bytes, which it truncates rather than refuses.
+    """
     assert canonical_relation_type("works_at") == "WORKS_AT"
     assert canonical_relation_type("WORKS_AT") == "WORKS_AT"
-    for bad in ('a"b', "1_START", "has space", ""):
+    for taken in ('a"b', "1_START", "has space", "RELÉ", "관계"):
+        assert canonical_relation_type(taken) == taken.upper()
+    for bad in ("", "A\x00B", "A" * 64, "가" * 22):
         with pytest.raises(ValueError):
             canonical_relation_type(bad)

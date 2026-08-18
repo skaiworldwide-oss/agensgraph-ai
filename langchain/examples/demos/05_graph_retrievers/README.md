@@ -11,6 +11,9 @@ model's memory.
 cd langchain
 .venv/bin/python examples/demos/05_graph_retrievers/ingest.py    # 8 films, people, genres
 .venv/bin/python examples/demos/05_graph_retrievers/retrieve.py  # the three retrievers, side by side
+
+# the same retrievers on 138k real vertices (needs demo 01's arxiv graph):
+.venv/bin/python examples/demos/05_graph_retrievers/arxiv.py
 ```
 
 ## What it demonstrates
@@ -32,3 +35,16 @@ cd langchain
 
 Each answer prints with its retrieval wall-clock, and the text2cypher answer
 prints the Cypher it generated.
+
+## At scale
+
+- **`arxiv.py`** — the identical retrievers against demo 01's `arxiv` graph
+  (50k papers, 88k authors, 275k edges): an abstract never names its authors,
+  so the vector answer cannot and the 1-hop context answer can. The aggregate
+  question also shows `retry_on_empty` recovering from a relationship written
+  against its schema direction — a query that runs clean and matches nothing.
+- **`bench/retriever_bench_arxiv.py`** — the module's numbers on that graph,
+  with no embedding API in the loop (query vectors are sampled from the store):
+  one-statement context vs one-query-per-seed, plan-shape proof, concurrency,
+  and the cautionary unfiltered two-hop walk through the Category/Year hubs
+  that a `relationship_type` filter exists to avoid.

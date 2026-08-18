@@ -1,8 +1,19 @@
 DATA_INGEST_PROCESS = """
 Follow these steps when ingesting data into AgensGraph.
-1. Create constraints before loading any data.
-2. Load all nodes before relationships.
+1. Create constraints before loading any data. These statements reshape the graph rather than
+   write to it, so a cypher server will only run them if it was started with --allow-graph-ddl;
+   an ingest server is deliberately not given that. They are what makes the key identify one
+   element: without the unique index the MERGE that loads a node is a scan of the whole label,
+   and two loaders running at once make duplicates rather than finding each other's rows.
+2. Load all nodes before relationships. A relationship matches its endpoints by key, so an
+   endpoint that is not there yet means the relationship is silently not created.
 3. Then load relationships serially to avoid deadlocks.
+
+A relationship with no key property is one relationship per (start, end, type). Loading two
+records for the same pair leaves one, carrying the first record's values -- measured, two records
+with quantity 2 and 7 left a single relationship with quantity 2. That is what you want for a
+relationship that exists once between two things, and it silently loses data for one that can
+happen repeatedly. Give that kind a key property, so each occurrence is its own relationship.
 """
 
 # Real-World Example: Patient Journey Healthcare Data Model

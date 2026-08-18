@@ -14,9 +14,30 @@ from mcp_agensgraph_cypher.server import (
     server_has_gql_clauses,
 )
 
-CATALOG_SIZES = """
-    SELECT (SELECT count(*) FROM pg_catalog.pg_proc)  AS procs,
-           (SELECT count(*) FROM pg_catalog.pg_class) AS relations
+CATALOG_CONTENTS = """
+    SELECT n.nspname || '.' || c.relname
+      FROM pg_catalog.pg_class c
+      JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = %s
+    UNION ALL
+    SELECT n.nspname || '.' || p.proname
+      FROM pg_catalog.pg_proc p
+      JOIN pg_catalog.pg_namespace n ON n.oid = p.pronamespace
+     WHERE n.nspname IN (%s, 'public')
+"""
+"""What a server could have left behind, in the places it could leave it.
+
+Counted over the whole database, and by size, this failed whenever anything else in the database
+made or dropped a relation -- a count that went *down* by one, which nothing being installed can
+do. What is being asked is whether this server added something, so it is asked of the names
+themselves, which also says which name appeared.
+
+Relations are asked about in the graph's own schema, which nothing else writes. In ``public``
+only functions are, because that is where a helper function would land -- the thing this is
+guarding against, since a server here once installed a plpgsql ``typeof`` on every startup --
+and because relations in a shared ``public`` are what another session creates and drops all day.
+Measured across three runs of the suite: ``pg_proc`` identical every time, ``pg_class`` moving
+in two of them.
 """
 
 
@@ -25,13 +46,13 @@ async def _call(server: FastMCP, name: str, args: dict | None = None):
     return json.loads((await tool.run(args or {})).content[0].text)
 
 
-async def _sizes(pool) -> tuple[int, int]:
+async def _contents(pool, graphname: str) -> set[str]:
     async with pool.connection() as conn:
         async with conn.cursor() as cur:
-            await cur.execute(CATALOG_SIZES)
-            row = await cur.fetchone()
+            await cur.execute(CATALOG_CONTENTS, (graphname, graphname))
+            found = await cur.fetchall()
         await conn.rollback()
-    return row
+    return {name for name, in found}
 
 
 async def _run(pool, statement: str) -> None:
@@ -43,16 +64,17 @@ async def _run(pool, statement: str) -> None:
 
 class TestInstallsNothing:
     @pytest.mark.asyncio(loop_scope="function")
-    async def test_a_full_startup_leaves_the_catalogs_the_size_they_were(
+    async def test_a_full_startup_leaves_nothing_behind_in_the_catalogs(
         self, setup, graphname, db_url
     ):
         """Serving a graph is not a reason to create anything in somebody's database.
 
         The graph already exists, which is the state a server starts in every time after the
-        first, so a start that adds a row to ``pg_proc`` or ``pg_class`` has added something
-        nobody asked for.
+        first, so a start that leaves behind a relation or a function nobody asked for has
+        installed something. Only what appeared is asked about: something else dropping a
+        relation in the meantime is not this server's doing.
         """
-        before = await _sizes(setup)
+        before = await _contents(setup, graphname)
         await ensure_graph(db_url, graphname)
         gql = await server_has_gql_clauses(setup)
         server = create_mcp_server(
@@ -68,7 +90,8 @@ class TestInstallsNothing:
             await client.call_tool(
                 "read_agensgraph_cypher", {"query": "MATCH (n) RETURN count(*) AS c"}
             )
-        assert await _sizes(setup) == before
+        after = await _contents(setup, graphname)
+        assert after - before == set()
 
 
 class TestSchema:

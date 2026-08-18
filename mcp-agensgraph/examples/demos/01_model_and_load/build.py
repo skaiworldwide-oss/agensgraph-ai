@@ -112,7 +112,10 @@ async def main() -> None:
         with psycopg.connect(config.dsn(DB), autocommit=True) as conn:
             conn.execute(f'DROP GRAPH IF EXISTS "{GRAPH}" CASCADE')
 
-    async with clients.cypher_client(DB, GRAPH) as cy:
+    # Applying a model's constraints reshapes the graph rather than writing to it, which the
+    # write tool offers only to a server told to allow it. That is the point of the flag: an
+    # ingest server does not need to create labels and indexes, and this step is not ingest.
+    async with clients.cypher_client(DB, GRAPH, allow_graph_ddl=True) as cy:
         # Each item the generator returns is one whole statement, and it is run as one. It is
         # a list for exactly this reason: a label may hold whatever a label holds, including
         # the separator a joined script would be split on, and splitting there hands the tail

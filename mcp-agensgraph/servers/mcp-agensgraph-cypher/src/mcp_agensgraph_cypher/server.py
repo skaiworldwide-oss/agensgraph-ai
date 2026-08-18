@@ -45,7 +45,8 @@ from mcp_agensgraph_common.policy import PolicyRefusal, check_statement_is_allow
 from mcp_agensgraph_common.results import (
     count_tokens,
     fit_rows,
-    mapping_rows,
+    named_row,
+    naming_rows,
     rows_of,
     value_sanitize,
 )
@@ -384,13 +385,19 @@ async def _walk_result(
             f"grammar accepts only at the top of a statement. Ask for a page instead, or end "
             f"the query with a RETURN that has no {clause} before it."
         )
-    kept: List[Dict[str, Any]] = []
+    raw: List[Any] = []
+    names: List[str] = []
     total = 0
     async with pool.connection() as conn:
         # A stream takes its cursor from the connection, so the rows are shaped there. Put back
         # afterwards: the connection goes on to serve somebody else's call.
+        #
+        # The rows arrive as they were sent and only the kept ones are converted. Shaping each
+        # row on the way past converts the ones about to be dropped, which is most of them --
+        # measured, walking 2,000 rows to keep 10 built 4,000 values instead of 20, and 50,000
+        # whole vertices cost 30.4 seconds against 21.0.
         previous_factory = conn.row_factory
-        conn.row_factory = mapping_rows
+        conn.row_factory = naming_rows(names)
         try:
             async with conn.read_only_transaction(
                 allow_server_programs=allow_server_programs
@@ -399,11 +406,11 @@ async def _walk_result(
                     query, jsonb_params(params) or None, size=STREAM_CHUNK
                 ):
                     total += 1
-                    if len(kept) < keep:
-                        kept.append(record)
+                    if len(raw) < keep:
+                        raw.append(record)
         finally:
             conn.row_factory = previous_factory
-    return kept, total
+    return [named_row(names, values) for values in raw], total
 
 
 def create_mcp_server(

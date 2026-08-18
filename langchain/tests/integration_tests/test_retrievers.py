@@ -396,6 +396,37 @@ class TestAgensText2CypherRetriever:
         assert docs[0].metadata["cypher"] == READ_PEOPLE
         graph.close()
 
+    def test_an_empty_result_can_ask_for_a_second_opinion(self) -> None:
+        # A relationship written against its schema direction plans, runs, and
+        # matches nothing -- no error, just zero rows. retry_on_empty turns
+        # that silence into feedback.
+        graph = make_qa_graph()
+        empty = "MATCH (n:person) WHERE n.name = 'Nobody' RETURN n.name AS name"
+        llm = fake_llm(empty, READ_PEOPLE)
+        retriever = AgensText2CypherRetriever(
+            graph=graph,
+            llm=llm,
+            max_retries=1,
+            retry_on_empty=True,
+            allow_server_programs=True,
+        )
+        docs = retriever.invoke("who is here?")
+        assert len(docs) == 2
+        assert docs[0].metadata["cypher"] == READ_PEOPLE
+        graph.close()
+
+    def test_an_empty_result_is_an_answer_by_default(self) -> None:
+        graph = make_qa_graph()
+        empty = "MATCH (n:person) WHERE n.name = 'Nobody' RETURN n.name AS name"
+        llm = fake_llm(empty, READ_PEOPLE)
+        retriever = AgensText2CypherRetriever(
+            graph=graph, llm=llm, max_retries=1, allow_server_programs=True
+        )
+        assert retriever.invoke("who is here?") == []
+        # The model was not consulted a second time over a legitimate empty.
+        assert llm.i == 1
+        graph.close()
+
     def test_no_correction_happens_unasked(self) -> None:
         graph = make_qa_graph()
         llm = fake_llm(BROKEN, READ_PEOPLE)

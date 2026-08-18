@@ -29,6 +29,15 @@ _CORRECTION = """That query failed with:
 
 Write a corrected Cypher query answering the same question. Return only the query."""
 
+# An empty result raises nothing, so it needs its own feedback. The dominant
+# cause is a relationship written against its schema direction -- the pattern
+# plans, runs, and matches nothing.
+_EMPTY_FEEDBACK = (
+    "That query ran without error and returned zero rows. Check every "
+    "relationship's direction and every label's spelling against the schema; "
+    "the schema's directions are authoritative."
+)
+
 
 class AgensText2CypherRetriever(_AgensRetrieverBase):
     """A model writes the Cypher; the server is trusted to contain it.
@@ -42,7 +51,11 @@ class AgensText2CypherRetriever(_AgensRetrieverBase):
     ``max_retries`` (default 0) turns execution failures into feedback: the
     failed query and the server's error go back to the model for a corrected
     attempt, all attempts spending the one budget -- a spent budget fails fast
-    rather than paying for another round.
+    rather than paying for another round. ``retry_on_empty`` extends that to a
+    query that runs clean and matches nothing, which is what a relationship
+    written against its schema direction looks like: the pattern plans, runs,
+    and returns zero rows. It is opt-in because an empty result is sometimes
+    the true answer, and asking again costs a model call.
 
     Each returned document is one result row as JSON, with the Cypher that
     produced it in ``metadata["cypher"]``. ``k`` bounds the rows; the value the
@@ -65,6 +78,7 @@ class AgensText2CypherRetriever(_AgensRetrieverBase):
     allow_server_programs: bool = False
     cypher_prompt: Optional[ChatPromptTemplate] = None
     max_retries: int = Field(default=0, ge=0)
+    retry_on_empty: bool = False
 
     _chain: AgensCypherQAChain = PrivateAttr()
 
@@ -82,7 +96,7 @@ class AgensText2CypherRetriever(_AgensRetrieverBase):
 
     # ---- generation ----
 
-    def _corrected(self, question: str, cypher: str, error: Exception) -> str:
+    def _corrected(self, question: str, cypher: str, error: object) -> str:
         """Ask the model again, showing it what it wrote and what the server said."""
         chain = self._chain
         messages = chain.cypher_prompt.format_messages(
@@ -95,7 +109,7 @@ class AgensText2CypherRetriever(_AgensRetrieverBase):
         raw = StrOutputParser().invoke(self.llm.invoke(messages))
         return quote_identifiers(strip_fences(raw), chain._known_names())
 
-    async def _acorrected(self, question: str, cypher: str, error: Exception) -> str:
+    async def _acorrected(self, question: str, cypher: str, error: object) -> str:
         chain = self._chain
         messages = chain.cypher_prompt.format_messages(
             schema=chain._schema(), question=question
@@ -136,11 +150,16 @@ class AgensText2CypherRetriever(_AgensRetrieverBase):
                 try:
                     chain.check(cypher)
                     rows = chain.run_cypher(cypher)
-                    break
                 except Exception as exc:
                     if attempt == self.max_retries or self._out_of_time():
                         raise
                     cypher = self._corrected(query, cypher, exc)
+                    continue
+                if rows or not self.retry_on_empty:
+                    break
+                if attempt == self.max_retries or self._out_of_time():
+                    break
+                cypher = self._corrected(query, cypher, _EMPTY_FEEDBACK)
         return self._documents(rows, cypher, kwargs.get("k", self.k))
 
     async def _aget_relevant_documents(
@@ -159,9 +178,14 @@ class AgensText2CypherRetriever(_AgensRetrieverBase):
                 try:
                     await chain.acheck(cypher)
                     rows = await chain.arun_cypher(cypher)
-                    break
                 except Exception as exc:
                     if attempt == self.max_retries or self._out_of_time():
                         raise
                     cypher = await self._acorrected(query, cypher, exc)
+                    continue
+                if rows or not self.retry_on_empty:
+                    break
+                if attempt == self.max_retries or self._out_of_time():
+                    break
+                cypher = await self._acorrected(query, cypher, _EMPTY_FEEDBACK)
         return self._documents(rows, cypher, kwargs.get("k", self.k))

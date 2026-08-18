@@ -141,8 +141,12 @@ retriever = AgensGraphContextRetriever(
 
 # A model writes the Cypher; the server contains it (write refusal, EXPLAIN
 # check, read-only transaction, one deadline across the attempt). max_retries
-# feeds an execution error back for a corrected attempt, on the same budget.
-retriever = AgensText2CypherRetriever(graph=graph, llm=llm, max_retries=1)
+# feeds an execution error back for a corrected attempt, on the same budget;
+# retry_on_empty extends that to a query that runs clean and matches nothing
+# (what a relationship written against its schema direction looks like).
+retriever = AgensText2CypherRetriever(
+    graph=graph, llm=llm, max_retries=1, retry_on_empty=True
+)
 rows = retriever.invoke("How many people joined after 2024?")
 rows[0].metadata["cypher"]
 

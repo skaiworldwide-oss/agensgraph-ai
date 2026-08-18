@@ -1569,18 +1569,37 @@ class AgensgraphVector(VectorStore):
         params: Optional[Dict[str, Any]] = None,
         effective_search_ratio: float = 1.0,
         hybrid_config: Optional[HybridSearchConfig] = None,
+        retrieval_query: Optional[str] = None,
         **kwargs: Any,
     ) -> List[Tuple[Document, float]]:
-        """Return the top k documents nearest this vector, with their scores."""
+        """Return the top k documents nearest this vector, with their scores.
+
+        ``retrieval_query`` shapes this one search without touching the store: several
+        retrievers can share one store -- and so one connection pool -- while each reads
+        a different context. Building a second store per shape instead would re-run the
+        constructor's connection and index checks for what is only a different tail on
+        the same statement. ``None`` means the store's own; the same contract applies
+        (the query sees ``node``/``relationship`` and ``score``, returns ``text``,
+        ``score``, ``doc_id``, ``metadata``, and doubles literal braces).
+        """
         statement, parameters, trim = self._build_search(
-            embedding, k, filter, params, effective_search_ratio, hybrid_config, **kwargs
+            embedding,
+            k,
+            filter,
+            params,
+            effective_search_ratio,
+            hybrid_config,
+            retrieval_query=retrieval_query,
+            **kwargs,
         )
         results = self.query(
             statement,
             params=parameters,
             search_options=self._options(kwargs, parameters.get("k")),
         )
-        return self._search_results_to_documents(results, trim, **kwargs)
+        return self._search_results_to_documents(
+            results, trim, retrieval_query=retrieval_query, **kwargs
+        )
 
     def _options(
         self, kwargs: Dict[str, Any], fetch_k: Optional[int] = None
@@ -1618,6 +1637,7 @@ class AgensgraphVector(VectorStore):
         params: Optional[Dict[str, Any]] = None,
         effective_search_ratio: float = 1.0,
         hybrid_config: Optional[HybridSearchConfig] = None,
+        retrieval_query: Optional[str] = None,
         **kwargs: Any,
     ) -> Tuple[Any, Dict[str, Any], int]:
         """Build the search statement and its parameters, without running it.
@@ -1733,9 +1753,13 @@ class AgensgraphVector(VectorStore):
             var = "node"
             index_query = index_query + " WITH *, n as node "
 
-        if not self.retrieval_query:
+        # A per-call query wins over the store's; either silences the default tail.
+        wanted_query = (
+            retrieval_query if retrieval_query is not None else self.retrieval_query
+        )
+        if not wanted_query:
             if kwargs.get("return_embeddings"):
-                retrieval_query = (
+                wanted_query = (
                     """RETURN {var}.{text_property} AS text, score,
                     {var}.__id__ AS doc_id, {var} ||
                     jsonb_build_object({text_property_literal}, Null,
@@ -1743,16 +1767,14 @@ class AgensgraphVector(VectorStore):
                     '_embedding_', {var}.{embedding_property}) AS metadata"""
                 ).replace("{var}", var)
             else:
-                retrieval_query = (
+                wanted_query = (
                     """RETURN {var}.{text_property} AS text, score,
                     {var}.__id__ AS doc_id, {var} ||
                     jsonb_build_object({text_property_literal}, Null,
                     {embedding_property_literal}, Null, '__id__', Null) AS metadata"""
                 ).replace("{var}", var)
-        else:
-            retrieval_query = self.retrieval_query
 
-        read_query = index_query + retrieval_query
+        read_query = index_query + wanted_query
 
         # Over-fetch from the ANN index when caller asks for higher recall.
         # ``effective_search_ratio`` >= 1.0; final results are trimmed to k.
@@ -1794,12 +1816,21 @@ class AgensgraphVector(VectorStore):
         return composed, parameters, k
 
     def _search_results_to_documents(
-        self, results: List[Dict[str, Any]], k: int, **kwargs: Any
+        self,
+        results: List[Dict[str, Any]],
+        k: int,
+        retrieval_query: Optional[str] = None,
+        **kwargs: Any,
     ) -> List[Tuple[Document, float]]:
         """Turn what a search returned into documents.
+
+        ``retrieval_query`` here is only the per-call override the search ran with, so
+        a complaint about a bad ``text`` column blames the query that actually built the
+        row rather than whichever one the store happens to hold.
         """
+        custom_query = retrieval_query or self.retrieval_query
         if any(result["text"] is None for result in results):
-            if not self.retrieval_query:
+            if not custom_query:
                 raise ValueError(
                     f"Make sure that none of the `{self.text_node_property}` "
                     f"properties on nodes with label `{self.node_label}` "
@@ -1818,7 +1849,7 @@ class AgensgraphVector(VectorStore):
             and result["metadata"]["_embedding_"] is None
             for result in results
         ):
-            if not self.retrieval_query:
+            if not custom_query:
                 raise ValueError(
                     f"Make sure that none of the `{self.embedding_node_property}` "
                     f"properties on nodes with label `{self.node_label}` "
@@ -2794,22 +2825,37 @@ class AgensgraphVector(VectorStore):
         filter: Optional[Dict[str, Any]] = None,
         params: Optional[Dict[str, Any]] = None,
         effective_search_ratio: float = 1.0,
+        hybrid_config: Optional[HybridSearchConfig] = None,
+        retrieval_query: Optional[str] = None,
         **kwargs: Any,
     ) -> List[Tuple[Document, float]]:
         """Async sibling of :meth:`similarity_search_with_score_by_vector`.
 
         The statement is built by the same code the blocking path builds it with and
-        then awaited, so two searches on one store overlap.
+        then awaited, so two searches on one store overlap. ``hybrid_config`` and
+        ``retrieval_query`` are named here for the same reason they are named on the
+        blocking twin: before this they only reached `_build_search` by falling through
+        ``**kwargs``, which worked but promised nothing -- an unrelated keyword of the
+        same name added later would have bound silently.
         """
         statement, parameters, trim = self._build_search(
-            embedding, k, filter, params, effective_search_ratio, **kwargs
+            embedding,
+            k,
+            filter,
+            params,
+            effective_search_ratio,
+            hybrid_config,
+            retrieval_query=retrieval_query,
+            **kwargs,
         )
         results = await self.aquery(
             statement,
             params=parameters,
             search_options=self._options(kwargs, parameters.get("k")),
         )
-        return self._search_results_to_documents(results, trim, **kwargs)
+        return self._search_results_to_documents(
+            results, trim, retrieval_query=retrieval_query, **kwargs
+        )
 
     async def asearch(
         self, query: str, search_type: str, **kwargs: Any

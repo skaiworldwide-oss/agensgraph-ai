@@ -1361,3 +1361,99 @@ class TestBuildingAStoreCostsNoEmbedding:
         )
         with pytest.raises(ValueError, match="dimensions do not match"):
             store.add_texts(["one of the wrong width"])
+
+
+class TestPerCallRetrievalQuery:
+    """One store, many shapes: a search names its own retrieval query.
+
+    The override exists so several retrievers can share one store -- and its one
+    connection pool -- while each reads a different context. These tests hold the two
+    properties that make that safe: the override shapes only the call that carries it,
+    and the store's own query is untouched afterwards.
+    """
+
+    OVERRIDE = """
+        RETURN 'overridden' AS text, score, node.__id__ AS doc_id,
+        {{shape: 'override'}} AS metadata
+    """
+
+    def test_override_shapes_one_call_only(self) -> None:
+        docsearch = AgensgraphVector.from_texts(
+            texts=texts,
+            embedding=FakeEmbeddings(),
+            pre_delete_collection=True,
+            url=url,
+        )
+        shaped = docsearch.similarity_search("foo", k=1, retrieval_query=self.OVERRIDE)
+        assert _no_id(shaped) == [
+            Document(page_content="overridden", metadata={"shape": "override"})
+        ]
+        # The next plain search still reads the store's default shape.
+        plain = docsearch.similarity_search("foo", k=1)
+        assert _no_id(plain) == [Document(page_content="foo")]
+        drop_vector_indexes(docsearch)
+
+    def test_override_wins_over_the_stores_own(self) -> None:
+        docsearch = AgensgraphVector.from_texts(
+            texts=texts,
+            embedding=FakeEmbeddings(),
+            pre_delete_collection=True,
+            retrieval_query="RETURN 'constructor' AS text, score, {{}} AS metadata",
+            url=url,
+        )
+        shaped = docsearch.similarity_search("foo", k=1, retrieval_query=self.OVERRIDE)
+        assert shaped[0].page_content == "overridden"
+        # And without the override the constructor's query still answers.
+        assert docsearch.similarity_search("foo", k=1)[0].page_content == "constructor"
+        drop_vector_indexes(docsearch)
+
+    async def test_the_async_path_carries_the_override(self) -> None:
+        docsearch = AgensgraphVector.from_texts(
+            texts=texts,
+            embedding=FakeEmbeddings(),
+            pre_delete_collection=True,
+            url=url,
+        )
+        shaped = await docsearch.asimilarity_search(
+            "foo", k=1, retrieval_query=self.OVERRIDE
+        )
+        assert _no_id(shaped) == [
+            Document(page_content="overridden", metadata={"shape": "override"})
+        ]
+        await docsearch.aclose()
+        drop_vector_indexes(docsearch)
+
+
+class TestAsyncHybridConfig:
+    """The async twin takes the fusion knobs the blocking one does.
+
+    Before, ``hybrid_config`` reached `_build_search` only by falling through
+    ``**kwargs``; naming it is what this test pins, by asserting the two paths fuse
+    identically under a knob that is not the default.
+    """
+
+    async def test_the_twins_fuse_alike(self) -> None:
+        from langchain_agensgraph.vectorstores.agensgraph_vector import (
+            HybridSearchConfig,
+        )
+
+        docsearch = AgensgraphVector.from_texts(
+            texts=texts,
+            embedding=FakeEmbeddings(),
+            pre_delete_collection=True,
+            search_type=SearchType.HYBRID,
+            url=url,
+        )
+        sharp = HybridSearchConfig(rank_constant=1, keyword_weight=2.0)
+        wanted = docsearch.similarity_search_with_score(
+            "foo", k=3, hybrid_config=sharp
+        )
+        got = await docsearch.asimilarity_search_with_score(
+            "foo", k=3, hybrid_config=sharp
+        )
+        assert [(d.page_content, s) for d, s in _no_id(wanted)] == [
+            (d.page_content, s) for d, s in _no_id(got)
+        ]
+        await docsearch.aclose()
+        drop_fulltext_indexes(docsearch)
+        drop_vector_indexes(docsearch)

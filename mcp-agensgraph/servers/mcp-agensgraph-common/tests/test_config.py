@@ -94,6 +94,7 @@ def test_read_controls_defaults_and_cli():
         "token_limit": DEFAULT_TOKEN_LIMIT,
         "read_only": False,
         "allow_server_programs": False,
+        "allow_graph_ddl": False,
     }
     cfg = read_controls(ns(read_timeout=10, token_limit=500, read_only=True))
     assert cfg == {
@@ -101,6 +102,7 @@ def test_read_controls_defaults_and_cli():
         "token_limit": 500,
         "read_only": True,
         "allow_server_programs": False,
+        "allow_graph_ddl": False,
     }
 
 

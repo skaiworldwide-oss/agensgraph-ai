@@ -264,6 +264,21 @@ def graph_ddl_control(args: argparse.Namespace) -> dict[str, Any]:
     return {"allow_graph_ddl": parse_boolean_safely(env) if env is not None else False}
 
 
+def graph_adoption_control(args: argparse.Namespace) -> dict[str, Any]:
+    """Whether the operator has said a graph someone else filled holds this server's data.
+
+    Off unless it is asked for. Starting up folds elements sharing a name into one and moves
+    relationships onto another label, which is justified by owning the data; a graph already
+    holding those labels is not distinguishable from this server's by reading it, so the
+    operator settles it.
+    """
+    asked = getattr(args, "adopt_existing_graph", False)
+    if asked:
+        return {"adopt_existing_graph": True}
+    env = os.getenv("AGENSGRAPH_ADOPT_EXISTING_GRAPH")
+    return {"adopt_existing_graph": parse_boolean_safely(env) if env is not None else False}
+
+
 def server_program_control(args: argparse.Namespace) -> dict[str, Any]:
     """Whether the operator has accepted a role that can run a command on the server's host.
 

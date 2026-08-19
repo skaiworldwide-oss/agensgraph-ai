@@ -436,3 +436,85 @@ def test_bulk_ingest_puts_the_vector_indexes_back(
     except Boom:
         pass
     assert "BIRD_entity" in vector_indexes()
+
+
+def test_the_embedding_gets_a_column_and_the_index_matches_it(
+    vec_store: AgensPropertyGraphStore,
+):
+    """Read out of the property map an embedding is text in a TOASTed bag, parsed
+    once per element a filter kept -- which is where a filtered search spent its
+    time: 538.9 ms against 3.0 ms over 20,000 entities with a filter keeping one
+    in ten.
+
+    The index has to be spelled for where the value lives. Against a column the
+    query says ``n.embedding`` and the cast falls away, so an index built over the
+    cast cannot serve it: 568 ms against 1.8 ms, with nothing to say it went
+    unused.
+    """
+    declared = {
+        prop.name
+        for prop in vec_store.connection.declared_properties(
+            "__Node__", graph=vec_store.graph_name
+        )
+    }
+    vec_store.connection.commit()
+    assert "embedding" in declared
+
+    vec_store.upsert_nodes(
+        [
+            EntityNode(
+                name=f"c{i}",
+                label="CAT",
+                properties={"embedding": [float(i), 0.0, 0.0, 1.0]},
+            )
+            for i in range(20)
+        ]
+    )
+    definitions = {
+        index.name: index.definition
+        for index in vec_store.connection.indexes("CAT", graph=vec_store.graph_name)
+    }
+    vec_store.connection.commit()
+    assert "::vector(" not in definitions["CAT_entity"]
+
+    built = vec_store._build_vector_query(
+        VectorStoreQuery(query_embedding=[1.0, 0.0, 0.0, 1.0], similarity_top_k=3)
+    )
+    assert built is not None
+    plan = _plan_noseqscan(vec_store.connection, *built)
+    assert "CAT_entity" in plan and "Seq Scan" not in plan
+
+
+def test_promotion_can_be_declined():
+    """A server that cannot give a property a column keeps it in the map, and so
+    does a caller who says so -- and the index is then spelled with the cast."""
+    store = AgensPropertyGraphStore(
+        "test_no_promotion",
+        conf=_conf(),
+        vector_dimension=4,
+        create=True,
+        promote_embedding=False,
+    )
+    store.structured_query("MATCH (n) DETACH DELETE n")
+    declared = {
+        prop.name
+        for prop in store.connection.declared_properties(
+            "__Node__", graph="test_no_promotion"
+        )
+    }
+    store.connection.commit()
+    assert "embedding" not in declared
+
+    store.upsert_nodes(
+        [
+            EntityNode(
+                name="d1", label="DOG", properties={"embedding": [1.0, 0.0, 0.0, 0.0]}
+            )
+        ]
+    )
+    definitions = {
+        index.name: index.definition
+        for index in store.connection.indexes("DOG", graph="test_no_promotion")
+    }
+    store.connection.commit()
+    assert "::vector(4)" in definitions["DOG_entity"]

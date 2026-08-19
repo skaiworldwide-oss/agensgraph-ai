@@ -76,6 +76,9 @@ def score_graph(
         with graph.read_only(allow_server_programs=True):
             gold_rows = graph.query(entry["gold"], timeout=30)
         outcome: Dict[str, Any] = _tag(entry)
+        if entry.get("expect_index"):
+            # Not proven indexed until the generated plan says so.
+            outcome["indexed"] = False
         try:
             docs = retriever.invoke(entry["question"])
         except Exception as exc:
@@ -88,6 +91,11 @@ def score_graph(
         outcome.update(ok=True, match=matched, cypher=cypher)
         if not matched:
             outcome["error"] = "empty" if not got_rows and gold_rows else "mismatch"
+        if entry.get("expect_index") and cypher:
+            try:
+                outcome["indexed"] = t2c.plan_has_index_path(conf, graph_name, cypher)
+            except Exception:
+                outcome["indexed"] = False
         outcomes.append(outcome)
     graph.close()
     return outcomes
@@ -160,6 +168,14 @@ def main() -> None:
         "execution accuracy",
         f"{len(matched)}/{len(scored)} ({100 * len(matched) / total:.0f}%)",
     )
+    checked = [o for o in scored if "indexed" in o]
+    if checked:
+        served = sum(1 for o in checked if o["indexed"])
+        console.kv(
+            "index-served",
+            f"{served}/{len(checked)} "
+            f"({100 * served / len(checked):.0f}% of index-checked entries)",
+        )
 
     by_category: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     for o in scored:

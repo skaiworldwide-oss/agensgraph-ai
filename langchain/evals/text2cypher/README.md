@@ -41,24 +41,37 @@ Connection and key come from the demos' configuration (`examples/demos/.env`).
 Each run prints the table and writes a per-item `results_<tag>.jsonl` beside
 this file for diffing runs.
 
-## Measured — gpt-4o-mini, 90 entries, 2.18-devel
+## Scoring plans, not just rows
 
-Commands exactly as above, all four on the same server and fixtures:
+Entries marked `expect_index` also score the PLAN of the generated query:
+`plan_has_index_path` EXPLAINs it under `enable_seqscan = off`, where a plan
+carrying `Disabled: true` is the planner's own statement that no index path
+exists. The `unindexed` habit outcome encodes the silent failure this exists
+for — a query that returns exactly the right rows while reading the whole
+label — and the validation test proves both sides of every such claim.
 
-| configuration      | executable | execution accuracy |
-| ------------------ | ---------- | ------------------ |
-| 0-shot             | 87%        | 52%                |
-| 0-shot + retry     | 92%        | 59%                |
-| 12-shot            | 87%        | **70%**            |
-| 12-shot + retry    | 92%        | **72%**            |
+## Measured — gpt-4o-mini, 99 entries, 2.18-devel
 
-What the deltas say: the twelve `DIALECT_EXAMPLES` pairs are the big lever
-(+18 points — direction went 2/6 to 5/6, jsonb semantics 6/10 to 9/10,
-function idioms 4/12 to 8/12); the self-correction loop adds +7 alone and
-raises the executable rate to 92% in both cases. The hardest category in every
-configuration is `paths` (1/6 at best): `shortestpath` requires pre-bound
-endpoints and `dijkstra` has its own capture form, and no amount of prompting
-has taught those yet — the per-item files name each miss.
+Commands exactly as above (the pack is 17 pairs; `--examples 17`), all four
+configurations on the same server and fixtures, with the schema's index
+section and the prompt's index rules in place:
+
+| configuration      | executable | execution accuracy | index-served |
+| ------------------ | ---------- | ------------------ | ------------ |
+| 0-shot             | 90%        | 60%                | 92%          |
+| 0-shot + retry     | 94%        | 68%                | 92%          |
+| 17-shot            | 83%        | 66%                | 92%          |
+| 17-shot + retry    | 90%        | **73%**            | **92%**      |
+
+What the numbers say: the index rules and the schema's index section carry the
+index-served rate to 92% on their own — it is 12/13 in every configuration,
+few-shot adds nothing there. The one recurring miss is the honest kind: asked
+"which cities are not Seoul?", the model writes `<> 'Seoul'` — right rows, full
+label read — and only the plan check notices. The full configuration answers
+the `sargability` category 9/9 and `direction` 6/6; `paths` stays the floor
+(1/6): `shortestpath` wants pre-bound endpoints and `dijkstra` its own capture
+form, and prompting has not taught them yet. The 17-pair pack without the
+retry loop dips the executable rate (83%); the retry recovers it.
 
 A model's output varies between runs even at temperature zero, so treat
 single-digit differences as noise and re-run before believing them.

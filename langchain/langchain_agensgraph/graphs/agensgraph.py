@@ -264,6 +264,7 @@ class AgensGraph(GraphStore):
         sanitize: bool = False,
         engine: Optional["AgensEngine"] = None,
         enhanced_schema: bool = False,
+        include_indexes: bool = True,
         refresh_schema: bool = True,
         retry_attempts: int = 3,
     ) -> None:
@@ -320,6 +321,7 @@ class AgensGraph(GraphStore):
         self.timeout = timeout
         self.sanitize = sanitize
         self.enhanced_schema = enhanced_schema
+        self.include_indexes = include_indexes
         self._schema_refreshed_at: float = 0.0
         self._aconn: Optional[agensgraph.AsyncConnection] = None
         # Whether a caller has asked for vectors to be carried as themselves, so that the
@@ -1076,12 +1078,43 @@ class AgensGraph(GraphStore):
         # and no write.
         with self._untimed(), self._dedicated() as conn:
             description = conn.describe(sample=sample, refresh=True)
+            indexes = self._read_indexes(conn) if self.include_indexes else []
 
         self.structured_schema = self._structured(description)
+        self.structured_schema["indexes"] = indexes
         if self.enhanced_schema:
             self._augment_with_examples(self.structured_schema)
         self.schema = self._rendered(description, self.structured_schema)
         self._schema_refreshed_at = time.monotonic()
+
+    def _read_indexes(self, conn: Any) -> List[Dict[str, Any]]:
+        """The btree property indexes, as facts a query writer can act on.
+
+        A predicate an index cannot serve returns the right rows and reads the
+        whole label; nothing but the plan says so. Telling the model which
+        indexes exist is what lets it choose the servable spelling. Only btree
+        indexes are listed -- vector and fulltext indexes answer the vector
+        store's searches, not a generated predicate -- and the store's internal
+        ``__id__`` identity index is kept out of sight. A failure to read them
+        loses the section, not the schema.
+        """
+        try:
+            found = conn.indexes()
+        except Exception:
+            return []
+        entries = []
+        for index in found:
+            tail = index.definition.split(" USING ", 1)
+            if len(tail) != 2:
+                continue
+            method, _, keys = tail[1].partition(" ")
+            keys = keys.split(" WHERE ", 1)[0].strip()
+            if method != "btree" or "__id__" in keys or not keys:
+                continue
+            entries.append(
+                {"label": index.label, "on": keys, "unique": index.unique}
+            )
+        return entries
 
     def _augment_with_examples(
         self, structured: Dict[str, Any], sample: int = 25, limit: int = 3
@@ -1194,6 +1227,21 @@ class AgensGraph(GraphStore):
             for rel in structured["relationships"]
         ]
         counts = structured["counts"]
+        indexes = [
+            '(:"{label}") ON {on}{unique}'.format(
+                label=entry["label"],
+                on=entry["on"],
+                unique=" UNIQUE" if entry["unique"] else "",
+            )
+            for entry in structured.get("indexes", [])
+        ]
+        index_section = (
+            "Property indexes are the following"
+            " (and id(x) is always indexed, on every label):\n"
+            f"        {indexes}\n        "
+            if indexes
+            else ""
+        )
         return f"""
         Node properties are the following:
         {[{"labels": label, "properties": props}
@@ -1205,7 +1253,7 @@ class AgensGraph(GraphStore):
         {triples}
         Element counts are the following:
         {counts}
-        """
+        {index_section}"""
 
     @property
     def get_schema(self) -> str:

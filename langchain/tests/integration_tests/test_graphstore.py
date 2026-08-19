@@ -192,3 +192,53 @@ class TestAgensGraph(unittest.TestCase):
         # Counts arrive from the catalogs with everything else.
         self.assertEqual(refreshed["counts"], {"a": 1, "c": 1, "b": 1})
         self.assertIn('(:"a")-[:"b"]->(:"c")', self.graph.get_schema)
+
+
+class TestSchemaIndexes(unittest.TestCase):
+    """The schema names the graph's btree property indexes.
+
+    A predicate an index cannot serve returns the right rows while reading the
+    whole label, so which indexes exist is a fact the query writer needs -- the
+    schema is where it learns everything else about the graph.
+    """
+
+    def setUp(self) -> None:
+        self.graph = AgensGraph(
+            "schema_idx_test", conf, create=True, refresh_schema=False
+        )
+        self.graph.query("CREATE VLABEL IF NOT EXISTS doc")
+        self.graph.query("MATCH (n) DETACH DELETE n")
+        self.graph.query("CREATE (:doc {title: 'one', code: 'x1'})")
+        for ddl in (
+            "CREATE PROPERTY INDEX IF NOT EXISTS sit_title ON doc (title)",
+            "CREATE UNIQUE PROPERTY INDEX IF NOT EXISTS sit_code ON doc (code)",
+            "CREATE PROPERTY INDEX IF NOT EXISTS sit_lower ON doc ((tolower(title)))",
+        ):
+            self.graph.query(ddl)
+
+    def tearDown(self) -> None:
+        self.graph.close()
+
+    def test_indexes_arrive_in_the_schema(self) -> None:
+        self.graph.refresh_schema(force=True)
+        entries = self.graph.get_structured_schema["indexes"]
+        by_on = {entry["on"]: entry for entry in entries if entry["label"] == "doc"}
+        self.assertIn("(title)", by_on)
+        self.assertFalse(by_on["(title)"]["unique"])
+        self.assertIn("(code)", by_on)
+        self.assertTrue(by_on["(code)"]["unique"])
+        self.assertIn("((tolower(title)))", by_on)
+        rendered = self.graph.get_schema
+        self.assertIn("Property indexes are the following", rendered)
+        self.assertIn('(:"doc") ON (title)', rendered)
+        self.assertIn('(:"doc") ON (code) UNIQUE', rendered)
+        self.assertIn('(:"doc") ON ((tolower(title)))', rendered)
+
+    def test_the_section_can_be_turned_off(self) -> None:
+        quiet = AgensGraph(
+            "schema_idx_test", conf, include_indexes=False, refresh_schema=False
+        )
+        quiet.refresh_schema(force=True)
+        self.assertEqual(quiet.get_structured_schema["indexes"], [])
+        self.assertNotIn("Property indexes", quiet.get_schema)
+        quiet.close()

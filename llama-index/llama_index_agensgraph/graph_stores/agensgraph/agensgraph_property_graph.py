@@ -36,6 +36,7 @@ import time
 from contextlib import asynccontextmanager, contextmanager
 
 from llama_index.core.graph_stores.types import (
+    TRIPLET_SOURCE_KEY,
     PropertyGraphStore,
     Triplet,
     LabelledNode,
@@ -43,6 +44,8 @@ from llama_index.core.graph_stores.types import (
     EntityNode,
     ChunkNode,
 )
+from llama_index.core.schema import BaseNode
+from llama_index.core.vector_stores.utils import metadata_dict_to_node
 from llama_index.core.graph_stores.utils import value_sanitize
 from llama_index_agensgraph.engine import AgensEngine
 from llama_index_agensgraph.filters import metadata_filters_to_cypher
@@ -51,6 +54,7 @@ from llama_index_agensgraph.graph_stores.agensgraph.utils import query_failed
 from llama_index.core.prompts import PromptTemplate
 from llama_index.core.vector_stores.types import VectorStoreQuery
 import agensgraph
+from psycopg.conninfo import make_conninfo
 from agensgraph import Edge, RetryPolicy, Vertex
 from agensgraph.vector import Vector, generated_column
 from agensgraph.cypher import check_single_statement
@@ -245,6 +249,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         engine: Optional[AgensEngine] = None,
         retry_attempts: int = 3,
         schema_sample: int = 100,
+        async_pool_size: int = 10,
         promote_embedding: bool = True,
         statement_timeout: Optional[float] = None,
     ) -> None:
@@ -257,6 +262,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         # label full of embeddings to learn that one key holds an array is
         # minutes rather than milliseconds.
         self.schema_sample = schema_sample
+        self.async_pool_size = async_pool_size
         self._label_counts: Dict[str, int] = {}
         # Properties a caller has asked to be indexed, kept so a label
         # declared later is indexed on the way in.
@@ -265,6 +271,10 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         # it is spelled to match.
         self._promote_embedding = promote_embedding
         self._is_promoted = False
+        # Two coroutines reaching the first await would each build a pool
+        # and the second assignment would drop the first still holding its
+        # connections.
+        self._apool_lock = asyncio.Lock()
         self._promotion_read = False
         # Depth, not a flag: a caller's read-only block can hold another.
         self._read_only_depth = 0
@@ -305,6 +315,8 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         # (a pooled checkout would try to `SET graph_path` to a missing graph).
         self._engine = None
         self._aconn = None
+        self._apool_pool = None
+        self._apool_loop = None
 
         with self._get_cursor() as curs:
             graphid = get_graph_id(curs, graph_name)
@@ -425,6 +437,53 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         else:
             yield self.connection
 
+    async def _apool(self) -> "agensgraph.AsyncConnectionPool":
+        """The pool the async methods borrow from when no engine was supplied.
+
+        One connection was held and handed to every caller, so two coroutines in
+        flight at once ran their statements down the same wire and into each
+        other's transactions -- twelve concurrent reads gave "transaction commit
+        at the wrong nesting level" and "graph_path is NULL". A borrower gets a
+        connection to itself now.
+
+        It connects per borrow rather than keeping a set of connections warm. A
+        pool that keeps them runs its workers on the loop's executor, and
+        ``asyncio.run`` waits for that executor before it returns -- so a program
+        that used one async method and then ended would hang there, silently, with
+        nothing to suggest what it was waiting for. Keeping the connections is
+        worth having: twelve concurrent reads take 21.8 ms through a warm pool
+        against 104.3 ms connecting each time. It is offered as ``AgensEngine``,
+        which is a thing the caller holds and closes, rather than as a default
+        that hangs on the way out.
+
+        Built on first use and keyed to the loop it was built on, since a pool
+        left over from a loop that has closed cannot be handed out.
+        """
+        running = asyncio.get_running_loop()
+        if self._apool_pool is not None and self._apool_loop is running:
+            return self._apool_pool
+        async with self._apool_lock:
+            if self._apool_pool is not None and self._apool_loop is running:
+                return self._apool_pool
+
+            async def configure(conn: "agensgraph.AsyncConnection") -> None:
+                if await conn.has_vectors():
+                    await conn.register_vectors()
+
+            pool = agensgraph.AsyncNullConnectionPool(
+                make_conninfo(**self._conf),
+                graph=self.graph_name,
+                min_size=0,
+                max_size=self.async_pool_size,
+                configure=configure,
+                kwargs={"autocommit": True},
+                check_connections=False,
+            )
+            await pool.open()
+            self._apool_pool = pool
+            self._apool_loop = running
+        return self._apool_pool
+
     @asynccontextmanager
     async def _aacquire(self) -> "AsyncIterator[psycopg.AsyncConnection]":
         """Async sibling of :meth:`_acquire`."""
@@ -432,14 +491,34 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             async with self._engine.aconnection(graph_path=self.graph_name) as conn:
                 yield conn
         else:
-            if self._aconn is None or self._aconn.closed:
-                self._aconn = await agensgraph.AsyncConnection.connect(**self._conf)
-                if await self._aconn.has_vectors():
-                    await self._aconn.register_vectors()
-                # Selecting the graph through the driver also fills the label table it
-                # decodes an element's label from, which a hand-written SET does not.
-                await self._aconn.graph(self.graph_name)
-            yield self._aconn
+            pool = await self._apool()
+            async with pool.connection() as conn:
+                yield conn
+
+    async def aclose(self) -> None:
+        """Give back the connections the async methods borrowed.
+
+        A pool keeps workers of its own, and a loop will not finish while they are
+        running: without this, a program that used one async method and then
+        returned from ``asyncio.run`` never got there. An engine's pool belongs to
+        the engine and is left for it to close.
+        """
+        if self._apool_pool is not None:
+            await self._apool_pool.close()
+            self._apool_pool = None
+            self._apool_loop = None
+        if self._aconn is not None and not self._aconn.closed:
+            await self._aconn.close()
+            self._aconn = None
+
+    def close(self) -> None:
+        """Close the connection this store opened for itself.
+
+        The async side has to be closed from the loop it was used on, so
+        :meth:`aclose` is separate.
+        """
+        if self.connection is not None and not self.connection.closed:
+            self.connection.close()
 
     @property
     def client(self) -> Any:
@@ -684,7 +763,19 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         labels, relationships, and properties
         """
 
-        description = self._describe()
+        self._schema_from(self._describe())
+
+    async def arefresh_schema(self) -> None:
+        """True-async counterpart of :meth:`refresh_schema`.
+
+        ``enhanced_schema`` is the exception: its per-property statistics are a
+        statement each and still run synchronously, so a store that asked for
+        them holds the loop for that part.
+        """
+        self._schema_from(await self._adescribe())
+
+    def _schema_from(self, description: Any) -> None:
+        """Record what a description says the graph holds."""
         self.structured_schema = {
             "node_props": self._properties_of(description, "v"),
             "rel_props": self._properties_of(description, "e"),
@@ -702,12 +793,34 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         self._schema_refreshed = True
 
     def get_schema(self, refresh: bool = False) -> Any:
-        # Lazily run the (O(N)) introspection on first access if it was deferred
-        # at construction (refresh_schema=False).
+        # Read on first access if it was deferred at construction.
         if refresh or not self._schema_refreshed:
             self.refresh_schema()
 
         return self.structured_schema
+
+    async def aget_schema(self, refresh: bool = False) -> Any:
+        """True-async counterpart of :meth:`get_schema`."""
+        if refresh or not self._schema_refreshed:
+            await self.arefresh_schema()
+
+        return self.structured_schema
+
+    async def aget_schema_str(
+        self,
+        refresh: bool = False,
+        exclude_types: List[str] = [],
+        include_types: List[str] = [],
+    ) -> str:
+        """True-async counterpart of :meth:`get_schema_str`.
+
+        Only the reading is async; the formatting below it is arithmetic on what
+        was read.
+        """
+        await self.aget_schema(refresh=refresh)
+        return self.get_schema_str(
+            refresh=False, exclude_types=exclude_types, include_types=include_types
+        )
 
     def get_schema_str(
         self,
@@ -1162,6 +1275,42 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         response = await self.astructured_query(query, params=params)
         return self._get_response_to_nodes(response)
 
+    async def aget_llama_nodes(self, node_ids: List[str]) -> List[BaseNode]:
+        """True-async counterpart of :meth:`get_llama_nodes`."""
+        converted: List[BaseNode] = []
+        for node in await self.aget(ids=node_ids):
+            try:
+                converted.append(metadata_dict_to_node(node.properties))
+                converted[-1].set_content(node.text)  # type: ignore[attr-defined]
+            except Exception:
+                continue
+        return converted
+
+    async def adelete_llama_nodes(
+        self,
+        node_ids: Optional[List[str]] = None,
+        ref_doc_ids: Optional[List[str]] = None,
+    ) -> None:
+        """True-async counterpart of :meth:`delete_llama_nodes`.
+
+        The base class reads each id with a statement of its own and then calls
+        the synchronous delete, holding the event loop for all of it.
+        """
+        nodes: List[LabelledNode] = []
+        node_ids = node_ids or []
+        for id_ in node_ids:
+            nodes.extend(await self.aget(properties={TRIPLET_SOURCE_KEY: id_}))
+        if node_ids:
+            nodes.extend(await self.aget(ids=node_ids))
+
+        ref_doc_ids = ref_doc_ids or []
+        for id_ in ref_doc_ids:
+            nodes.extend(await self.aget(properties={"ref_doc_id": id_}))
+        if ref_doc_ids:
+            nodes.extend(await self.aget(ids=ref_doc_ids))
+
+        await self.adelete(ids=[node.id for node in nodes])
+
     def get_triplets(
         self,
         entity_names: Optional[List[str]] = None,
@@ -1170,7 +1319,40 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         ids: Optional[List[str]] = None,
         limit: int = 100,
     ) -> List[Triplet]:
-        """The triplets matching every argument given.
+        """The triplets matching every argument given."""
+        query, params = self._build_get_triplets(
+            entity_names, relation_names, properties, ids, limit
+        )
+        return self._triplets_from(self.structured_query(query, params=params))
+
+    async def aget_triplets(
+        self,
+        entity_names: Optional[List[str]] = None,
+        relation_names: Optional[List[str]] = None,
+        properties: Optional[dict] = None,
+        ids: Optional[List[str]] = None,
+        limit: int = 100,
+    ) -> List[Triplet]:
+        """True-async counterpart of :meth:`get_triplets`.
+
+        The base class answers this by calling the synchronous one, which holds
+        the event loop for the whole round trip. An async retriever would do a
+        real async vector query and then block on this.
+        """
+        query, params = self._build_get_triplets(
+            entity_names, relation_names, properties, ids, limit
+        )
+        return self._triplets_from(await self.astructured_query(query, params=params))
+
+    def _build_get_triplets(
+        self,
+        entity_names: Optional[List[str]] = None,
+        relation_names: Optional[List[str]] = None,
+        properties: Optional[dict] = None,
+        ids: Optional[List[str]] = None,
+        limit: int = 100,
+    ) -> Tuple[sql.Composed, Dict[str, Any]]:
+        """Build the (query, params) for :meth:`get_triplets`.
 
         ``limit`` bounds what comes back. It was a literal 100 written into the
         statement, so a caller asking a broad question was given a hundred rows and
@@ -1231,16 +1413,19 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         """
 
         query += ")t"
-        data = self.structured_query(
+        return (
             sql.SQL(query).format(
                 BASE_ENTITY_LABEL=sql.Literal(BASE_ENTITY_LABEL),
-                BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL)
-            ), params=params
+                BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL),
+            ),
+            params,
         )
-        data = data if data else []
 
+    @staticmethod
+    def _triplets_from(data: Optional[List[Dict[str, Any]]]) -> List[Triplet]:
+        """Shape what the triplet read returned."""
         triplets = []
-        for record in data:
+        for record in data or []:
             source = EntityNode(
                 name=record["source_id"],
                 label=record["source_type"],
@@ -1268,11 +1453,45 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         ignore_rels: Optional[List[str]] = None,
     ) -> List[Triplet]:
         """Get depth-aware rel map."""
-        triples = []
+        built = self._build_get_rel_map(graph_nodes, depth, limit)
+        if built is None:
+            return []
+        query, params = built
+        return self._rel_map_from(
+            self.structured_query(query, params=params), ignore_rels
+        )
 
+    async def aget_rel_map(
+        self,
+        graph_nodes: List[LabelledNode],
+        depth: int = 2,
+        limit: int = 30,
+        ignore_rels: Optional[List[str]] = None,
+    ) -> List[Triplet]:
+        """True-async counterpart of :meth:`get_rel_map`.
+
+        The base class answers this by calling the synchronous one, which holds
+        the event loop for the whole round trip -- and this is the expensive half
+        of what an async retriever does after its vector query.
+        """
+        built = self._build_get_rel_map(graph_nodes, depth, limit)
+        if built is None:
+            return []
+        query, params = built
+        return self._rel_map_from(
+            await self.astructured_query(query, params=params), ignore_rels
+        )
+
+    def _build_get_rel_map(
+        self,
+        graph_nodes: List[LabelledNode],
+        depth: int = 2,
+        limit: int = 30,
+    ) -> Optional[Tuple[sql.Composed, Dict[str, Any]]]:
+        """Build the (query, params) for :meth:`get_rel_map`, or None for no seeds."""
         ids = [node.id for node in graph_nodes]
         if not ids:
-            return triples
+            return None
         query = """SELECT t.source_id,
                             t.source_type,
                             t.source_properties - 'embedding' - 'id' AS source_properties,
@@ -1329,17 +1548,24 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             LIMIT %(limit)s
             """
         query += ")t"
-        response = self.structured_query(
+        return (
             sql.SQL(query).format(
                 BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL),
                 BASE_ENTITY_LABEL=sql.Literal(BASE_ENTITY_LABEL),
-                depth=depth
-            ), {**seed_params, "limit": limit}
+                depth=depth,
+            ),
+            {**seed_params, "limit": limit},
         )
-        response = response if response else []
 
+    @staticmethod
+    def _rel_map_from(
+        response: Optional[List[Dict[str, Any]]],
+        ignore_rels: Optional[List[str]] = None,
+    ) -> List[Triplet]:
+        """Shape what the rel-map read returned."""
+        triples: List[Triplet] = []
         ignore_rels = ignore_rels or []
-        for record in response:
+        for record in response or []:
             if record["type"] in ignore_rels:
                 continue
 
@@ -1363,6 +1589,49 @@ class AgensPropertyGraphStore(PropertyGraphStore):
 
         return triples
     
+    def _delete_ops(
+        self,
+        entity_names: Optional[List[str]] = None,
+        relation_names: Optional[List[str]] = None,
+        properties: Optional[dict] = None,
+        ids: Optional[List[str]] = None,
+    ) -> List[Tuple[Any, Dict[str, Any]]]:
+        """The statements :meth:`delete` runs, in order."""
+        ops: List[Tuple[Any, Dict[str, Any]]] = []
+        if entity_names:
+            frag, params = self._or_equalities("n.name", entity_names, "etn")
+            ops.append(
+                ('MATCH (n:"__Node__") WHERE ' + frag + " DETACH DELETE n", params)
+            )
+
+        if ids:
+            prelude, keyed, params = self._keyed_equalities("n.id", ids, "del_ids")
+            ops.append(
+                (
+                    prelude
+                    + 'MATCH (n:"__Node__") WHERE '
+                    + keyed
+                    + " DETACH DELETE n",
+                    params,
+                )
+            )
+
+        if relation_names:
+            for rel in relation_names:
+                ops.append(
+                    (
+                        sql.SQL("MATCH ()-[r:{rel}]->() DELETE r").format(
+                            rel=sql.Identifier(rel)
+                        ),
+                        {},
+                    )
+                )
+
+        if properties:
+            frag, params = _property_equalities("e", properties, "del_prop")
+            ops.append(("MATCH (e) WHERE " + frag + " DETACH DELETE e", params))
+        return ops
+
     def delete(
         self,
         entity_names: Optional[List[str]] = None,
@@ -1371,33 +1640,27 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         ids: Optional[List[str]] = None,
     ) -> None:
         """Delete matching data."""
-        if entity_names:
-            frag, p = self._or_equalities("n.name", entity_names, "etn")
-            self.structured_query(
-                'MATCH (n:"__Node__") WHERE ' + frag + " DETACH DELETE n", p
-            )
+        for query, params in self._delete_ops(
+            entity_names, relation_names, properties, ids
+        ):
+            self.structured_query(query, params=params)
 
-        if ids:
-            prelude, keyed, p = self._keyed_equalities("n.id", ids, "del_ids")
-            self.structured_query(
-                prelude + 'MATCH (n:"__Node__") WHERE ' + keyed + " DETACH DELETE n",
-                p,
-            )
+    async def adelete(
+        self,
+        entity_names: Optional[List[str]] = None,
+        relation_names: Optional[List[str]] = None,
+        properties: Optional[dict] = None,
+        ids: Optional[List[str]] = None,
+    ) -> None:
+        """True-async counterpart of :meth:`delete`.
 
-        if relation_names:
-            for rel in relation_names:
-                self.structured_query(
-                    sql.SQL(
-                        'MATCH ()-[r:{rel}]->() DELETE r'
-                    ).format(
-                        rel=sql.Identifier(rel)
-                    )
-                )
-
-        if properties:
-            frag, params = _property_equalities("e", properties, "del_prop")
-            cypher = "MATCH (e) WHERE " + frag + " DETACH DELETE e"
-            self.structured_query(cypher, params=params)
+        The base class answers this by calling the synchronous one, which holds
+        the event loop for every statement it runs.
+        """
+        for query, params in self._delete_ops(
+            entity_names, relation_names, properties, ids
+        ):
+            await self.astructured_query(query, params=params)
 
     def _build_vector_query(
         self, query: VectorStoreQuery
@@ -1857,6 +2120,31 @@ class AgensPropertyGraphStore(PropertyGraphStore):
     # The schema dict names a JSON type the way a Cypher writer says it, and the
     # driver names it the way JSON does. Everything else is the same word.
     _SCHEMA_TYPES = {"array": "LIST", "object": "MAP"}
+
+    async def _adescribe(self) -> Any:
+        """Async sibling of :meth:`_describe`."""
+        async with self._aacquire() as conn:
+            try:
+                stale = not await conn.meta_is_current(graph=self.graph_name)
+                try:
+                    return await conn.describe(
+                        graph=self.graph_name, sample=self.schema_sample, refresh=stale
+                    )
+                except psycopg.Error as e:
+                    if not stale:
+                        raise query_failed("describing the graph", e) from e
+                    logger.debug(
+                        "could not gather the triple catalog: %s", safe_message(e)
+                    )
+                    await conn.rollback()
+                    return await conn.describe(
+                        graph=self.graph_name, sample=self.schema_sample
+                    )
+            finally:
+                try:
+                    await conn.commit()
+                except psycopg.Error:
+                    pass
 
     def _properties_of(self, description: Any, kind: str) -> Dict[str, Any]:
         """The properties of every label of ``kind``, as the schema dict spells them.

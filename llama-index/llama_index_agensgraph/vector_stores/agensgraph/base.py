@@ -8,6 +8,7 @@ from typing import (
     Optional,
     Tuple,
 )
+import asyncio
 import logging
 import re
 
@@ -170,6 +171,9 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
     _url: str = PrivateAttr()
     _vectors_registered: bool = PrivateAttr(default=False)
     _promoted: bool = PrivateAttr(default=False)
+    _apool_pool: Optional[Any] = PrivateAttr(default=None)
+    _apool_loop: Optional[Any] = PrivateAttr(default=None)
+    _apool_lock: Any = PrivateAttr(default=None)
 
     def __init__(
         self,
@@ -223,6 +227,9 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
 
         # With the vector types registered, an embedding travels as itself
         # instead of as its decimal spelling for the server to parse back.
+        # Two coroutines reaching the first await would each build a pool and the
+        # second assignment would drop the first still holding its connections.
+        self._apool_lock = asyncio.Lock()
         self._vectors_registered = self._connection.has_vectors()
         if self._vectors_registered:
             self._connection.register_vectors()
@@ -1101,6 +1108,45 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         else:
             yield self._connection
 
+    async def _apool(self) -> "agensgraph.AsyncNullConnectionPool":
+        """The connections the async methods borrow when no engine was supplied.
+
+        One connection was held and handed to every caller, so two coroutines in
+        flight at once ran their statements down the same wire and into each
+        other's transactions. A borrower gets a connection to itself now.
+
+        It connects per borrow rather than keeping a set warm. A pool that keeps
+        them runs its workers on the loop's executor, and ``asyncio.run`` waits
+        for that executor before it returns -- so a program that used one async
+        method and then ended would hang there, silently. Keeping them is worth
+        having, and is offered as ``AgensEngine``: a thing the caller holds and
+        closes, rather than a default that hangs on the way out.
+        """
+        running = asyncio.get_running_loop()
+        if self._apool_pool is not None and self._apool_loop is running:
+            return self._apool_pool
+        async with self._apool_lock:
+            if self._apool_pool is not None and self._apool_loop is running:
+                return self._apool_pool
+
+            async def configure(conn: "agensgraph.AsyncConnection") -> None:
+                if self._vectors_registered:
+                    await conn.register_vectors()
+
+            pool = agensgraph.AsyncNullConnectionPool(
+                self._url,
+                graph=self._graph_name,
+                min_size=0,
+                max_size=10,
+                configure=configure,
+                kwargs={"autocommit": True},
+                check_connections=False,
+            )
+            await pool.open()
+            self._apool_pool = pool
+            self._apool_loop = running
+        return self._apool_pool
+
     @asynccontextmanager
     async def _aacquire(self) -> "AsyncIterator[psycopg.AsyncConnection]":
         """Async sibling of :meth:`_acquire`."""
@@ -1108,18 +1154,19 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
             async with self._engine.aconnection(graph_path=self._graph_name) as conn:
                 yield conn
         else:
-            if self._aconn is None or self._aconn.closed:
-                self._aconn = await agensgraph.AsyncConnection.connect(self._url)
-                if self._vectors_registered:
-                    await self._aconn.register_vectors()
-                async with self._aconn.cursor() as cur:
-                    await cur.execute(
-                        sql.SQL("SET graph_path = {n}").format(
-                            n=sql.Identifier(self._graph_name)
-                        )
-                    )
-                await self._aconn.commit()
-            yield self._aconn
+            pool = await self._apool()
+            async with pool.connection() as conn:
+                yield conn
+
+    async def aclose(self) -> None:
+        """Give back the connections the async methods borrowed."""
+        if self._apool_pool is not None:
+            await self._apool_pool.close()
+            self._apool_pool = None
+            self._apool_loop = None
+        if self._aconn is not None and not self._aconn.closed:
+            await self._aconn.close()
+            self._aconn = None
 
     async def adatabase_query(
         self, query: str, params: dict = {}

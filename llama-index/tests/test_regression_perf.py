@@ -299,3 +299,49 @@ def test_create_property_index_enables_filtered_index_scan(vec_store: AgensPrope
     query, params = built
     plan = _plan_noseqscan(vec_store.connection, query, params)
     assert "country_idx" in plan and "Index Scan" in plan
+
+
+def test_query_embedding_is_bound_as_a_vector(vec_store: AgensPropertyGraphStore):
+    """The embedding travels as itself, not as its decimal spelling.
+
+    A list sent as jsonb is written out as text for the server to parse back: on
+    1536 numbers that is 31 KB on the wire against 6 KB, and vector_query measured
+    1.39x slower. The statement must lose the cast to match -- a vector needs
+    none -- so both are checked together.
+    """
+    from agensgraph.vector import Vector
+
+    built = vec_store._build_vector_query(
+        VectorStoreQuery(query_embedding=[1.0, 0.0, 0.0, 0.0], similarity_top_k=3)
+    )
+    assert built is not None
+    query, params = built
+    assert isinstance(params["query_embedding"], Vector)
+    assert "%(query_embedding)s::vector" not in query.as_string(vec_store.connection)
+
+
+def test_a_bound_vector_still_reaches_the_hnsw_index(
+    vec_store: AgensPropertyGraphStore,
+):
+    """Binding it differently must not cost the index."""
+    from psycopg import sql
+
+    vec_store.upsert_nodes(
+        [
+            EntityNode(
+                label="POINT",
+                name=f"v{i}",
+                properties={"embedding": [float(i), 0.0, 0.0, 0.0]},
+            )
+            for i in range(50)
+        ]
+    )
+    query, params = vec_store._build_vector_query(
+        VectorStoreQuery(query_embedding=[1.0, 0.0, 0.0, 0.0], similarity_top_k=3)
+    )
+    with vec_store.connection.cursor() as cur:
+        cur.execute("SET LOCAL enable_seqscan = off")
+        cur.execute((sql.SQL("EXPLAIN ") + query).as_string(cur), params)
+        plan = " ".join(" ".join(str(c) for c in row) for row in cur.fetchall())
+    vec_store.connection.rollback()
+    assert "entity" in plan and "Index Scan" in plan

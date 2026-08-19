@@ -23,7 +23,17 @@ import contextvars
 import re
 import time
 from contextlib import asynccontextmanager, contextmanager
-from typing import Any, AsyncIterator, Dict, Iterator, List, Mapping, Optional
+from typing import (
+    Any,
+    AsyncIterator,
+    Dict,
+    Iterator,
+    List,
+    Mapping,
+    Optional,
+    Sequence,
+    Tuple,
+)
 
 import agensgraph
 import psycopg
@@ -209,6 +219,86 @@ GQL_RULE = (
 """The line that forbids the GQL clause set, dropped on a server that has it."""
 
 
+def _example_text(text: str) -> str:
+    """A few-shot text made safe for a prompt template: braces doubled."""
+    return text.replace("{", "{{").replace("}", "}}")
+
+
+DIALECT_EXAMPLES: Tuple[Tuple[str, str], ...] = (
+    (
+        "How many Product nodes are there?",
+        'MATCH (p:"Product") RETURN count(*) AS n LIMIT 1',
+    ),
+    (
+        "Who works at Acme?",
+        'MATCH (p:"Person")-[:"WORKS_AT"]->(c:"Company") '
+        "WHERE c.name = 'Acme' RETURN p.name AS name LIMIT 10",
+    ),
+    (
+        "Which people are named exactly 'Ada'? Match with a regular expression.",
+        'MATCH (p:"Person") WHERE p.name =~ \'^Ada$\' '
+        "RETURN p.name AS name LIMIT 10",
+    ),
+    (
+        "Which titles contain the word graph?",
+        'MATCH (b:"Book") WHERE b.title CONTAINS \'graph\' '
+        "RETURN b.title AS title LIMIT 10",
+    ),
+    (
+        "Ages are stored as strings. Who is older than 30?",
+        'MATCH (p:"Person") WHERE p.age::int4 > 30 '
+        "RETURN p.name AS name, p.age::int4 AS age ORDER BY age DESC LIMIT 10",
+    ),
+    (
+        "Return the vertex whose graph id is 3.1.",
+        "MATCH (n) WHERE id(n) = 3.1 RETURN n LIMIT 1",
+    ),
+    (
+        "Which people are friends, in either direction?",
+        'MATCH (a:"Person")-[:"FRIENDS_WITH"]-(b:"Person") '
+        "RETURN a.name AS a, b.name AS b LIMIT 10",
+    ),
+    (
+        "Which authors wrote more than five papers?",
+        'MATCH (a:"Author")<-[:"AUTHORED_BY"]-(p:"Paper") '
+        "WITH a, count(*) AS papers WHERE papers > 5 "
+        "RETURN a.name AS name, papers ORDER BY papers DESC LIMIT 10",
+    ),
+    (
+        "Which customers placed at least one order?",
+        'MATCH (c:"Customer") WHERE EXISTS((c)-[:"ORDERED"]->()) '
+        "RETURN c.name AS name LIMIT 10",
+    ),
+    (
+        "Return the first three characters of every name.",
+        'MATCH (p:"Person") RETURN substring(p.name, 0, 3) AS prefix LIMIT 10',
+    ),
+    (
+        "How many distinct genres does each movie have?",
+        'MATCH (m:"Movie")-[:"IN_GENRE"]->(g:"Genre") '
+        "RETURN m.title AS title, count(DISTINCT g.name) AS genres "
+        "ORDER BY genres DESC LIMIT 10",
+    ),
+    (
+        "Double every item's price and keep the ones over 100.",
+        'MATCH (i:"Item") LET doubled = i.price * 2 FILTER doubled > 100 '
+        "RETURN i.name AS name, doubled LIMIT 10",
+    ),
+)
+"""Question-and-query pairs that teach the dialect's sharpest edges.
+
+Each pair exists because a model reaching for its habits gets that case wrong
+here: unquoted labels fold to lower case, ``=~`` matches substrings unless
+anchored, ``count()`` takes an argument or ``*``, a graph id is ``labid.locid``,
+integer conversion is a ``::int4`` cast, ``substring`` starts at zero, and a
+list-iteration binding is ``LET``. The last pair uses LET and FILTER, which a
+server before 2.18 does not accept.
+
+Pass to :class:`AgensCypherQAChain` or ``AgensText2CypherRetriever`` as
+``examples=DIALECT_EXAMPLES``.
+"""
+
+
 def render_cypher_system(
     template: str, top_k: int, graph: Optional[AgensGraph] = None
 ) -> str:
@@ -266,8 +356,14 @@ class AgensCypherQAChain(Runnable[Dict[str, Any], Dict[str, Any]]):
         allow_server_programs: bool = False,
         cypher_prompt: Optional[ChatPromptTemplate] = None,
         qa_prompt: Optional[ChatPromptTemplate] = None,
+        examples: Optional[Sequence[Tuple[str, str]]] = None,
         return_intermediate_steps: bool = False,
     ) -> None:
+        if cypher_prompt is not None and examples:
+            raise ValueError(
+                "Pass examples or a custom cypher_prompt, not both; a custom "
+                "prompt carries its own examples as messages."
+            )
         self.graph = graph
         self.cypher_llm = cypher_llm
         self.qa_llm = qa_llm
@@ -277,9 +373,20 @@ class AgensCypherQAChain(Runnable[Dict[str, Any], Dict[str, Any]]):
         self.allow_dangerous_requests = allow_dangerous_requests
         self.allow_server_programs = allow_server_programs
         self.return_intermediate_steps = return_intermediate_steps
+        self.examples = tuple(examples or ())
+        # Few-shot pairs become real conversation turns, not prompt text: the
+        # model sees each question answered with the query alone, which is the
+        # shape it is being asked to produce. The texts are escaped because
+        # from_messages reads every string as a template, and a Cypher map
+        # literal's braces would otherwise be taken for variables.
+        shots: List[Any] = []
+        for shown_question, shown_cypher in self.examples:
+            shots.append(("human", _example_text(shown_question)))
+            shots.append(("ai", _example_text(shown_cypher)))
         self.cypher_prompt = cypher_prompt or ChatPromptTemplate.from_messages(
             [
                 ("system", render_cypher_system(CYPHER_SYSTEM, top_k, graph=graph)),
+                *shots,
                 ("human", "Schema:\n{schema}\n\nQuestion: {question}"),
             ]
         )
@@ -558,6 +665,7 @@ def create_cypher_tool(
 __all__: List[str] = [
     "AgensCypherQAChain",
     "CYPHER_SYSTEM",
+    "DIALECT_EXAMPLES",
     "QA_SYSTEM",
     "create_cypher_tool",
     "case_sensitive_names",

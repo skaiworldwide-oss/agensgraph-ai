@@ -427,6 +427,22 @@ class TestAgensText2CypherRetriever:
         assert llm.i == 1
         graph.close()
 
+    def test_examples_ride_into_the_generation_prompt(self) -> None:
+        graph = make_qa_graph()
+        retriever = AgensText2CypherRetriever(
+            graph=graph,
+            llm=fake_llm(READ_PEOPLE),
+            examples=[("who?", "MATCH (x:person) RETURN x.name AS name")],
+            allow_server_programs=True,
+        )
+        docs = retriever.invoke("who is here?")
+        assert len(docs) == 2
+        messages = retriever._chain.cypher_prompt.format_messages(
+            schema="s", question="q"
+        )
+        assert [m.type for m in messages] == ["system", "human", "ai", "human"]
+        graph.close()
+
     def test_no_correction_happens_unasked(self) -> None:
         graph = make_qa_graph()
         llm = fake_llm(BROKEN, READ_PEOPLE)

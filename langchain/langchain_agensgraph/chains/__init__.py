@@ -2,6 +2,7 @@
 
 from langchain_agensgraph.chains.cypher_qa import (
     CYPHER_SYSTEM,
+    DIALECT_EXAMPLES,
     QA_SYSTEM,
     AgensCypherQAChain,
     create_cypher_tool,
@@ -10,6 +11,7 @@ from langchain_agensgraph.chains.cypher_qa import (
 __all__ = [
     "AgensCypherQAChain",
     "CYPHER_SYSTEM",
+    "DIALECT_EXAMPLES",
     "QA_SYSTEM",
     "create_cypher_tool",
 ]

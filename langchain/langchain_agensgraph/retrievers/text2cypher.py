@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Sequence, Tuple
 
 import agensgraph
 from langchain_core.callbacks import (
@@ -77,6 +77,7 @@ class AgensText2CypherRetriever(_AgensRetrieverBase):
     allow_dangerous_requests: bool = False
     allow_server_programs: bool = False
     cypher_prompt: Optional[ChatPromptTemplate] = None
+    examples: Optional[Sequence[Tuple[str, str]]] = None
     max_retries: int = Field(default=0, ge=0)
     retry_on_empty: bool = False
 
@@ -92,6 +93,7 @@ class AgensText2CypherRetriever(_AgensRetrieverBase):
             allow_dangerous_requests=self.allow_dangerous_requests,
             allow_server_programs=self.allow_server_programs,
             cypher_prompt=self.cypher_prompt,
+            examples=self.examples,
         )
 
     # ---- generation ----

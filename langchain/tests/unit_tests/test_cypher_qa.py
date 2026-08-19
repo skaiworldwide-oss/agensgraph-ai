@@ -161,3 +161,53 @@ class TestPrompt:
 
     def test_prompt_parameterizes_the_row_limit(self):
         assert "{top_k}" in CYPHER_SYSTEM
+
+
+class TestFewShotExamples:
+    """Example pairs become real conversation turns ahead of the question."""
+
+    def _chain(self, **kwargs):
+        from langchain_core.language_models import FakeListChatModel
+
+        from langchain_agensgraph.chains.cypher_qa import AgensCypherQAChain
+
+        llm = FakeListChatModel(responses=["MATCH (n) RETURN n"])
+        return AgensCypherQAChain.from_llm(llm, graph=object(), **kwargs)
+
+    def test_examples_become_alternating_turns(self):
+        chain = self._chain(examples=[("q1", "c1"), ("q2", "c2")])
+        messages = chain.cypher_prompt.format_messages(schema="S", question="Q")
+        assert [m.type for m in messages] == [
+            "system",
+            "human",
+            "ai",
+            "human",
+            "ai",
+            "human",
+        ]
+        assert messages[1].content == "q1"
+        assert messages[2].content == "c1"
+        assert messages[-1].content.endswith("Question: Q")
+
+    def test_braces_in_an_example_survive_templating(self):
+        chain = self._chain(examples=[("map?", "RETURN {a: 1} AS m")])
+        messages = chain.cypher_prompt.format_messages(schema="S", question="Q")
+        assert messages[2].content == "RETURN {a: 1} AS m"
+
+    def test_examples_and_a_custom_prompt_refuse_each_other(self):
+        from langchain_core.prompts import ChatPromptTemplate
+
+        prompt = ChatPromptTemplate.from_messages([("human", "{schema} {question}")])
+        with pytest.raises(ValueError, match="not both"):
+            self._chain(examples=[("q", "c")], cypher_prompt=prompt)
+
+    def test_the_dialect_pack_renders_whole(self):
+        from langchain_agensgraph.chains.cypher_qa import DIALECT_EXAMPLES
+
+        assert len(DIALECT_EXAMPLES) >= 10
+        chain = self._chain(examples=DIALECT_EXAMPLES)
+        messages = chain.cypher_prompt.format_messages(schema="S", question="Q")
+        assert len(messages) == 2 + 2 * len(DIALECT_EXAMPLES)
+        # Every taught query is stated as the assistant's own turn, verbatim.
+        taught = [m.content for m in messages if m.type == "ai"]
+        assert taught == [cypher for _q, cypher in DIALECT_EXAMPLES]

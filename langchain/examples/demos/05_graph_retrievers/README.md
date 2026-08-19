@@ -16,6 +16,16 @@ cd langchain
 .venv/bin/python examples/demos/05_graph_retrievers/arxiv.py
 ```
 
+## Explore it interactively
+
+[`graph_retrievers.ipynb`](graph_retrievers.ipynb) is a runnable, pre-executed tour
+of everything the retriever family does, with real outputs: all three retrievers,
+the graph context rendered as a prompt reads it, the driver's own proof that a
+four-seed two-hop retrieval is **one** statement, the server refusing a generated
+write, self-correction recovering a direction-flipped relationship on the arXiv
+graph, the dialect example pack, an index created live and the plan changing with
+it, and the eval's plan claims re-proven cell by cell. Open it after `ingest.py`.
+
 ## What it demonstrates
 
 - **`ingest.py`** — the movies are the vector store's own nodes (label `Movie`,

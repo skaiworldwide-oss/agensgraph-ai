@@ -253,6 +253,50 @@ Cypher query:"""
 AGENS_CYPHER_TEMPLATE = PromptTemplate(AGENS_CYPHER_TEMPLATE_STR)
 
 
+def _cypher_params(given: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Bind a caller's parameters in the form the server reads them.
+
+    A Cypher comparison is against a jsonb property, so the value has to arrive as
+    jsonb. Sent as itself, a string is parsed as JSON and rejected -- ``"Alice"`` is
+    not a JSON document -- and a mapping cannot be adapted at all. Both are wrapped.
+
+    A number is left alone, and deliberately: it is already valid JSON, so it compares
+    correctly either way, and it is the one kind that also appears as a ``LIMIT``,
+    where jsonb is refused outright ("argument of LIMIT must be type bigint"). Wrapping
+    everything would have made every paged statement in this class fail.
+
+    Anything already wrapped by the caller is passed through untouched.
+    """
+    if not given:
+        return {}
+    bound: Dict[str, Any] = {}
+    for name, value in given.items():
+        bound[name] = (
+            Jsonb(value) if isinstance(value, (str, dict, list)) else value
+        )
+    return bound
+
+
+def _property_equalities(
+    alias: str, properties: Dict[str, Any], prefix: str
+) -> Tuple[str, Dict[str, Any]]:
+    """Render ``alias."key" = %(param)s`` for each property, safely.
+
+    Both halves have to be built rather than interpolated. A property name is quoted,
+    because a name is chosen by the caller and reaches the statement as an identifier:
+    a key of ``secret" IS NOT NULL OR e."secret`` turned a filter matching nothing into
+    one matching everything, and gave ``delete`` the same reach. And the parameter is
+    named by position rather than after the property, because a name holding a bracket
+    or a percent sign does not survive being written into a placeholder.
+    """
+    fragments, params = [], {}
+    for index, key in enumerate(properties):
+        name = f"{prefix}_{index}"
+        fragments.append(f'{alias}.{sql.Identifier(key).as_string(None)} = %({name})s')
+        params[name] = Jsonb(properties[key])
+    return " AND ".join(fragments), params
+
+
 class AgensPropertyGraphStore(PropertyGraphStore):
     """
     AgensGraph Property Graph Store.
@@ -312,6 +356,16 @@ class AgensPropertyGraphStore(PropertyGraphStore):
 
             self.graphid = graphid
             set_graph_path(curs, graph_name)
+
+            # One builder at a time. Every one of the statements below is a CREATE OR
+            # REPLACE, so two processes constructing a store against the same graph
+            # rewrite the same catalog rows and one of them loses with "tuple
+            # concurrently updated" -- which is any multi-worker boot, and no
+            # constructor argument turned it off. The lock is transaction-scoped, so
+            # the commit at the end of this block releases it whatever happens.
+            curs.execute(
+                "SELECT pg_advisory_xact_lock(%s)", (int(self.graphid),)
+            )
 
             # Create functions, triggers and catalog to handle multiple labels
             execute_query(curs, append_label_function)
@@ -743,7 +797,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         """Build the (query, params) for :meth:`get`."""
         query = """SELECT t.name,
                             t.type,
-                            (t.properties - 'labels' - '__type__') || '{{"embedding": null, "id": null}}'::jsonb AS properties
+                            (t.properties - 'labels' - '__type__') - 'embedding' - 'id' AS properties
                      FROM ("""
         params: Dict[str, Any] = {}
         query += 'MATCH (e:{BASE_NODE_LABEL}) '
@@ -758,11 +812,9 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             params.update(id_params)
 
         if properties:
-            prop_params = [f'e."{prop}" = %({prop})s' for prop in properties]
-            query += "AND " + " AND ".join(prop_params)
-            params.update(
-                {f"{prop}": Jsonb(properties[prop]) for prop in properties}
-            )
+            frag, prop_params = _property_equalities("e", properties, "get_prop")
+            query += "AND " + frag
+            params.update(prop_params)
 
         query += """
             WITH e, e.labels as labels
@@ -841,53 +893,59 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         relation_names: Optional[List[str]] = None,
         properties: Optional[dict] = None,
         ids: Optional[List[str]] = None,
+        limit: int = 100,
     ) -> List[Triplet]:
-        params = {}
+        """The triplets matching every argument given.
+
+        ``limit`` bounds what comes back. It was a literal 100 written into the
+        statement, so a caller asking a broad question was given a hundred rows and
+        no way to know the answer had been cut.
+        """
+        params: Dict[str, Any] = {"triplet_limit": limit}
 
         query = """
                 SELECT t.type,
                         t.rel_prop,
                         t.source_id,
                         t.source_type,
-                        (t.source_properties - 'labels' - '__type__') || '{{"embedding": null, "name": null}}'::jsonb AS source_properties,
+                        (t.source_properties - 'labels' - '__type__') - 'embedding' - 'name' AS source_properties,
                         t.target_id,
                         t.target_type,
-                        (t.target_properties - 'labels' - '__type__') || '{{"embedding": null, "name": null}}'::jsonb AS target_properties
+                        (t.target_properties - 'labels' - '__type__') - 'embedding' - 'name' AS target_properties
                 FROM ("""
         query += "MATCH (e)-[r]->(t) "
-        query += "WHERE {BASE_ENTITY_LABEL} IN e.labels "
 
-        if entity_names or relation_names or properties or ids:
-            query += "AND "
+        # Collected and joined once. Each argument used to add its own separator, so a
+        # combination nobody had tried emitted `AND AND` or two fragments with nothing
+        # between them -- six of the fifteen combinations of these four arguments were
+        # a syntax error, and the one test covering the method passes only entity_names.
+        predicates = ["{BASE_ENTITY_LABEL} IN e.labels"]
 
         if entity_names:
             frag, p = self._or_equalities("e.name", entity_names, "etn")
-            query += frag + " "
+            predicates.append(frag)
             params.update(p)
-
-        if relation_names and entity_names:
-            query += "AND "
 
         if relation_names:
             # type(r) is the edge label, not a property, so it can't use a
             # property index; the containment form is fine here.
-            query += "type(r) <@ %(relation_names)s "
+            predicates.append("type(r) <@ %(relation_names)s")
             params["relation_names"] = Jsonb(relation_names)
 
         if ids:
             frag, p = self._or_equalities("e.id", ids, "gtid")
-            query += frag + " "
+            predicates.append(frag)
             params.update(p)
 
         if properties:
-            prop_params = [f'e."{prop}" = %({prop})s' for prop in properties]
-            query += "AND " + " AND ".join(prop_params)
-            params.update(
-                {f"{prop}": Jsonb(properties[prop]) for prop in properties}
-            )
+            frag, prop_params = _property_equalities("e", properties, "get_prop")
+            predicates.append(frag)
+            params.update(prop_params)
+
+        predicates.append("NOT ANY(label IN e.labels WHERE label = 'Chunk')")
+        query += "WHERE " + " AND ".join(predicates) + " "
 
         query += """
-        AND NOT ANY(label IN e.labels WHERE label = 'Chunk')
             WITH *, e.labels as e_labels, t.labels as t_labels
             RETURN type(r) as type, properties(r) as rel_prop, e.id as source_id,
             CASE
@@ -909,7 +967,8 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                         ELSE NULL
                     END
                 ELSE t_labels[0]
-            END AS target_type, properties(t) AS target_properties LIMIT 100
+            END AS target_type, properties(t) AS target_properties
+            LIMIT %(triplet_limit)s
         """
 
         query += ")t"
@@ -957,12 +1016,12 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             return triples
         query = """SELECT t.source_id,
                             t.source_type,
-                            (t.source_properties - 'labels' - '__type__') || '{{"embedding": null, "id": null}}'::jsonb AS source_properties,
+                            (t.source_properties - 'labels' - '__type__') - 'embedding' - 'id' AS source_properties,
                             t.type,
                             t.rel_properties,
                             t.target_id,
                             t.target_type,
-                            (t.target_properties - 'labels' - '__type__') || '{{"embedding": null, "id": null}}'::jsonb AS target_properties
+                            (t.target_properties - 'labels' - '__type__') - 'embedding' - 'id' AS target_properties
                       FROM (
                 """
         # OR-of-equalities seed match uses the id index (BitmapOr), whereas the
@@ -999,7 +1058,6 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 endNode(rel) AS endNode,
                 startNode(rel).labels AS source_labels,
                 endNode(rel).labels AS target_labels
-            LIMIT %(limit)s
             RETURN source.id AS source_id,
                 CASE
                     WHEN {BASE_ENTITY_LABEL} IN source_labels THEN
@@ -1091,11 +1149,8 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 )
 
         if properties:
-            cypher = "MATCH (e) WHERE "
-            props = [f'e."{prop}" = %({prop})s' for prop in properties]
-            cypher += " AND ".join(props)
-            cypher += " DETACH DELETE e"
-            params = {f"{prop}": Jsonb(properties[prop]) for prop in properties}
+            frag, params = _property_equalities("e", properties, "del_prop")
+            cypher = "MATCH (e) WHERE " + frag + " DETACH DELETE e"
             self.structured_query(cypher, params=params)
 
     def _build_vector_query(
@@ -1125,15 +1180,13 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 SELECT
                     t.name,
                     t.type,
-                    (t.properties - 'labels' - '__type__') || '{{"embedding": null, "name": null, "id": null}}'::jsonb AS properties,
+                    (t.properties - 'labels' - '__type__') - 'embedding' - 'name' - 'id' AS properties,
                     t.similarity
                 FROM (
                     MATCH (n: {BASE_NODE_LABEL})
                     WHERE n.embedding IS NOT NULL {filter_clause}
                     WITH n, n.labels AS labels,
                          (n.embedding::vector({dim}) <=> %(query_embedding)s::vector({dim})) AS dist
-                    ORDER BY dist
-                    LIMIT %(top_k)s
                     RETURN n.id as name,
                            properties(n) AS properties,
                            (1 - dist) AS similarity,
@@ -1146,6 +1199,8 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                                     END
                                 ELSE labels[0]
                            END AS type
+                    ORDER BY dist
+                    LIMIT %(top_k)s
                 )t;
                 """
             )
@@ -1166,7 +1221,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             vector_query = """SELECT t.name,
                                 t.type,
                                 t.similarity,
-                                (t.properties - 'labels' - '__type__') || '{{"embedding": null, "name": null, "id": null}}'::jsonb AS properties
+                                (t.properties - 'labels' - '__type__') - 'embedding' - 'name' - 'id' AS properties
                             FROM (
                             """
             vector_query += """
@@ -1175,8 +1230,6 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                             WITH n,
                                 n.labels AS labels,
                                 %(query_embedding)s::vector <=> n.embedding::vector AS cos_d
-                            ORDER BY cos_d
-                            LIMIT %(top_k)s
                             RETURN n.id as name,
                                 properties(n) AS properties,
                                 1-cos_d as similarity,
@@ -1189,6 +1242,8 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                                         END
                                     ELSE labels[0]
                                 END AS type
+                            ORDER BY cos_d
+                            LIMIT %(top_k)s
                             """
             vector_query += ")t"
             return (
@@ -1296,24 +1351,33 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         return d
 
     @require_psycopg
-    def structured_query(self, query: str, params: dict = {}) -> List[Dict[str, Any]]:
-        """
-        Query the graph by taking a cypher query, executing it and
-        converting the result
+    def structured_query(
+        self,
+        query: str,
+        param_map: Optional[Dict[str, Any]] = None,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Run a Cypher statement and return its rows.
 
         Args:
-            query (str): a cypher query to be executed
-            params (dict): parameters for the query (not used in this implementation)
+            query: the statement to run.
+            param_map: its parameters. This is the name the ``PropertyGraphStore``
+                contract uses, and ``CypherTemplateRetriever`` passes it by keyword.
+            params: the same thing under this class's older name, kept working.
 
-        Returns:
-            List[Dict[str, Any]]: a list of dictionaries containing the result set
+        Values are bound rather than written into the text: a string or a mapping is
+        wrapped so the server reads it as the jsonb a Cypher comparison expects, and a
+        number is passed as itself so it can still be a ``LIMIT``.
         """
+
+        bound = _cypher_params(param_map if param_map is not None else params)
 
         # execute the query, rolling back on an error
         with self._acquire() as conn:
             with conn.cursor(row_factory=psycopg.rows.namedtuple_row) as curs:
                 try:
-                    curs.execute(query, params)
+                    curs.execute(query, bound)
                     conn.commit()
                 except psycopg.Error as e:
                     conn.rollback()
@@ -1340,13 +1404,19 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 return result
 
     async def astructured_query(
-        self, query: str, params: dict = {}
+        self,
+        query: str,
+        param_map: Optional[Dict[str, Any]] = None,
+        *,
+        params: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Async counterpart of :meth:`structured_query` (true async I/O)."""
+        bound = _cypher_params(param_map if param_map is not None else params)
+
         async with self._aacquire() as conn:
             async with conn.cursor(row_factory=psycopg.rows.namedtuple_row) as curs:
                 try:
-                    await curs.execute(query, params)
+                    await curs.execute(query, bound)
                     await conn.commit()
                 except psycopg.Error as e:
                     await conn.rollback()

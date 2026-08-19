@@ -36,9 +36,13 @@ class TestBuildExpansionQuery:
 
     def test_the_seed_identity_travels_with_the_context(self) -> None:
         # An edge can point at the seed itself, and the seed is never among
-        # its own neighbours -- the id is what lets a renderer name it.
-        assert "id(node) AS seed_id" in build_expansion_query(hops=1, hybrid=False)
-        assert "id(seed) AS seed_id" in build_expansion_query(hops=1, hybrid=True)
+        # its own neighbours -- the id and label are what let a renderer name it.
+        vector = build_expansion_query(hops=1, hybrid=False)
+        assert "id(node) AS seed_id" in vector
+        assert "label(node) AS seed_label" in vector
+        hybrid = build_expansion_query(hops=1, hybrid=True)
+        assert "id(seed) AS seed_id" in hybrid
+        assert "label(seed) AS seed_label" in hybrid
 
     @pytest.mark.parametrize("hops", [0, 4, -1])
     def test_out_of_range_hops_are_refused(self, hops: int) -> None:
@@ -68,6 +72,7 @@ class TestRenderGraphContext:
             metadata={
                 "title": "The Seed",
                 "_seed_id_": "9.9",
+                "_seed_label_": "doc",
                 "_context_nodes_": [
                     {"id": "3.1", "label": "person", "properties": {"name": "Ada"}},
                     {"id": "3.2", "label": "person", "properties": {}},
@@ -83,7 +88,25 @@ class TestRenderGraphContext:
         assert "- person:Ada" in rendered.page_content
         assert "- person:3.2" in rendered.page_content
         assert "- person:Ada -[knows]-> person:3.2" in rendered.page_content
-        # The edge into the seed names the seed, not its graph id.
-        assert "- person:Ada -[wrote]-> The Seed" in rendered.page_content
+        # The edge into the seed names the seed by its own label, not by a
+        # graph id -- and the seed is not listed among its own neighbours.
+        assert "- person:Ada -[wrote]-> doc:The Seed" in rendered.page_content
+        assert "- doc:The Seed\n" not in rendered.page_content
         assert rendered.id == "d1"
         assert rendered.metadata == doc.metadata
+
+    def test_a_seed_without_a_label_is_still_named(self) -> None:
+        doc = Document(
+            page_content="seed",
+            metadata={
+                "name": "Anon",
+                "_seed_id_": "9.9",
+                "_context_nodes_": [
+                    {"id": "3.1", "label": "person", "properties": {"name": "Ada"}}
+                ],
+                "_context_rels_": [
+                    {"type": "wrote", "start": "3.1", "end": "9.9", "properties": {}}
+                ],
+            },
+        )
+        assert "- person:Ada -[wrote]-> Anon" in render_graph_context(doc).page_content

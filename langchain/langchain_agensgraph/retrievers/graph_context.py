@@ -31,7 +31,7 @@ _RELATIONSHIP_TYPE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 # validation. Braces other than the store's own format keys must not appear.
 _EXPANSION = """
     OPTIONAL MATCH ({anchor})-[rels{rel_type}*1..{hops}]-(peer)
-    WITH node, score, id({anchor}) AS seed_id,
+    WITH node, score, id({anchor}) AS seed_id, label({anchor}) AS seed_label,
          collect(DISTINCT CASE WHEN peer IS NULL THEN NULL ELSE
              jsonb_build_object('id', id(peer), 'label', label(peer),
                  'properties', properties(peer) ||
@@ -45,7 +45,7 @@ _EXPANSION = """
     RETURN node.{text_property} AS text, score, node.__id__ AS doc_id,
            node || jsonb_build_object({text_property_literal}, Null,
                {embedding_property_literal}, Null, '__id__', Null,
-               '_seed_id_', seed_id,
+               '_seed_id_', seed_id, '_seed_label_', seed_label,
                '_context_nodes_', ctx_nodes, '_context_rels_', ctx_rels) AS metadata
 """
 
@@ -184,12 +184,15 @@ def render_graph_context(doc: Document) -> Document:
         )
         for node in nodes
     }
-    # An edge whose far side is the seed itself would otherwise show a bare
-    # graph id -- the seed is never among its own neighbours.
+    lines = [f"- {name}" for name in named.values()]
+    # The seed is named for the edges that point back at it, and not listed among
+    # them: it is the document the context belongs to, not one of its neighbours.
+    # Without a name an edge into it would read as a bare graph id.
     seed_id = doc.metadata.get("_seed_id_")
-    if seed_id is not None and seed_id not in named:
-        named[seed_id] = name_of(doc.metadata, doc.id or "this document")
-    lines = [f"- {named[node_id]}" for node_id in named]
+    if seed_id is not None:
+        own = name_of(doc.metadata, doc.id or "this document")
+        seed_label = doc.metadata.get("_seed_label_")
+        named.setdefault(seed_id, f"{seed_label}:{own}" if seed_label else own)
     for rel in rels:
         start = named.get(rel["start"], str(rel["start"]))
         end = named.get(rel["end"], str(rel["end"]))

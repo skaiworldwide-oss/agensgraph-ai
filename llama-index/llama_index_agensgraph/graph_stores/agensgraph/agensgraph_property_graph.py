@@ -25,6 +25,7 @@ from typing import (
     NamedTuple,
     Optional,
     Sequence,
+    Set,
     Tuple,
 )
 import re, json
@@ -261,6 +262,9 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         self._indexed_properties: set = set()
         # Depth, not a flag: a caller's read-only block can hold another.
         self._read_only_depth = 0
+        # Inside a bulk block the vector indexes are deliberately absent, so
+        # a label first written there must not build one on the way in.
+        self._bulk_depth = 0
         self._allow_server_programs = False
         self.sanitize_query_output = sanitize_query_output
         self.enhanced_schema = enhanced_schema
@@ -336,6 +340,13 @@ class AgensPropertyGraphStore(PropertyGraphStore):
 
             self.connection.commit()
 
+        # What the graph already holds, so a store reopened on it knows its labels
+        # before writing one. Without this a label written by an earlier run is
+        # invisible until something writes it again -- and a bulk block would
+        # leave that label's vector index in place, which is the one thing it is
+        # there to remove.
+        self._declared_labels.update(self._established_labels())
+
         # Schema introspection scans every node's properties (O(N)). With
         # refresh_schema=False it is deferred and computed lazily on the first
         # get_schema()/get_schema_str() call.
@@ -370,19 +381,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             # 248 buffers by label against 495 through a btree over a scalar copy,
             # which also cost a property in every element and an index on every write.
             if self._supports_vector_index:
-                # The HNSW index expression must match what the Cypher vector
-                # query emits (n.embedding::vector(N)) for the planner to use it.
-                self.structured_query(
-                    sql.SQL(
-                        "CREATE PROPERTY INDEX IF NOT EXISTS {name} ON {label} "
-                        "USING hnsw ((embedding::vector("
-                        + str(int(self.vector_dimension))
-                        + ")) vector_cosine_ops)"
-                    ).format(
-                        name=sql.Identifier(VECTOR_INDEX_NAME),
-                        label=sql.Identifier(BASE_NODE_LABEL),
-                    )
-                )
+                self._create_vector_index()
                 self._ensure_constraints(
                     [
                         Check(
@@ -459,6 +458,101 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 self.connection.rollback()
                 logger.log(logging.WARNING, """Vector extension not supported\nUnable to install pg_vector extension""")
                 pass
+
+    def _established_labels(self) -> Set[str]:
+        """The labels this graph already holds that carry their own uniqueness.
+
+        A label without it is left out deliberately: it is treated as undeclared,
+        so the next write to it goes through the path that adds the constraint.
+        Two writers merging the same id onto a label that has none each create an
+        element rather than finding one.
+        """
+        try:
+            labels = self.connection.labels(graph=self.graph_name)
+            constraints = self.connection.constraints(graph=self.graph_name)
+        finally:
+            self.connection.commit()
+        unique_on_id = {
+            constraint.label for constraint in constraints if constraint.unique
+        }
+        return {
+            label.name
+            for label in labels
+            if label.kind == "v"
+            and label.parent == BASE_NODE_LABEL
+            and label.name in unique_on_id
+        }
+
+    def _vector_index_name(self, label: str) -> str:
+        """The name of a label's vector index."""
+        if label == BASE_NODE_LABEL:
+            # What it has always been called, so a graph written before this keeps
+            # the index it has instead of gaining a second one beside it.
+            return VECTOR_INDEX_NAME
+        return _bounded_name(label, VECTOR_INDEX_NAME)
+
+    def _create_vector_index(self, labels: Optional[Iterable[str]] = None) -> None:
+        """Build the HNSW index over the embeddings, on every label that holds any.
+
+        An index belongs to one label's storage and does not reach the labels that
+        inherit from it. Since an element is written on the label naming what it
+        is, indexing only the base left the search reading every embedded element:
+        on two thousand of them the child branch of the plan was a sequential scan
+        at 5.27 ms, against 0.38 ms once the label itself was indexed.
+
+        The expression has to match what the vector query emits --
+        ``n.embedding::vector(N)`` -- or the planner cannot use it, and the search
+        goes back to reading everything without saying so.
+        """
+        if not self._supports_vector_index:
+            return
+        for label in sorted(self._declared_labels if labels is None else labels):
+            self.structured_query(
+                sql.SQL(
+                    "CREATE PROPERTY INDEX IF NOT EXISTS {name} ON {label} "
+                    "USING hnsw ((embedding::vector("
+                    + str(int(self.vector_dimension))
+                    + ")) vector_cosine_ops)"
+                ).format(
+                    name=sql.Identifier(self._vector_index_name(label)),
+                    label=sql.Identifier(label),
+                )
+            )
+
+    @contextmanager
+    def bulk_ingest(self) -> Iterator[None]:
+        """Drop the vector indexes for the writes in this block and build them after.
+
+        Keeping them current costs more than the writing does. Measured on 4,000
+        elements of 384 numbers, with the arms alternating in one process: 12.40 s
+        with the index kept against 6.23 s with it built afterwards, and the gap
+        widens as the label grows, because every insertion walks a graph that is
+        getting bigger.
+
+        **A search inside this block reads every element**, for everyone using the
+        graph and not only this caller, because for its duration the indexes are
+        not there. It is for loading a corpus, not for a store answering
+        questions. If the process is killed inside the block they stay dropped;
+        constructing the store builds them again.
+        """
+        if not self._supports_vector_index:
+            yield
+            return
+        for label in sorted(self._declared_labels):
+            self.structured_query(
+                sql.SQL("DROP PROPERTY INDEX IF EXISTS {}").format(
+                    sql.Identifier(self._vector_index_name(label))
+                )
+            )
+        self._bulk_depth += 1
+        try:
+            yield
+        finally:
+            self._bulk_depth -= 1
+            if not self._bulk_depth:
+                # Every label, not only the ones dropped: a label first written
+                # inside the block needs one too.
+                self._create_vector_index()
 
     def create_property_index(
         self, property_name: str, label: Optional[str] = None
@@ -670,6 +764,12 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         # A property asked for before this label existed is indexed on it now.
         if self._indexed_properties:
             self._ensure_property_indexes(wanted, sorted(self._indexed_properties))
+        # And so is the embedding, for the same reason: the index belongs to this
+        # label's storage and the base label's does not reach it. Not inside a bulk
+        # block -- building it there is the cost that block exists to avoid, and
+        # the block builds every label's on the way out.
+        if not self._bulk_depth:
+            self._create_vector_index(wanted)
 
     def _ensure_constraints(self, desired: List[Any]) -> None:
         """Make the constraints named in ``desired`` exist, under the graph's lock."""

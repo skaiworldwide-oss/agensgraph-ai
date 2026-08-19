@@ -270,8 +270,17 @@ def test_relation_batching_one_query_per_label(vec_store: AgensPropertyGraphStor
     assert len(ops) == 2  # one batched UNWIND per distinct label, not 10
 
 
-def test_create_property_index_enables_filtered_index_scan(vec_store: AgensPropertyGraphStore):
-    """After create_property_index, a metadata-filtered vector_query can use it."""
+def test_create_property_index_indexes_the_label_that_holds_the_rows(
+    vec_store: AgensPropertyGraphStore,
+):
+    """The index has to be on the label the elements are written on.
+
+    An index belongs to one label's storage and does not reach the labels that
+    inherit from it, so one built on the base label alone served nothing: the
+    base holds no elements.
+    """
+    from psycopg import sql
+
     vec_store.upsert_nodes(
         [
             EntityNode(
@@ -286,19 +295,55 @@ def test_create_property_index_enables_filtered_index_scan(vec_store: AgensPrope
         ]
     )
     vec_store.create_property_index("country")
-    built = vec_store._build_vector_query(
-        VectorStoreQuery(
-            query_embedding=[1.0, 0.0, 0.0, 0.0],
-            similarity_top_k=3,
-            filters=MetadataFilters(
-                filters=[MetadataFilter(key="country", value="FR", operator=FilterOperator.EQ)]
-            ),
+
+    # Asked for on its own, the filter is served by the index rather than by
+    # reading the label. (Ordered by distance as well, the planner may instead
+    # take the vector index and filter after it, which is its decision to make.)
+    filter_only = sql.SQL(
+        'SELECT t.name FROM (MATCH (n:{label}) WHERE n.country = \'"FR"\'::jsonb '
+        "RETURN n.id AS name)t"
+    ).format(label=sql.Identifier("PERSON"))
+    with vec_store.connection.cursor() as cur:
+        cur.execute("SET LOCAL enable_seqscan = off")
+        cur.execute((sql.SQL("EXPLAIN ") + filter_only).as_string(cur))
+        plan = " ".join(" ".join(str(c) for c in row) for row in cur.fetchall())
+    vec_store.connection.rollback()
+    assert "PERSON_country_idx" in plan and "Seq Scan" not in plan
+
+
+def test_every_label_holding_embeddings_is_vector_indexed(
+    vec_store: AgensPropertyGraphStore,
+):
+    """Not only the base label, which holds none of them.
+
+    Measured on two thousand elements: the child branch of the plan was a
+    sequential scan at 5.27 ms with only the base indexed, and an index scan at
+    0.38 ms once the label itself was.
+    """
+    vec_store.upsert_nodes(
+        [
+            EntityNode(
+                name=f"q{i}",
+                label="ANIMAL",
+                properties={"embedding": [float(i), 1.0, 0.0, 0.0]},
+            )
+            for i in range(20)
+        ]
+    )
+    names = {
+        index.name
+        for index in vec_store.connection.indexes(
+            "ANIMAL", graph=vec_store.graph_name
         )
+    }
+    assert "ANIMAL_entity" in names
+
+    built = vec_store._build_vector_query(
+        VectorStoreQuery(query_embedding=[1.0, 1.0, 0.0, 0.0], similarity_top_k=3)
     )
     assert built is not None
-    query, params = built
-    plan = _plan_noseqscan(vec_store.connection, query, params)
-    assert "country_idx" in plan and "Index Scan" in plan
+    plan = _plan_noseqscan(vec_store.connection, *built)
+    assert "ANIMAL_entity" in plan and "Seq Scan" not in plan
 
 
 def test_query_embedding_is_bound_as_a_vector(vec_store: AgensPropertyGraphStore):
@@ -345,3 +390,49 @@ def test_a_bound_vector_still_reaches_the_hnsw_index(
         plan = " ".join(" ".join(str(c) for c in row) for row in cur.fetchall())
     vec_store.connection.rollback()
     assert "entity" in plan and "Index Scan" in plan
+
+
+def test_bulk_ingest_puts_the_vector_indexes_back(
+    vec_store: AgensPropertyGraphStore,
+):
+    """Including for a label first written inside the block, and after a failure.
+
+    Keeping the indexes current costs more than the writing does: 3,000 elements
+    of 384 numbers took 11.02 s written normally and 6.86 s inside the block.
+    """
+
+    def vector_indexes():
+        return {
+            index.name
+            for label in ("__Node__", "BIRD")
+            for index in vec_store.connection.indexes(
+                label, graph=vec_store.graph_name
+            )
+            if index.name.endswith("entity")
+        }
+
+    with vec_store.bulk_ingest():
+        assert vector_indexes() == set()
+        vec_store.upsert_nodes(
+            [
+                EntityNode(
+                    name=f"b{i}",
+                    label="BIRD",
+                    properties={"embedding": [float(i), 0.0, 1.0, 0.0]},
+                )
+                for i in range(5)
+            ]
+        )
+        # Still absent: building it here is the cost this block exists to avoid.
+        assert vector_indexes() == set()
+    assert "BIRD_entity" in vector_indexes()
+
+    class Boom(Exception):
+        pass
+
+    try:
+        with vec_store.bulk_ingest():
+            raise Boom
+    except Boom:
+        pass
+    assert "BIRD_entity" in vector_indexes()

@@ -15,6 +15,7 @@ import logging
 import json, re
 from contextlib import asynccontextmanager, contextmanager
 
+import agensgraph
 import psycopg
 from psycopg import sql
 from psycopg.types.json import Jsonb
@@ -329,7 +330,7 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         # connection (see ``_acquire``); without one, every query uses this
         # dedicated connection -- the original single-connection behavior.
         try:
-            self._connection = psycopg.connect(url)
+            self._connection = agensgraph.Connection.connect(url)
         except psycopg.OperationalError as e:
             raise ValueError(f"Failed to connect to Agensgraph database: {e}")
 
@@ -1024,7 +1025,7 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
                 yield conn
         else:
             if self._aconn is None or self._aconn.closed:
-                self._aconn = await psycopg.AsyncConnection.connect(self._url)
+                self._aconn = await agensgraph.AsyncConnection.connect(self._url)
                 async with self._aconn.cursor() as cur:
                     await cur.execute(
                         sql.SQL("SET graph_path = {n}").format(

@@ -45,6 +45,8 @@ from llama_index_agensgraph.filters import metadata_filters_to_cypher
 from llama_index_agensgraph.graph_stores.agensgraph.utils import *
 from llama_index.core.prompts import PromptTemplate
 from llama_index.core.vector_stores.types import VectorStoreQuery
+import agensgraph
+from agensgraph import Edge, Path, Vertex
 import psycopg
 from psycopg import sql
 from psycopg.types.json import Jsonb
@@ -238,8 +240,6 @@ class AgensPropertyGraphStore(PropertyGraphStore):
     This class implements a AgensGraph property graph store.
     """
 
-    vertex_regex: Pattern = re.compile(r"(\w+)\[(\d+\.\d+)\](\{.*\})")
-    edge_regex: Pattern = re.compile(r"(\w+)\[(\d+\.\d+)\]\[(\d+\.\d+),\s*(\d+\.\d+)\](\{.*\})")
 
     supports_structured_queries: bool = True
     supports_vector_queries: bool = True
@@ -264,7 +264,13 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         self.sanitize_query_output = sanitize_query_output
         self.enhanced_schema = enhanced_schema
         self.create_indexes = create_indexes
-        self.connection = psycopg.connect(**conf)
+        # The driver's connection: it refuses a server too old to speak to from the
+        # startup packet, decodes an element into a Vertex or an Edge rather than
+        # leaving it as text to be matched, and carries the vector types once
+        # registered.
+        self.connection = agensgraph.Connection.connect(**conf)
+        if self.connection.has_vectors():
+            self.connection.register_vectors()
         self.vector_dimension = vector_dimension
         # The engine (pool) is wired in only after setup completes: graph/index
         # creation must run on the dedicated connection before the graph exists
@@ -404,14 +410,12 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 yield conn
         else:
             if self._aconn is None or self._aconn.closed:
-                self._aconn = await psycopg.AsyncConnection.connect(**self._conf)
-                async with self._aconn.cursor() as cur:
-                    await cur.execute(
-                        sql.SQL("SET graph_path = {n}").format(
-                            n=sql.Identifier(self.graph_name)
-                        )
-                    )
-                await self._aconn.commit()
+                self._aconn = await agensgraph.AsyncConnection.connect(**self._conf)
+                if await self._aconn.has_vectors():
+                    await self._aconn.register_vectors()
+                # Selecting the graph through the driver also fills the label table it
+                # decodes an element's label from, which a hand-written SET does not.
+                await self._aconn.graph(self.graph_name)
             yield self._aconn
 
     @property
@@ -1226,58 +1230,42 @@ class AgensPropertyGraphStore(PropertyGraphStore):
 
     @staticmethod
     def _record_to_dict(record: NamedTuple) -> Dict[str, Any]:
+        """Turn a row into plain Python.
+
+        The driver decodes an element before it gets here, so a vertex arrives as a
+        Vertex and a relationship as an Edge carrying its own properties and the ids of
+        both its endpoints. Reading them out of the text they print as lost all of
+        that: a relationship came back as an empty pair with a type between them, a
+        path was never recognised, a label with a space in it stayed a raw string, and
+        a stored string shaped like a vertex was read back as one -- so stored text
+        could stand in for a real element, and which element you got depended on the
+        order the columns were returned in.
+
+        A relationship keeps the shape callers read, ``(start, type, end)``. The
+        endpoints are filled from the vertices the same row returned, matched on their
+        ids rather than on their spelling, so a value that merely looks like a vertex
+        cannot be mistaken for one.
         """
-        Convert a record returned from an agensgraph query to a dictionary
+        vertices: Dict[Any, Dict[str, Any]] = {}
+        for name in record._fields:
+            value = getattr(record, name)
+            if isinstance(value, Vertex):
+                vertices[value.id] = dict(value.properties)
 
-        Args:
-            record (): a record from an agensgraph query result
-
-        Returns:
-            Dict[str, Any]: a dictionary representation of the record where
-                the dictionary key is the field name and the value is the
-                value converted to a python type
-        """
-        # result holder
-        d = {}
-
-        # prebuild a mapping of vertex_id to vertex mappings to be used
-        # later to build edges
-        vertices = {}
-        for k in record._fields:
-            v = getattr(record, k)
-
-            # records comes back label[id]{properties} which must be parsed
-            if isinstance(v, str):
-                vertex = AgensPropertyGraphStore.vertex_regex.match(v)
-                if vertex:
-                    label, vertex_id, properties = vertex.groups()
-                    properties = json.loads(properties)
-                    vertices[str(vertex_id)] = properties
-
-        # iterate returned fields and parse appropriately
-        for k in record._fields:
-            v = getattr(record, k)
-
-            if isinstance(v, str):
-                vertex = AgensPropertyGraphStore.vertex_regex.match(v)
-                edge = AgensPropertyGraphStore.edge_regex.match(v)
-
-                if vertex:
-                    d[k] = json.loads(vertex.group(3))
-                elif edge:
-                    elabel, edge_id, start_id, end_id, properties = edge.groups()
-                    d[k] = (
-                        vertices.get(start_id, {}),
-                        elabel,
-                        vertices.get(end_id, {}),
-                    )
-                else:
-                    d[k] = v
-
+        row: Dict[str, Any] = {}
+        for name in record._fields:
+            value = getattr(record, name)
+            if isinstance(value, Edge):
+                row[name] = (
+                    vertices.get(value.start, {}),
+                    value.label,
+                    vertices.get(value.end, {}),
+                )
+            elif isinstance(value, Vertex):
+                row[name] = dict(value.properties)
             else:
-                d[k] = v
-
-        return d
+                row[name] = value
+        return row
 
     @require_psycopg
     def structured_query(

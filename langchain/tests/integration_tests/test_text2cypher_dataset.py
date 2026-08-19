@@ -57,6 +57,10 @@ def test_the_entry_holds(entry, graphs) -> None:
     else:
         assert gold_rows, "gold returned no rows"
     assert len(gold_rows) <= 10, "answers are designed to fit within a LIMIT 10"
+    if entry.get("expect_index"):
+        assert t2c.plan_has_index_path(
+            conf, entry["graph"], entry["gold"]
+        ), "gold was declared index-served but the planner finds no index path"
 
     habit = entry.get("habit")
     if habit is None:
@@ -65,6 +69,17 @@ def test_the_entry_holds(entry, graphs) -> None:
         with pytest.raises(Exception):
             with graph.read_only(allow_server_programs=True):
                 graph.query(habit, timeout=30)
+    elif entry["habit_outcome"] == "unindexed":
+        # The silent case: the habit answers correctly and reads the whole
+        # label doing it -- only the plan tells the two apart.
+        with graph.read_only(allow_server_programs=True):
+            habit_rows = graph.query(habit, timeout=30)
+        assert t2c.results_match(
+            habit_rows, gold_rows, entry.get("ordered", False)
+        ), "an unindexed habit must return the same rows as gold"
+        assert not t2c.plan_has_index_path(
+            conf, entry["graph"], habit
+        ), "the habit was declared unindexed but an index path exists"
     else:
         with graph.read_only(allow_server_programs=True):
             habit_rows = graph.query(habit, timeout=30)

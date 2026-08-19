@@ -56,6 +56,26 @@ def results_match(
     return canonical(got, ordered) == canonical(want, ordered)
 
 
+def plan_has_index_path(conf: Dict[str, Any], graph: str, cypher: str) -> bool:
+    """Whether any index can serve this statement at all.
+
+    With ``enable_seqscan = off`` the planner still picks a sequential scan when
+    nothing else exists, and marks it ``Disabled: true`` -- its own statement
+    that no index path exists. That line, not which plan wins by cost, is what
+    separates "the index cannot serve this predicate" from "the table is small".
+    """
+    import psycopg
+
+    connect = {k: v for k, v in conf.items() if v is not None}
+    with psycopg.connect(**connect) as conn:
+        cur = conn.cursor()
+        cur.execute(f"SET graph_path = {graph}")
+        cur.execute("SET enable_seqscan = off")
+        cur.execute("EXPLAIN (COSTS OFF) " + cypher)
+        plan = "\n".join(row[0] for row in cur.fetchall())
+    return "Disabled: true" not in plan
+
+
 def requires_met(entry: Dict[str, Any], capabilities: Any) -> Optional[str]:
     """None when the server can run this entry, else the unmet requirement."""
     for requirement in entry.get("requires", ()):
@@ -159,6 +179,14 @@ def build_movies(graph: Any) -> None:
                 "CREATE (m)-[:in_genre]->(g)",
                 params={"m": title, "g": genre},
             )
+    # The indexes the sargability entries hold their plans against.
+    for ddl in (
+        'CREATE PROPERTY INDEX IF NOT EXISTS t2cm_title ON "Movie" (title)',
+        'CREATE PROPERTY INDEX IF NOT EXISTS t2cm_year ON "Movie" (year)',
+        "CREATE PROPERTY INDEX IF NOT EXISTS t2cm_person_name ON person (name)",
+        "CREATE PROPERTY INDEX IF NOT EXISTS t2cm_genre_name ON genre (name)",
+    ):
+        graph.query(ddl)
 
 
 def build_traps(graph: Any) -> None:
@@ -215,6 +243,22 @@ def build_traps(graph: Any) -> None:
             "CREATE (x)-[:road {km: %(k)s}]->(y)",
             params={"a": a, "b": b, "k": km},
         )
+    # A label's children do not inherit its indexes, and a MATCH on the parent
+    # scans the children too -- one unindexed child and the whole read loses
+    # its index path. So every "Person" index exists on student as well.
+    for label, prefix in (('"Person"', "t2ct_person"), ("student", "t2ct_student")):
+        for suffix, keys in (
+            ("name", "(name)"),
+            ("age", "(age)"),
+            ("code", "(code)"),
+            ("scores", "(scores)"),
+            ("lower", "((tolower(name)))"),
+        ):
+            graph.query(
+                f"CREATE PROPERTY INDEX IF NOT EXISTS {prefix}_{suffix} "
+                f"ON {label} {keys}"
+            )
+    graph.query("CREATE PROPERTY INDEX IF NOT EXISTS t2ct_city_name ON city (name)")
 
 
 BUILDERS = {"t2c_movies": build_movies, "t2c_traps": build_traps}

@@ -28,11 +28,11 @@ from typing import (
 )
 import re, json
 import asyncio
+import hashlib
 import logging
 import time
 from contextlib import asynccontextmanager, contextmanager
 
-from llama_index.core.graph_stores.prompts import DEFAULT_CYPHER_TEMPALTE
 from llama_index.core.graph_stores.types import (
     PropertyGraphStore,
     Triplet,
@@ -49,7 +49,15 @@ from llama_index_agensgraph.graph_stores.agensgraph.utils import query_failed
 from llama_index.core.prompts import PromptTemplate
 from llama_index.core.vector_stores.types import VectorStoreQuery
 import agensgraph
-from agensgraph import Edge, Path, RetryPolicy, Vertex
+from agensgraph import Edge, RetryPolicy, Vertex
+from agensgraph.errors import safe_message
+from agensgraph.introspect import (
+    MAX_IDENTIFIER,
+    Check,
+    DesiredIndex,
+    DesiredLabel,
+    Unique,
+)
 import psycopg
 from psycopg import sql
 from psycopg.types.json import Jsonb
@@ -72,72 +80,6 @@ LONG_TEXT_THRESHOLD = 52
 
 
 
-
-# Collect the DISTINCT *types* per property rather than the DISTINCT *values*.
-# Deduplicating values forced the server to materialize (and ship) every
-# distinct value of every property on each schema refresh — including full
-# embedding vectors — which scales with the graph size for no benefit, since
-# only the property name and type are used (example values are sampled
-# separately, with a bound, when ``enhanced_schema`` is enabled).
-node_properties_query = f"""
-    MATCH (a:"{BASE_NODE_LABEL}")
-    UNWIND keys(properties(a)) AS prop
-    WITH label(a) AS label, prop, typeof(properties(a)[prop]) AS vtype
-    WITH label, prop AS property, COLLECT(DISTINCT vtype) AS types
-    RETURN label, COLLECT({{'property': property, 'type': types[0]}}) as props;
-"""
-
-edge_properties_query = f"""
-    MATCH ()-[e]->()
-    WITH type(e) as label, properties(e) as properties
-    UNWIND keys(properties) AS prop
-    WITH label, prop, typeof(properties[prop]) AS vtype
-    WITH label, prop AS property, COLLECT(DISTINCT vtype) AS types
-    RETURN label, COLLECT(DISTINCT {{'property': property, type: types[0]}}) as props;
-"""
-
-rel_query = """
-    MATCH (start_node)-[r]->(end_node)
-    RETURN DISTINCT
-        {start: label(start_node), type: type(r), end: label(end_node)} AS output
-"""
-
-constraint_wrapper = """
-    DO
-    $$BEGIN
-        {}
-    EXCEPTION
-        WHEN others THEN
-            NULL;
-    END;$$;
-"""
-
-typeof_function = r"""
-    CREATE OR REPLACE FUNCTION typeof(element jsonb)
-    RETURNS text AS $$
-    DECLARE
-        elem_type text;
-    BEGIN
-        elem_type := jsonb_typeof(element);
-        
-        IF elem_type = 'number' THEN
-            IF element::text ~ '^\d+$' THEN
-                RETURN 'INTEGER';
-            ELSIF element::text ~ '^\d+\.\d+$' THEN
-                RETURN 'FLOAT';
-            ELSE               
-                RETURN 'NUMBER';
-            END IF;
-        ELSE
-            CASE UPPER(elem_type)
-                WHEN 'OBJECT' THEN RETURN 'MAP';
-                WHEN 'ARRAY' THEN RETURN 'LIST';
-                ELSE RETURN UPPER(elem_type);
-            END CASE;
-        END IF;
-    END;
-    $$ LANGUAGE plpgsql IMMUTABLE;
-"""
 
 logger = logging.getLogger(__name__)
 
@@ -237,6 +179,29 @@ def _property_equalities(
 
 
 
+
+def _bounded_name(*parts: str) -> str:
+    """A name for a constraint or an index that stays distinct after truncation.
+
+    An identifier is 63 bytes and a label can be longer -- these are whatever an LLM
+    called an entity type. Two labels agreeing for the first 63 bytes would be given
+    one name, and the second would be read as already there and skipped, leaving that
+    label without the uniqueness that stops two writers making two of one node.
+    """
+    name = "_".join(parts)
+    encoded = name.encode()
+    if len(encoded) <= MAX_IDENTIFIER:
+        return name
+    digest = hashlib.blake2b(encoded, digest_size=8).hexdigest()
+    head = encoded[: MAX_IDENTIFIER - len(digest) - 1].decode("utf-8", "ignore")
+    return f"{head}_{digest}"
+
+
+def _unique_id_name(label: str) -> str:
+    """The name for a label's assertion that ``id`` is unique."""
+    return _bounded_name(label, "unique_id")
+
+
 def _merge_race(exc: BaseException) -> bool:
     """Whether a refusal is two writers reaching the same key at the same moment.
 
@@ -275,6 +240,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         refresh_schema: bool = True,
         engine: Optional[AgensEngine] = None,
         retry_attempts: int = 3,
+        schema_sample: int = 100,
         statement_timeout: Optional[float] = None,
     ) -> None:
         """Create a new Agensgraph Graph instance."""
@@ -282,6 +248,14 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         self.graph_name = graph_name
         # How many times a statement the server says to try again is tried again.
         self.retry_policy = RetryPolicy(attempts=retry_attempts)
+        # How many rows of a label establish its shape. Reading every row of a
+        # label full of embeddings to learn that one key holds an array is
+        # minutes rather than milliseconds.
+        self.schema_sample = schema_sample
+        self._label_counts: Dict[str, int] = {}
+        # Properties a caller has asked to be indexed, kept so a label
+        # declared later is indexed on the way in.
+        self._indexed_properties: set = set()
         self.sanitize_query_output = sanitize_query_output
         self.enhanced_schema = enhanced_schema
         self.create_indexes = create_indexes
@@ -343,13 +317,12 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 "SELECT pg_advisory_xact_lock(%s)", (int(self.graphid),)
             )
 
-            # `typeof` is what the schema read asks a value's type with. The label
-            # list this used to keep, and the catalog and trigger that maintained it,
-            # are gone: an element is written on the label naming what it is.
-            execute_query(curs, typeof_function)
-            execute_query(curs, sql.SQL("CREATE VLABEL IF NOT EXISTS {};").format(
-                sql.Identifier(BASE_NODE_LABEL)
-            ))
+            # The label list this used to keep, and the catalog and trigger that
+            # maintained it, are gone: an element is written on the label naming
+            # what it is.
+            self.connection.ensure_labels(
+                [DesiredLabel(BASE_NODE_LABEL, "v", None)], graph=graph_name
+            )
 
             self.connection.commit()
 
@@ -370,12 +343,12 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 "vector search (search still works without it, but unindexed)."
             )
         if create_indexes:
-            self.structured_query(
-                constraint_wrapper.format(
-                    f"""CREATE CONSTRAINT unique_id
-                        ON "{BASE_NODE_LABEL}"
-                        ASSERT id IS UNIQUE;"""
-                )
+            # Asked for by shape rather than by statement: the driver reads what is
+            # there and issues only what is missing. The block this replaces ran the
+            # DDL and swallowed every exception it raised, so a constraint that
+            # failed for a reason other than already existing failed silently.
+            self._ensure_constraints(
+                [Unique(BASE_NODE_LABEL, "id", _unique_id_name(BASE_NODE_LABEL))]
             )
             # A chunk is written on its own label like anything else, and a constraint
             # on the base label does not reach a child -- so without this, reading a
@@ -400,13 +373,15 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                         label=sql.Identifier(BASE_NODE_LABEL),
                     )
                 )
-                self.structured_query(
-                    constraint_wrapper.format(
-                        f"""CREATE CONSTRAINT embedding_length   
-                        ON "{BASE_NODE_LABEL}" 
-                        ASSERT jsonb_typeof(embedding) = 'array' AND 
-                               jsonb_array_length(embedding) = {self.vector_dimension};"""
-                    )
+                self._ensure_constraints(
+                    [
+                        Check(
+                            BASE_NODE_LABEL,
+                            "jsonb_typeof(embedding) = 'array' AND "
+                            f"jsonb_array_length(embedding) = {self.vector_dimension}",
+                            "embedding_length",
+                        )
+                    ]
                 )
 
         # An element says what it is by the label it is written on, so there is no list
@@ -475,25 +450,51 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 logger.log(logging.WARNING, """Vector extension not supported\nUnable to install pg_vector extension""")
                 pass
 
-    def create_property_index(self, property_name: str) -> None:
-        """
-        Create a btree property index on ``property_name`` of the base node
-        label.
+    def create_property_index(
+        self, property_name: str, label: Optional[str] = None
+    ) -> None:
+        """Index a property, on every label that holds elements.
 
         A metadata-filtered ``vector_query`` cannot use the HNSW index for the
-        filter, so without a property index the filter degrades to a sequential
-        scan over all embedded nodes. Indexing the keys you filter on lets the
-        planner pre-select matching rows via an index/bitmap scan.
+        filter, so without a property index the filter reads every embedded
+        element.
+
+        An index belongs to one label's storage and does not reach the labels that
+        inherit from it. Indexing only the base label left every element unindexed,
+        because an element is written on the label naming what it is -- and the
+        base holds nothing. The property is remembered, so a label declared later
+        is indexed as it appears.
         """
-        self.structured_query(
-            sql.SQL(
-                "CREATE PROPERTY INDEX IF NOT EXISTS {index_name} ON {label} ({prop})"
-            ).format(
-                index_name=sql.Identifier(f"{BASE_NODE_LABEL}_{property_name}_idx"),
-                label=sql.Identifier(BASE_NODE_LABEL),
-                prop=sql.Identifier(property_name),
+        self._indexed_properties.add(property_name)
+        labels = [label] if label else sorted(self._declared_labels)
+        self._ensure_property_indexes(labels, [property_name])
+
+    def _ensure_property_indexes(
+        self, labels: Iterable[str], properties: Iterable[str]
+    ) -> None:
+        """Make a btree index exist for each label and property named."""
+        desired = [
+            DesiredIndex(
+                label, (prop,), False, _bounded_name(label, prop, "idx"), "btree", None
             )
-        )
+            for label in labels
+            for prop in properties
+        ]
+        if not desired:
+            return
+
+        def once() -> None:
+            with self._acquire() as conn:
+                try:
+                    with conn.transaction():
+                        conn.execute(
+                            "SELECT pg_advisory_xact_lock(%s)", (int(self.graphid),)
+                        )
+                        conn.ensure_indexes(desired, graph=self.graph_name)
+                except psycopg.Error as e:
+                    raise query_failed("declaring property indexes", e) from e
+
+        self._run_with_retry(once)
 
     def refresh_schema(self) -> None:
         """
@@ -501,19 +502,17 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         labels, relationships, and properties
         """
 
+        description = self._describe()
         self.structured_schema = {
-            "node_props": self._get_node_properties(),
-            "rel_props": self._get_edge_properties(),
-            "relationships": self._get_triples(),
+            "node_props": self._properties_of(description, "v"),
+            "rel_props": self._properties_of(description, "e"),
+            "relationships": [
+                {"start": triple.start, "type": triple.edge, "end": triple.end}
+                for triple in description.triples
+            ],
             "metadata": {},
         }
-
-        # The schema-introspection helpers run SELECTs on the dedicated
-        # connection without committing, which would otherwise leave it
-        # idle-in-transaction holding an AccessShareLock on the label tables --
-        # enough to block a second store's CREATE CONSTRAINT (AccessExclusiveLock)
-        # on the same graph. Commit to release those locks.
-        self.connection.commit()
+        self._label_counts = dict(description.counts)
 
         if self.enhanced_schema:
             self._enhance_schema()
@@ -610,9 +609,15 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         elements -- so without one per label two writers merging the same id would each
         create an element rather than find one.
         """
-        wanted = [
-            label for label in labels if label and label not in self._declared_labels
-        ]
+        # Deduplicated: a batch of nodes usually shares a label, and asking for the
+        # same one twice is asking for two constraints of the same name.
+        wanted = list(
+            dict.fromkeys(
+                label
+                for label in labels
+                if label and label not in self._declared_labels
+            )
+        )
         if not wanted:
             return
         self._run_with_retry(lambda: self._declare_labels(wanted))
@@ -626,38 +631,51 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 # group back rather than leaving the connection unable to run
                 # anything else.
                 with conn.transaction():
-                    with conn.cursor() as curs:
-                        # ``IF NOT EXISTS`` asks whether the label is there and then
-                        # creates it, which is two steps: eight writers all found
-                        # Person missing and the losers were told it already exists.
-                        # The lock lasts as long as the transaction, so it is released
-                        # whichever way this ends.
-                        curs.execute(
-                            "SELECT pg_advisory_xact_lock(%s)", (int(self.graphid),)
-                        )
-                        for label in wanted:
-                            curs.execute(
-                                sql.SQL(
-                                    "CREATE VLABEL IF NOT EXISTS {child} "
-                                    "INHERITS ({parent})"
-                                ).format(
-                                    child=sql.Identifier(label),
-                                    parent=sql.Identifier(BASE_NODE_LABEL),
-                                )
-                            )
-                            # A constraint has no IF NOT EXISTS arm, so a second store
-                            # opening the same graph would raise on one already there.
-                            # The statement inside the block carries its terminator.
-                            quoted = sql.Identifier(label).as_string(None)
-                            name = sql.Identifier(f"{label}_unique_id").as_string(None)
-                            curs.execute(
-                                constraint_wrapper.format(
-                                    f"CREATE CONSTRAINT {name} ON {quoted} "
-                                    "ASSERT id IS UNIQUE;"
-                                )
-                            )
+                    # Reconciling reads what is there and then creates what is not,
+                    # which is two steps: eight writers all found Person missing and
+                    # the losers were told it already exists. The lock lasts as long
+                    # as the transaction, so it is released whichever way this ends.
+                    conn.execute(
+                        "SELECT pg_advisory_xact_lock(%s)", (int(self.graphid),)
+                    )
+                    conn.ensure_labels(
+                        [
+                            DesiredLabel(label, "v", BASE_NODE_LABEL)
+                            for label in wanted
+                        ],
+                        graph=self.graph_name,
+                    )
+                    # A constraint on the parent does not reach a child -- measured,
+                    # the same id written to two child labels gave two elements -- so
+                    # each label carries its own.
+                    conn.ensure_constraints(
+                        [
+                            Unique(label, "id", _unique_id_name(label))
+                            for label in wanted
+                        ],
+                        graph=self.graph_name,
+                    )
             except psycopg.Error as e:
                 raise query_failed(f"declaring labels {wanted}", e) from e
+        # A property asked for before this label existed is indexed on it now.
+        if self._indexed_properties:
+            self._ensure_property_indexes(wanted, sorted(self._indexed_properties))
+
+    def _ensure_constraints(self, desired: List[Any]) -> None:
+        """Make the constraints named in ``desired`` exist, under the graph's lock."""
+
+        def once() -> None:
+            with self._acquire() as conn:
+                try:
+                    with conn.transaction():
+                        conn.execute(
+                            "SELECT pg_advisory_xact_lock(%s)", (int(self.graphid),)
+                        )
+                        conn.ensure_constraints(desired, graph=self.graph_name)
+                except psycopg.Error as e:
+                    raise query_failed(f"declaring constraints {desired}", e) from e
+
+        self._run_with_retry(once)
 
     def _build_upsert_nodes_ops(
         self, nodes: List[LabelledNode]
@@ -1478,47 +1496,82 @@ class AgensPropertyGraphStore(PropertyGraphStore):
 
                 return result
 
-    @require_psycopg
-    def _get_node_properties(self) -> Dict[str, Any]:
-        node_properties = {}
-        with self._get_cursor() as curs:
-            execute_query(curs, node_properties_query)
-            rows = curs.fetchall()
+    def _describe(self) -> Any:
+        """What the graph holds, read from the catalogs rather than from the graph.
 
-            for row in rows:                
-                node_properties[row.label] = row.props
+        This replaces three statements that walked every element's properties and
+        every edge, and a plpgsql function the package used to install in the
+        caller's database to name a JSON type -- ``jsonb_typeof`` is built in, and
+        the driver does the one thing it does not, telling a whole number from a
+        fractional one.
+        """
+        with self._acquire() as conn:
+            try:
+                # The triple catalog is the server's own and only a gather fills it,
+                # so a graph nobody has gathered has no relationships to report.
+                # Gathering is a write; doing it when the catalog already describes
+                # the graph would be a write for nothing.
+                stale = not conn.meta_is_current(graph=self.graph_name)
+                try:
+                    return conn.describe(
+                        graph=self.graph_name, sample=self.schema_sample, refresh=stale
+                    )
+                except psycopg.Error as e:
+                    if not stale:
+                        raise query_failed("describing the graph", e) from e
+                    # A reader who may not gather still deserves the labels and
+                    # their properties; only the relationships are lost.
+                    logger.debug(
+                        "could not gather the triple catalog: %s", safe_message(e)
+                    )
+                    conn.rollback()
+                    return conn.describe(
+                        graph=self.graph_name, sample=self.schema_sample
+                    )
+            finally:
+                # Reads, but on a connection that is not in autocommit they leave a
+                # transaction open holding a share lock on the label tables -- and
+                # the next store's CREATE CONSTRAINT wants the table to itself, so
+                # it waits for as long as this store lives.
+                try:
+                    conn.commit()
+                except psycopg.Error:
+                    pass
 
-        return node_properties
+    # The schema dict names a JSON type the way a Cypher writer says it, and the
+    # driver names it the way JSON does. Everything else is the same word.
+    _SCHEMA_TYPES = {"array": "LIST", "object": "MAP"}
 
-    @require_psycopg
-    def _get_edge_properties(self) -> Dict[str, Any]:
-        edge_properties = {}
-        with self._get_cursor() as curs:
-            execute_query(curs, edge_properties_query)
-            rows = curs.fetchall()
+    def _properties_of(self, description: Any, kind: str) -> Dict[str, Any]:
+        """The properties of every label of ``kind``, as the schema dict spells them.
 
-            for row in rows:                
-                edge_properties[row.label] = row.props
-
-        return edge_properties
+        The base label is left out: it inherits every element, so reporting it would
+        repeat each child's properties under a name nothing is written on.
+        """
+        kinds = {label.name: label.kind for label in description.labels}
+        skip = {"ag_vertex", "ag_edge", BASE_NODE_LABEL}
+        return {
+            name: [
+                {
+                    "property": shape.name,
+                    "type": self._SCHEMA_TYPES.get(shape.kind, shape.kind.upper()),
+                }
+                for shape in shapes
+            ]
+            for name, shapes in description.properties.items()
+            if name not in skip and kinds.get(name) == kind
+        }
 
     def _get_triples(self) -> List[Dict[str, str]]:
-        """
-        Get a set of distinct relationship types (as a list of dicts) in the graph
-        to be used as context by an llm.
+        """The distinct relationships in the graph, for an LLM's context.
 
         Returns:
             List[Dict[str, str]]: relationships as a list of dicts in the format
                 "{'start':<from_label>, 'type':<edge_label>, 'end':<from_label>}"
         """
-
-        triple_schema = []
-        with self._get_cursor() as curs:
-            execute_query(curs, rel_query)
-            rows = curs.fetchall()
-            triple_schema = [row.output for row in rows]
-        
-        return triple_schema
+        if not self._schema_refreshed:
+            self.refresh_schema()
+        return self.structured_schema.get("relationships", [])
 
     def _get_triples_str(self) -> List[str]:
         """
@@ -1537,16 +1590,11 @@ class AgensPropertyGraphStore(PropertyGraphStore):
     _NUMERIC_TYPES = {"INTEGER", "FLOAT", "NUMBER"}
 
     def _label_count(self, label: str) -> int:
-        # Use the indexed scalar __type__ (not `IN labels`, which scans every node)
-        # and count(*) (not count(a), which materializes every vertex, including
-        # its embedding).
-        rows = self.structured_query(
-            sql.SQL(
-                "MATCH (a:{base_label}) WHERE label(a) = %(label)s RETURN count(*) AS c"
-            ).format(base_label=sql.Identifier(BASE_NODE_LABEL)),
-            {"label": Jsonb(label)},
-        )
-        return int(rows[0]["c"]) if rows else 0
+        """How many elements a label holds, as the catalog already recorded it.
+
+        Counting these by statement was one round trip and one scan per label.
+        """
+        return int(self._label_counts.get(label, 0))
 
     def _enhance_schema(self) -> None:
         """

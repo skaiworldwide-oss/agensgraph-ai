@@ -6,22 +6,24 @@ from typing import (
     List,
     NamedTuple,
     Optional,
-    Pattern,
     Tuple,
-    Union,
 )
 import logging
+import re
 
-import json, re
 from contextlib import asynccontextmanager, contextmanager
 
 import agensgraph
+from agensgraph import Edge, Vertex
+from agensgraph.errors import safe_message
+from agensgraph.introspect import DesiredIndex
 import psycopg
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
 from llama_index_agensgraph.engine import AgensEngine
 from llama_index_agensgraph.filters import metadata_filters_to_cypher
+from llama_index_agensgraph.graph_stores.agensgraph.utils import AgensQueryException
 
 from llama_index.core.bridge.pydantic import PrivateAttr
 from llama_index.core.schema import BaseNode, MetadataMode
@@ -42,126 +44,22 @@ _logger = logging.getLogger(__name__)
 # not ship one oversized parameter / build one huge server-side list.
 CHUNK_SIZE = 1000
 
-get_vector_index_info_function = r"""
-    CREATE OR REPLACE FUNCTION ag_list_vector_indexes(
-        index_name text DEFAULT NULL,
-        node_label text DEFAULT NULL,
-        embedding_node_property text DEFAULT NULL
-    )
-    RETURNS TABLE (
-        name text,
-        labelortype text,
-        property text,
-        entitytype text,
-        dimensions int
-    )
-    LANGUAGE sql
-    AS $$
-        SELECT
-            c.relname AS name,
-            l.labname AS labelOrType,
-            CASE
-                WHEN indexdef ~ '\(+([a-zA-Z_][a-zA-Z0-9_]*)\)+::' THEN regexp_replace(indexdef, '.*\(+([a-zA-Z_][a-zA-Z0-9_]*)\)+::.*', '\1')
-                ELSE NULL
-            END AS property,
-            CASE
-                WHEN l.labkind = 'v' THEN 'NODE'
-                WHEN l.labkind = 'e' THEN 'RELATIONSHIP'
-                ELSE 'UNKNOWN'
-            END AS entityType,
-            CASE
-                WHEN indexdef ~ 'vector\((\d+)\)' THEN (regexp_match(indexdef, 'vector\((\d+)\)'))[1]::int
-                ELSE NULL
-            END AS dimensions
-        FROM
-            pg_catalog.pg_index i
-        JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
-        JOIN pg_catalog.ag_label l ON i.indrelid = l.relid
-        JOIN pg_catalog.ag_graph g ON l.graphid = g.oid
-        JOIN LATERAL pg_catalog.ag_get_propindexdef(c.oid) AS indexdef ON true
-        WHERE
-            g.graphname = current_setting('graph_path')
-            AND i.indexprs IS NOT NULL
-            AND indexdef ~ '::vector\(\d+\)'
-            AND (
-                index_name IS NULL AND node_label IS NULL AND embedding_node_property IS NULL
-                OR (
-                    (index_name IS NOT NULL AND c.relname = index_name)
-                    OR (
-                        node_label IS NOT NULL
-                        AND embedding_node_property IS NOT NULL
-                        AND l.labname = node_label
-                        AND CASE
-                            WHEN indexdef ~ '\(\(\(([^)]+)\)::' THEN regexp_replace(indexdef, '.*\(\(\(([^)]+)\)::.*', '\1')
-                            ELSE NULL
-                        END = embedding_node_property
-                    )
-                )
-            )
-    $$;
+# An expression index records its expression, and that is the only place the
+# indexed property and the vector's width appear. The driver's element parser
+# reads a plain index and returns nothing for one of these, so they are read
+# here -- where the two SQL functions this replaces used to do the same regex
+# work, in the caller's database, installed on every construction.
+VECTOR_INDEX_EXPR = re.compile(
+    r"""\(+ "?(?P<property>[A-Za-z_][A-Za-z0-9_]*)"? \)*
+        ::vector\( (?P<dimensions>\d+) \)""",
+    re.VERBOSE,
+)
+TEXT_INDEX_EXPR = re.compile(
+    r"""to_tsvector\( \s* '[^']*' \s* , \s*
+        "?(?P<property>[A-Za-z_][A-Za-z0-9_]*)"? \s* \)""",
+    re.VERBOSE,
+)
 
-
-"""
-
-get_keyword_index_info_function = r"""
-    CREATE OR REPLACE FUNCTION ag_list_text_indexes(
-        index_name text DEFAULT NULL,
-        node_label text DEFAULT NULL,
-        text_node_properties text[] DEFAULT NULL
-    )
-    RETURNS TABLE (
-        name text,
-        labelortype text,
-        properties text[],
-        entitytype text
-    )
-    LANGUAGE sql
-    AS $$
-    WITH extracted_props AS (
-        SELECT
-            c.relname AS name,
-            l.labname AS labelOrType,
-            ARRAY(
-                SELECT
-                    trim(both '"' from trim(m[1]))
-                FROM
-                    regexp_matches(indexdef, 'to_tsvector\((?:[^,]+),\s*([^)]+)\)', 'g') AS m
-            ) AS props,
-            CASE
-                WHEN l.labkind = 'v' THEN 'NODE'
-                WHEN l.labkind = 'e' THEN 'RELATIONSHIP'
-                ELSE 'UNKNOWN'
-            END AS entityType
-        FROM
-            pg_catalog.pg_index i
-        JOIN pg_catalog.pg_class c ON c.oid = i.indexrelid
-        JOIN pg_catalog.ag_label l ON i.indrelid = l.relid
-        JOIN pg_catalog.ag_graph g ON l.graphid = g.oid
-        JOIN LATERAL pg_catalog.ag_get_propindexdef(c.oid) AS indexdef ON true
-        WHERE
-            g.graphname = current_setting('graph_path')
-            AND i.indexprs IS NOT NULL
-            AND indexdef ~ 'to_tsvector\('
-    )
-    SELECT
-        name,
-        labelOrType,
-        props AS properties,
-        entityType
-    FROM
-        extracted_props
-    WHERE
-        (
-            (index_name IS NULL OR name = index_name)
-            AND (node_label IS NULL OR labelOrType = node_label)
-            AND (
-                text_node_properties IS NULL OR
-                array(SELECT unnest(props) ORDER BY 1) = array(SELECT unnest(text_node_properties) ORDER BY 1)
-            )
-        );
-    $$;
-
-"""
 
 def check_if_not_null(props: List[str], values: List[Any]) -> None:
     """Check if variable is not null and raise error accordingly."""
@@ -228,25 +126,8 @@ def remove_lucene_chars(text: Optional[str]) -> Optional[str]:
 # ``llama_index_agensgraph.filters.metadata_filters_to_cypher`` (shared with the
 # property graph store and supporting all 14 FilterOperators).
 
-class AgensQueryException(Exception):
-    """Exception for the Agensgraph queries."""
+logger = logging.getLogger(__name__)
 
-    def __init__(self, exception: Union[str, Dict]) -> None:
-        if isinstance(exception, dict):
-            self.message = exception["message"] if "message" in exception else "unknown"
-            self.details = exception["details"] if "details" in exception else "unknown"
-        else:
-            self.message = exception
-            self.details = "unknown"
-
-    def get_message(self) -> str:
-        return self.message
-
-    def get_details(self) -> Any:
-        return self.details
-
-_vertex_regex: Pattern = re.compile(r"(\w+)\[(\d+\.\d+)\](\{.*\})")
-_edge_regex: Pattern = re.compile(r"(\w+)\[(\d+\.\d+)\]\[(\d+\.\d+),\s*(\d+\.\d+)\](\{.*\})")
 
 class AgensgraphVectorStore(BasePydanticVectorStore):
     """
@@ -345,9 +226,6 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
             [index_name, node_label, embedding_node_property, text_node_property],
         )
 
-        # Create the graph and utility functions
-        self.database_query(get_vector_index_info_function)
-        self.database_query(get_keyword_index_info_function)
         self.database_query(sql.SQL("CREATE GRAPH IF NOT EXISTS {}").format(
             sql.Identifier(self._graph_name)
         ))
@@ -393,28 +271,63 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         return self._connection
 
     def create_property_index(
-        self, property_name: str, label: Optional[str] = None
+        self,
+        property_name: str,
+        label: Optional[str] = None,
+        unique: bool = False,
     ) -> None:
-        """
-        Create a btree property index on ``property_name`` for ``label``
-        (defaults to this store's node label).
+        """Index ``property_name`` on ``label``, this store's node label by default.
 
-        Useful for metadata keys you filter on: a metadata-filtered vector
+        Useful for the metadata keys you filter on: a metadata-filtered vector
         search cannot use the HNSW index for the filter, so without a property
-        index the filter degrades to a sequential scan. Indexing the filter key
-        lets the planner pre-select matching rows via an index/bitmap scan.
+        index the filter reads every embedded node.
+
+        ``unique`` also makes the index refuse a second node with the same value.
+        The whole reconciliation runs in one transaction, because making an
+        existing index unique means dropping it and building it again: if the
+        rebuild is refused, a graph that had an index would otherwise be left
+        with none, and every MERGE on that property would go back to reading the
+        whole label.
         """
         target_label = label or self.node_label
         self.verify_label_existence()
-        self.database_query(
-            sql.SQL(
-                "CREATE PROPERTY INDEX IF NOT EXISTS {index_name} ON {node_label} ({prop})"
-            ).format(
-                index_name=sql.Identifier(f"{target_label}_{property_name}_idx"),
-                node_label=sql.Identifier(target_label),
-                prop=sql.Identifier(property_name),
-            )
+        desired = DesiredIndex(
+            target_label,
+            (property_name,),
+            unique,
+            f"{target_label}_{property_name}_idx",
+            "btree",
+            None,
         )
+        with self._acquire() as conn:
+            try:
+                with conn.transaction():
+                    conn.ensure_indexes([desired], graph=self._graph_name)
+            except psycopg.errors.UniqueViolation:
+                if not unique:
+                    raise
+                # The label already holds two nodes of one id. Saying so is more
+                # use than refusing to open the store, and the index that was
+                # there is still there.
+                logger.warning(
+                    "%s already holds more than one node per %s, so that index "
+                    "cannot enforce uniqueness; duplicates already written stay, "
+                    "and concurrent writers can add more.",
+                    target_label,
+                    property_name,
+                )
+                with conn.transaction():
+                    conn.ensure_indexes(
+                        [desired._replace(unique=False)], graph=self._graph_name
+                    )
+            except psycopg.Error as e:
+                raise AgensQueryException(
+                    {
+                        "message": f"Error indexing {target_label}.{property_name}",
+                        "details": safe_message(e),
+                    },
+                    cause=e,
+                ) from e
 
     def create_id_index(self) -> None:
         """
@@ -424,8 +337,12 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         ``add`` upserts nodes with ``MERGE (c:{label} {id: row.id})`` and
         ``delete`` matches on ``ref_doc_id``; without these indexes each such
         lookup performs a sequential scan (bulk ingest becomes O(N^2)).
+
+        The one on ``id`` is unique. Two callers adding the same node at the same
+        moment both find it missing and both create it, and the id is what every
+        later read, update and delete of that node goes through.
         """
-        self.create_property_index("id")
+        self.create_property_index("id", unique=True)
         self.create_property_index("ref_doc_id")
 
     def create_new_index(self) -> None:
@@ -447,74 +364,75 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
             )
         )
 
+    def _graph_indexes(self) -> List[Any]:
+        """Every property index of this store's label, from the catalog."""
+        with self._acquire() as conn:
+            try:
+                return conn.indexes(self.node_label, graph=self._graph_name)
+            finally:
+                try:
+                    conn.commit()
+                except psycopg.Error:
+                    pass
+
     def retrieve_existing_index(self) -> bool:
+        """Adopt the vector index already on this label, if there is one.
+
+        Sets this store's index name, label, embedded property and dimension from
+        it, so a store opened against an existing index agrees with what is there
+        rather than trying to build a second one beside it.
         """
-        Check if the vector index exists in the Agensgraph database
-        and returns its embedding dimension.
-
-        This method queries the Agensgraph database for existing indexes
-        and attempts to retrieve the dimension of the vector index
-        with the specified name. If the index exists, its dimension is returned.
-        If the index doesn't exist, `None` is returned.
-
-        Returns:
-            int or None: The embedding dimension of the existing index if found.
-
-        """
-        index_information = self.database_query(
-            """SELECT * FROM ag_list_vector_indexes(index_name => %(index_name)s,
-                                                    node_label => %(node_label)s,
-                                                    embedding_node_property => %(embedding_node_property)s)
-            """,
-            params={
-                "index_name": self.index_name,
-                "node_label": self.node_label,
-                "embedding_node_property": self.embedding_node_property,
-            },
-        )
-        # sort by index_name
-        index_information = sort_by_index_name(index_information, self.index_name)
-        try:
-            self.index_name = index_information[0]["name"]
-            self.node_label = index_information[0]["labelortype"]
-            self.embedding_node_property = index_information[0]["property"]
-            self.embedding_dimension = index_information[0]["dimensions"]
-
-            return True
-        except IndexError:
+        found = []
+        for index in self._graph_indexes():
+            match = VECTOR_INDEX_EXPR.search(index.definition)
+            if match is None:
+                continue
+            if index.name != self.index_name and (
+                match.group("property") != self.embedding_node_property
+            ):
+                continue
+            found.append(
+                {
+                    "name": index.name,
+                    "labelortype": index.label,
+                    "property": match.group("property"),
+                    "dimensions": int(match.group("dimensions")),
+                }
+            )
+        if not found:
             return False
+        # The one named is the one meant; any other is a fallback.
+        chosen = sort_by_index_name(found, self.index_name)[0]
+        self.index_name = chosen["name"]
+        self.node_label = chosen["labelortype"]
+        self.embedding_node_property = chosen["property"]
+        self.embedding_dimension = chosen["dimensions"]
+        return True
 
     def retrieve_existing_fts_index(self) -> Optional[str]:
-        """
-        Check if the fulltext index exists in the Agensgraph database.
-
-        This method queries the Agensgraph database for existing fts indexes
-        with the specified name.
-
-        Returns:
-            (Tuple): keyword index information
-
-        """
-        index_information = self.database_query(
-            """SELECT * FROM ag_list_text_indexes(index_name => %(index_name)s,
-                                                  node_label => %(node_label)s,
-                                                  text_node_properties => %(text_node_properties)s)
-            """,
-            params={
-                "index_name": self.keyword_index_name,
-                "node_label": self.node_label,
-                "text_node_properties": [self.text_node_property],
-            },
-        )
-        # sort by index_name
-        index_information = sort_by_index_name(index_information, self.index_name)
-        try:
-            self.keyword_index_name = index_information[0]["name"]
-            self.text_node_property = index_information[0]["properties"][0]
-            node_label = index_information[0]["labelortype"]
-            return node_label
-        except IndexError:
+        """The label of the full-text index already on this store's label, if any."""
+        found = []
+        for index in self._graph_indexes():
+            properties = TEXT_INDEX_EXPR.findall(index.definition)
+            if not properties:
+                continue
+            if index.name != self.keyword_index_name and (
+                properties != [self.text_node_property]
+            ):
+                continue
+            found.append(
+                {
+                    "name": index.name,
+                    "labelortype": index.label,
+                    "properties": properties,
+                }
+            )
+        if not found:
             return None
+        chosen = sort_by_index_name(found, self.keyword_index_name)[0]
+        self.keyword_index_name = chosen["name"]
+        self.text_node_property = chosen["properties"][0]
+        return chosen["labelortype"]
 
     def create_new_keyword_index(self, text_node_properties: List[str] = []) -> None:
         """
@@ -922,45 +840,29 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
                 the dictionary key is the field name and the value is the
                 value converted to a python type
         """
-        # result holder
-        d = {}
+        # An element comes back as an element. Matched out of its printed form, a
+        # stored string that happens to read like one -- a chunk quoting a query
+        # result, say -- became a vertex, and its properties overwrote the real
+        # one returned in another field.
+        vertices: Dict[Any, Dict[str, Any]] = {}
+        for name in record._fields:
+            value = getattr(record, name)
+            if isinstance(value, Vertex):
+                vertices[value.id] = dict(value.properties)
 
-        # prebuild a mapping of vertex_id to vertex mappings to be used
-        # later to build edges
-        vertices = {}
-        for k in record._fields:
-            v = getattr(record, k)
-
-            # records comes back label[id]{properties} which must be parsed
-            if isinstance(v, str):
-                vertex = _vertex_regex.match(v)
-                if vertex:
-                    label, vertex_id, properties = vertex.groups()
-                    properties = json.loads(properties)
-                    vertices[str(vertex_id)] = properties
-
-        # iterate returned fields and parse appropriately
-        for k in record._fields:
-            v = getattr(record, k)
-
-            if isinstance(v, str):
-                vertex = _vertex_regex.match(v)
-                edge = _edge_regex.match(v)
-
-                if vertex:
-                    d[k] = json.loads(vertex.group(3))
-                elif edge:
-                    elabel, edge_id, start_id, end_id, properties = edge.groups()
-                    d[k] = (
-                        vertices.get(start_id, {}),
-                        elabel,
-                        vertices.get(end_id, {}),
-                    )
-                else:
-                    d[k] = v
-
+        d: Dict[str, Any] = {}
+        for name in record._fields:
+            value = getattr(record, name)
+            if isinstance(value, Edge):
+                d[name] = (
+                    vertices.get(value.start, {}),
+                    value.label,
+                    vertices.get(value.end, {}),
+                )
+            elif isinstance(value, Vertex):
+                d[name] = dict(value.properties)
             else:
-                d[k] = v
+                d[name] = value
 
         return d
 

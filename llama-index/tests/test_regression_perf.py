@@ -518,3 +518,54 @@ def test_promotion_can_be_declined():
     }
     store.connection.commit()
     assert "::vector(4)" in definitions["DOG_entity"]
+
+
+def test_reading_many_ids_costs_the_same_to_plan_as_reading_one(
+    vec_store: AgensPropertyGraphStore,
+):
+    """An OR of equalities reaches the index and executes at the same speed, but
+    the planner works through every term: on 5,000 ids that was 151.7 ms of
+    planning against 0.2 ms, roughly half the statement.
+
+    The form matters -- subscripting the list inside the predicate is not
+    something the index can serve -- so the plan is checked as well as the cost.
+    """
+    from psycopg import sql
+
+    vec_store.upsert_nodes(
+        [EntityNode(name=f"m{i}", label="MOUSE") for i in range(200)]
+    )
+
+    def planning_ms(count: int) -> float:
+        query, params = vec_store._build_get(
+            None, [f"m{i}" for i in range(count)]
+        )
+        with vec_store.connection.cursor() as cur:
+            cur.execute((sql.SQL("EXPLAIN (ANALYZE) ") + query).as_string(cur), params)
+            rows = [r[0] for r in cur.fetchall()]
+        vec_store.connection.rollback()
+        return min(
+            float(r.split(":")[1].split("ms")[0]) for r in rows if "Planning Time" in r
+        )
+
+    one = planning_ms(1)
+    many = planning_ms(200)
+    # Generous: the point is that it does not grow with the list, and the OR form
+    # was 16x here for the same step.
+    assert many < one * 4 + 1.0, f"planning grew from {one:.2f} ms to {many:.2f} ms"
+
+    query, params = vec_store._build_get(None, [f"m{i}" for i in range(200)])
+    plan = _plan_noseqscan(vec_store.connection, query, params)
+    assert "MOUSE_unique_id" in plan
+
+
+def test_reading_many_ids_returns_them(vec_store: AgensPropertyGraphStore):
+    """The rewrite must still answer the same question."""
+    vec_store.upsert_nodes(
+        [EntityNode(name=f"r{i}", label="RAT") for i in range(50)]
+    )
+    got = vec_store.get(ids=[f"RAT_r{i}" for i in range(0)])
+    assert got == []
+    ids = [n.id for n in vec_store.get(properties={"name": "r7"})]
+    assert len(ids) == 1
+    assert {n.name for n in vec_store.get(ids=ids)} == {"r7"}

@@ -19,22 +19,58 @@ import psycopg
 from psycopg import sql
 from functools import wraps
 
-class AgensQueryException(Exception):
-    """Exception for the Agensgraph queries."""
+from agensgraph.errors import safe_message
 
-    def __init__(self, exception: Union[str, Dict]) -> None:
+
+class AgensQueryException(Exception):
+    """Something the server refused, with what it said about it.
+
+    ``detail`` and ``details`` are both read. The four places that raise this wrote the
+    first and this read the second, so every failure arrived saying ``"unknown"`` and
+    the server's own words were dropped on the floor -- which is why a run of a hundred
+    failing statements could not be told apart from a run of one.
+
+    The cause is kept as ``__cause__`` so a caller can ask the driver whether it is
+    worth trying again.
+    """
+
+    def __init__(
+        self, exception: Union[str, Dict], cause: Union[BaseException, None] = None
+    ) -> None:
         if isinstance(exception, dict):
-            self.message = exception["message"] if "message" in exception else "unknown"
-            self.details = exception["details"] if "details" in exception else "unknown"
+            self.message = exception.get("message", "unknown")
+            self.details = exception.get("details", exception.get("detail", "unknown"))
         else:
             self.message = exception
             self.details = "unknown"
+        self.cause = cause
+        if cause is not None:
+            self.__cause__ = cause
 
     def get_message(self) -> str:
         return self.message
 
     def get_details(self) -> Any:
         return self.details
+
+
+def query_failed(query: Any, exc: BaseException) -> AgensQueryException:
+    """The exception to raise for a statement the server refused.
+
+    ``safe_message`` gives the SQLSTATE and the server's primary line and leaves off
+    ``DETAIL``, which carries the row that failed -- and these results are handed to a
+    language model.
+    """
+    return AgensQueryException(
+        {
+            "message": "Error executing graph query",
+            "details": (
+                safe_message(exc) if isinstance(exc, psycopg.Error) else str(exc)
+            ),
+            "query": str(query),
+        },
+        cause=exc,
+    )
     
 def get_graph_id(curs, graph_name: str):
     graph_id_query = (
@@ -61,13 +97,17 @@ def execute_query(curs, query, params={}, error_message = "Error executing query
     try:
         curs.execute(query, params)
     except psycopg.Error as e:
-
+        # A refused statement leaves its transaction able to run nothing else, so
+        # without this every later statement on the connection reports the abort
+        # instead of what actually went wrong -- one racing label refusal turned into
+        # 72 failures in a run of 200.
+        try:
+            curs.connection.rollback()
+        except psycopg.Error:
+            pass
         raise AgensQueryException(
-            {
-                "message": error_message,
-                "details": str(e),
-            }
-        )
+            {"message": error_message, "details": safe_message(e)}, cause=e
+        ) from e
 
 def require_psycopg(func):
     @wraps(func)

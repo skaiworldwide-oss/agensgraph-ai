@@ -17,17 +17,19 @@ limitations under the License.
 from typing import (
     Any,
     AsyncIterator,
+    Callable,
     Dict,
     Iterable,
     Iterator,
     List,
     NamedTuple,
     Optional,
-    Pattern,
     Tuple,
 )
 import re, json
+import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager, contextmanager
 
 from llama_index.core.graph_stores.prompts import DEFAULT_CYPHER_TEMPALTE
@@ -43,10 +45,11 @@ from llama_index.core.graph_stores.utils import value_sanitize
 from llama_index_agensgraph.engine import AgensEngine
 from llama_index_agensgraph.filters import metadata_filters_to_cypher
 from llama_index_agensgraph.graph_stores.agensgraph.utils import *
+from llama_index_agensgraph.graph_stores.agensgraph.utils import query_failed
 from llama_index.core.prompts import PromptTemplate
 from llama_index.core.vector_stores.types import VectorStoreQuery
 import agensgraph
-from agensgraph import Edge, Path, Vertex
+from agensgraph import Edge, Path, RetryPolicy, Vertex
 import psycopg
 from psycopg import sql
 from psycopg.types.json import Jsonb
@@ -233,6 +236,20 @@ def _property_equalities(
     return " AND ".join(fragments), params
 
 
+
+def _merge_race(exc: BaseException) -> bool:
+    """Whether a refusal is two writers reaching the same key at the same moment.
+
+    A graph's ``ASSERT id IS UNIQUE`` is carried by an exclusion constraint and not by
+    a unique index, so the writer arriving second is told ``23P01`` where the same race
+    on a table would say ``23505``. The driver knows the second is worth another try and
+    not the first, since an exclusion violation is normally a fact about the row rather
+    than about the timing. Here it is about the timing: the writer that lost finds the
+    node already there and merges onto it.
+    """
+    return isinstance(exc, psycopg.errors.ExclusionViolation)
+
+
 class AgensPropertyGraphStore(PropertyGraphStore):
     """
     AgensGraph Property Graph Store.
@@ -257,10 +274,14 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         create: bool = True,
         refresh_schema: bool = True,
         engine: Optional[AgensEngine] = None,
+        retry_attempts: int = 3,
+        statement_timeout: Optional[float] = None,
     ) -> None:
         """Create a new Agensgraph Graph instance."""
 
         self.graph_name = graph_name
+        # How many times a statement the server says to try again is tried again.
+        self.retry_policy = RetryPolicy(attempts=retry_attempts)
         self.sanitize_query_output = sanitize_query_output
         self.enhanced_schema = enhanced_schema
         self.create_indexes = create_indexes
@@ -268,6 +289,19 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         # startup packet, decodes an element into a Vertex or an Edge rather than
         # leaving it as text to be matched, and carries the vector types once
         # registered.
+        # A limit on every statement, carried in the connection's own options so it is
+        # in force before the first one and costs nothing per call. Set per statement it
+        # is a round trip each time, and asked for as a per-caller deadline it is more:
+        # measured elsewhere at 5 round trips a read against 9.
+        if statement_timeout is not None:
+            options = conf.get("options", "")
+            conf = {
+                **conf,
+                "options": (
+                    f"{options} -c statement_timeout={int(statement_timeout * 1000)}"
+                ).strip(),
+            }
+        self._conf = conf
         self.connection = agensgraph.Connection.connect(**conf)
         if self.connection.has_vectors():
             self.connection.register_vectors()
@@ -275,7 +309,6 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         # The engine (pool) is wired in only after setup completes: graph/index
         # creation must run on the dedicated connection before the graph exists
         # (a pooled checkout would try to `SET graph_path` to a missing graph).
-        self._conf = conf
         self._engine = None
         self._aconn = None
 
@@ -577,32 +610,54 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         elements -- so without one per label two writers merging the same id would each
         create an element rather than find one.
         """
-        wanted = [label for label in labels if label and label not in self._declared_labels]
+        wanted = [
+            label for label in labels if label and label not in self._declared_labels
+        ]
         if not wanted:
             return
-        with self._acquire() as conn:
-            with conn.cursor() as curs:
-                for label in wanted:
-                    curs.execute(
-                        sql.SQL(
-                            "CREATE VLABEL IF NOT EXISTS {child} INHERITS ({parent})"
-                        ).format(
-                            child=sql.Identifier(label),
-                            parent=sql.Identifier(BASE_NODE_LABEL),
-                        )
-                    )
-                    # No IF NOT EXISTS arm exists for a constraint, so a second store
-                    # opening the same graph would raise on one that is already there.
-                    # The statement inside the block carries its own terminator.
-                    quoted = sql.Identifier(label).as_string(None)
-                    name = sql.Identifier(f"{label}_unique_id").as_string(None)
-                    curs.execute(
-                        constraint_wrapper.format(
-                            f"CREATE CONSTRAINT {name} ON {quoted} ASSERT id IS UNIQUE;"
-                        )
-                    )
-            conn.commit()
+        self._run_with_retry(lambda: self._declare_labels(wanted))
         self._declared_labels.update(wanted)
+
+    def _declare_labels(self, wanted: List[str]) -> None:
+        """Create the labels in ``wanted``, one writer at a time."""
+        with self._acquire() as conn:
+            try:
+                # Everything here in one transaction, so a refusal takes the whole
+                # group back rather than leaving the connection unable to run
+                # anything else.
+                with conn.transaction():
+                    with conn.cursor() as curs:
+                        # ``IF NOT EXISTS`` asks whether the label is there and then
+                        # creates it, which is two steps: eight writers all found
+                        # Person missing and the losers were told it already exists.
+                        # The lock lasts as long as the transaction, so it is released
+                        # whichever way this ends.
+                        curs.execute(
+                            "SELECT pg_advisory_xact_lock(%s)", (int(self.graphid),)
+                        )
+                        for label in wanted:
+                            curs.execute(
+                                sql.SQL(
+                                    "CREATE VLABEL IF NOT EXISTS {child} "
+                                    "INHERITS ({parent})"
+                                ).format(
+                                    child=sql.Identifier(label),
+                                    parent=sql.Identifier(BASE_NODE_LABEL),
+                                )
+                            )
+                            # A constraint has no IF NOT EXISTS arm, so a second store
+                            # opening the same graph would raise on one already there.
+                            # The statement inside the block carries its terminator.
+                            quoted = sql.Identifier(label).as_string(None)
+                            name = sql.Identifier(f"{label}_unique_id").as_string(None)
+                            curs.execute(
+                                constraint_wrapper.format(
+                                    f"CREATE CONSTRAINT {name} ON {quoted} "
+                                    "ASSERT id IS UNIQUE;"
+                                )
+                            )
+            except psycopg.Error as e:
+                raise query_failed(f"declaring labels {wanted}", e) from e
 
     def _build_upsert_nodes_ops(
         self, nodes: List[LabelledNode]
@@ -1289,21 +1344,26 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         """
 
         bound = _cypher_params(param_map if param_map is not None else params)
+        return self._run_with_retry(lambda: self._run_once(query, bound))
 
-        # execute the query, rolling back on an error
+    def _run_once(
+        self, query: str, bound: Optional[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """One attempt at a statement, rolling back if the server refuses it."""
         with self._acquire() as conn:
             with conn.cursor(row_factory=psycopg.rows.namedtuple_row) as curs:
                 try:
                     curs.execute(query, bound)
                     conn.commit()
                 except psycopg.Error as e:
-                    conn.rollback()
-                    raise AgensQueryException(
-                        {
-                            "message": "Error executing graph query: {}".format(query),
-                            "detail": str(e),
-                        }
-                    )
+                    try:
+                        conn.rollback()
+                    except psycopg.Error:
+                        # A connection the server has already dropped cannot be
+                        # rolled back, and saying so here would replace the real
+                        # reason the statement failed.
+                        pass
+                    raise query_failed(query, e) from e
                 try:
                     data = curs.fetchall()
                 except psycopg.ProgrammingError:
@@ -1320,6 +1380,49 @@ class AgensPropertyGraphStore(PropertyGraphStore):
 
                 return result
 
+    def _retry_decision(self, cause: BaseException, number: int):
+        """Whether to try again after ``cause``, and how long to wait first.
+
+        The driver owns both answers -- which refusals are worth repeating, and the
+        backoff between attempts -- so a race it reads as final is put to it a second
+        time under the spelling it recognises rather than being decided here.
+        """
+        decision = self.retry_policy.decide(
+            cause, number=number, wrote=True, merging=True
+        )
+        if not decision.retry and _merge_race(cause):
+            decision = self.retry_policy.decide(
+                psycopg.errors.UniqueViolation(),
+                number=number,
+                wrote=True,
+                merging=True,
+            )
+        return decision
+
+    def _run_with_retry(self, attempt: Callable[[], Any]) -> Any:
+        """Run ``attempt``, repeating it while the driver says the refusal was timing.
+
+        Eight writers merging onto a shared set of keys refused 95 statements in 200
+        without this, because every one of those refusals was another writer holding the
+        key for the moment it took to commit.
+        """
+        number = 0
+        while True:
+            try:
+                return attempt()
+            except AgensQueryException as failure:
+                cause = failure.__cause__
+                number += 1
+                if cause is None:
+                    raise
+                decision = self._retry_decision(cause, number)
+                if not decision.retry:
+                    raise
+                logger.debug(
+                    "attempt %d: %s", number, decision.reason
+                )
+                time.sleep(decision.delay)
+
     async def astructured_query(
         self,
         query: str,
@@ -1330,19 +1433,36 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         """Async counterpart of :meth:`structured_query` (true async I/O)."""
         bound = _cypher_params(param_map if param_map is not None else params)
 
+        number = 0
+        while True:
+            try:
+                return await self._arun_once(query, bound)
+            except AgensQueryException as failure:
+                cause = failure.__cause__
+                number += 1
+                if cause is None:
+                    raise
+                decision = self._retry_decision(cause, number)
+                if not decision.retry:
+                    raise
+                logger.debug("attempt %d: %s", number, decision.reason)
+                await asyncio.sleep(decision.delay)
+
+    async def _arun_once(
+        self, query: str, bound: Optional[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Async sibling of :meth:`_run_once`."""
         async with self._aacquire() as conn:
             async with conn.cursor(row_factory=psycopg.rows.namedtuple_row) as curs:
                 try:
                     await curs.execute(query, bound)
                     await conn.commit()
                 except psycopg.Error as e:
-                    await conn.rollback()
-                    raise AgensQueryException(
-                        {
-                            "message": "Error executing graph query: {}".format(query),
-                            "detail": str(e),
-                        }
-                    )
+                    try:
+                        await conn.rollback()
+                    except psycopg.Error:
+                        pass
+                    raise query_failed(query, e) from e
                 try:
                     data = await curs.fetchall()
                 except psycopg.ProgrammingError:

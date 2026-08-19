@@ -77,6 +77,20 @@ AgensGraph dialect — these differ from Neo4j and matter:
 - Prefer an untyped relationship (a)-[r]->(b) and read type(r) unless the exact
   relationship type appears in the schema.
 
+Indexes — the schema lists them; write predicates they can serve:
+- Compare the raw property. A cast (n.x::int4), arithmetic (n.x + 1) or coalesce()
+  around an indexed property forces a full label read; jsonb already compares
+  numbers numerically, so n.age > 30 is right when age holds numbers.
+- Match the stored type exactly: a number property compares to 30, not '30' — the
+  wrong type returns zero rows without an error.
+- Prefix match as a half-open range: n.name >= 'Al' AND n.name < 'Am'.
+  STARTS WITH, CONTAINS, ENDS WITH and =~ never use an index.
+- Case-insensitive equality: tolower(n.prop) = 'x', when the schema lists an index
+  ON ((tolower(prop))).
+- Avoid <>: enumerate the values you DO want with IN [...].
+- ORDER BY an indexed property with LIMIT is served by the index, and
+  id(n) = 'N.M' is the fastest lookup of all.
+
 Hard rules:
 - Read-only: MATCH / OPTIONAL MATCH / WHERE / WITH / RETURN / ORDER BY / SKIP / LIMIT.
   Never CREATE / MERGE / SET / DELETE / REMOVE / DROP / DETACH / LOAD.
@@ -235,9 +249,8 @@ DIALECT_EXAMPLES: Tuple[Tuple[str, str], ...] = (
         "WHERE c.name = 'Acme' RETURN p.name AS name LIMIT 10",
     ),
     (
-        "Which people are named exactly 'Ada'? Match with a regular expression.",
-        'MATCH (p:"Person") WHERE p.name =~ \'^Ada$\' '
-        "RETURN p.name AS name LIMIT 10",
+        "Which person is named exactly 'Ada'?",
+        "MATCH (p:\"Person\") WHERE p.name = 'Ada' RETURN p.name AS name LIMIT 10",
     ),
     (
         "Which titles contain the word graph?",
@@ -245,9 +258,9 @@ DIALECT_EXAMPLES: Tuple[Tuple[str, str], ...] = (
         "RETURN b.title AS title LIMIT 10",
     ),
     (
-        "Ages are stored as strings. Who is older than 30?",
-        'MATCH (p:"Person") WHERE p.age::int4 > 30 '
-        "RETURN p.name AS name, p.age::int4 AS age ORDER BY age DESC LIMIT 10",
+        "Who is older than 30?",
+        'MATCH (p:"Person") WHERE p.age > 30 '
+        "RETURN p.name AS name, p.age AS age ORDER BY age DESC LIMIT 10",
     ),
     (
         "Return the vertex whose graph id is 3.1.",
@@ -284,15 +297,45 @@ DIALECT_EXAMPLES: Tuple[Tuple[str, str], ...] = (
         'MATCH (i:"Item") LET doubled = i.price * 2 FILTER doubled > 100 '
         "RETURN i.name AS name, doubled LIMIT 10",
     ),
+    (
+        "Which products have a name starting with Pro?",
+        "MATCH (p:\"Product\") WHERE p.name >= 'Pro' AND p.name < 'Prp' "
+        "RETURN p.name AS name LIMIT 10",
+    ),
+    (
+        "Which people are named Ada or Bob?",
+        "MATCH (p:\"Person\") WHERE p.name IN ['Ada', 'Bob'] "
+        "RETURN p.name AS name LIMIT 10",
+    ),
+    (
+        "Find the person named ada, whatever the letter case.",
+        "MATCH (p:\"Person\") WHERE tolower(p.name) = 'ada' "
+        "RETURN p.name AS name LIMIT 10",
+    ),
+    (
+        "The five cheapest items with their prices.",
+        'MATCH (i:"Item") RETURN i.name AS name, i.price AS price '
+        "ORDER BY price LIMIT 5",
+    ),
+    (
+        "Which codes are exactly three digits? Use a pattern.",
+        "MATCH (c:\"Code\") WHERE c.value =~ '^[0-9]{3}$' "
+        "RETURN c.value AS value LIMIT 10",
+    ),
 )
 """Question-and-query pairs that teach the dialect's sharpest edges.
 
 Each pair exists because a model reaching for its habits gets that case wrong
-here: unquoted labels fold to lower case, ``=~`` matches substrings unless
-anchored, ``count()`` takes an argument or ``*``, a graph id is ``labid.locid``,
-integer conversion is a ``::int4`` cast, ``substring`` starts at zero, and a
-list-iteration binding is ``LET``. The last pair uses LET and FILTER, which a
-server before 2.18 does not accept.
+here — wrong rows, or right rows off a full label read. Unquoted labels fold to
+lower case; ``count()`` takes an argument or ``*``; a graph id is
+``labid.locid``; ``substring`` starts at zero. And the index-serving spellings:
+compare the raw property (a cast or arithmetic around it reads the whole
+label), write a prefix match as a half-open range, use ``tolower(prop) =``
+against its expression index for case-insensitive lookups, enumerate values
+with ``IN``, and let ``ORDER BY prop LIMIT k`` ride the index. A regex is for
+questions that genuinely need a pattern; ``CONTAINS`` is correct dialect for
+infix matching and has no index-served form at all. The LET/FILTER pair needs
+a 2.18 server.
 
 Pass to :class:`AgensCypherQAChain` or ``AgensText2CypherRetriever`` as
 ``examples=DIALECT_EXAMPLES``.

@@ -162,6 +162,28 @@ class TestPrompt:
     def test_prompt_parameterizes_the_row_limit(self):
         assert "{top_k}" in CYPHER_SYSTEM
 
+    @pytest.mark.parametrize(
+        "rule",
+        [
+            "Compare the raw property",
+            "Match the stored type exactly",
+            "half-open range",
+            "tolower(n.prop)",
+            "ORDER BY an indexed property with LIMIT",
+        ],
+    )
+    def test_prompt_states_the_index_rules(self, rule):
+        assert rule in CYPHER_SYSTEM
+
+    def test_the_pack_teaches_no_property_wrapping(self):
+        # The two forms the sargability measurements ruled out: a cast or
+        # arithmetic around an indexed property has no index path at all.
+        from langchain_agensgraph.chains.cypher_qa import DIALECT_EXAMPLES
+
+        taught = " ".join(cypher for _q, cypher in DIALECT_EXAMPLES)
+        assert "::int4" not in taught
+        assert "::float8" not in taught
+
 
 class TestFewShotExamples:
     """Example pairs become real conversation turns ahead of the question."""

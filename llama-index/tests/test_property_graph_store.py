@@ -321,15 +321,22 @@ def test_14_structured_query(agens_store: AgensPropertyGraphStore):
     e1 = EntityNode(label="PERSON", name="Alice")
     agens_store.upsert_nodes([e1])
 
-    # Custom query
+    # An element's type is the label it is written on, so a query asks for it with
+    # label(n) rather than reading a list kept beside the properties.
     query = """
     MATCH (n) WHERE n.name = 'Alice'
-    RETURN n.name AS node_name, n.labels AS node_labels
+    RETURN n.name AS node_name, label(n) AS node_label
     """
     result = agens_store.structured_query(query)
     assert len(result) == 1
     assert result[0]["node_name"] == "Alice"
-    assert "PERSON" in result[0]["node_labels"]
+    assert result[0]["node_label"] == "PERSON"
+
+    # and the label is a real one, so a match on it reads only that type
+    typed = agens_store.structured_query(
+        'MATCH (n:"PERSON") RETURN count(*) AS c'
+    )
+    assert typed[0]["c"] >= 1
 
 
 def test_15_refresh_schema(agens_store: AgensPropertyGraphStore):

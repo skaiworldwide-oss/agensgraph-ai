@@ -18,6 +18,7 @@ from typing import (
     Any,
     AsyncIterator,
     Dict,
+    Iterable,
     Iterator,
     List,
     NamedTuple,
@@ -50,6 +51,11 @@ from psycopg.types.json import Jsonb
 
 BASE_ENTITY_LABEL = "__Entity__"
 BASE_NODE_LABEL = "__Node__"
+CHUNK_LABEL = "Chunk"
+# Every element is written on the label naming what it is, and each of those inherits
+# from BASE_NODE_LABEL. A match on the parent still reaches all of them, so a read that
+# wants everything is unchanged, while `label(n)` answers what a thing is and a match on
+# one type reads only that type's storage.
 EXHAUSTIVE_SEARCH_LIMIT = 10000
 # Threshold for returning all available prop values in graph schema
 DISTINCT_VALUE_LIMIT = 10
@@ -57,75 +63,10 @@ CHUNK_SIZE = 1000
 # Max example values kept per property in the enhanced schema.
 ENHANCED_MAX_EXAMPLES = 5
 VECTOR_INDEX_NAME = "entity"
-# A scalar copy of each node's primary type (the EntityNode label, or 'Chunk'),
-# btree-indexed so `WHERE n.__type__ = 'X'` is an index scan. The type also lives
-# in the jsonb `labels` list, but `'X' IN n.labels` cannot use an index.
-TYPE_PROPERTY = "__type__"
 LONG_TEXT_THRESHOLD = 52
 
-# Since we do not support multiple labels, we will maintain the extra labels as a list
-# This function will be used in queries to append new labels to the existing list
-# and ensure that the labels are unique
-append_label_function = """
-    CREATE OR REPLACE FUNCTION append_label(labels jsonb, new_label text) 
-    RETURNS jsonb AS $$
-    BEGIN
-        IF labels IS NULL OR jsonb_typeof(labels) <> 'array' THEN
-            labels := '[]'::jsonb;
-        END IF;
 
-        IF NOT labels @> to_jsonb(new_label) THEN
-            RETURN labels || jsonb_build_array(new_label);
-        ELSE
-            RETURN labels;
-        END IF;
-    END;
-    $$ LANGUAGE plpgsql;
 
-"""
-
-label_catalog = """
-CREATE TABLE IF NOT EXISTS label_catalog (
-    graph_id oid PRIMARY KEY,
-    labels jsonb DEFAULT '[]'::jsonb
-);
-
-"""
-
-track_labels = """
-CREATE OR REPLACE FUNCTION track_labels()
-RETURNS TRIGGER AS $$
-DECLARE
-    graphid OID := {}::oid;
-    new_labels JSONB;
-BEGIN
-    INSERT INTO label_catalog (graph_id, labels)
-    VALUES (graphid, '[]'::jsonb)
-    ON CONFLICT (graph_id) DO NOTHING;
-
-    IF NEW.properties ? 'labels' THEN
-        new_labels := NEW.properties->'labels';
-        new_labels := (
-            SELECT jsonb_agg(elems)
-            FROM jsonb_array_elements_text(new_labels) AS elems
-            WHERE elems NOT IN ('__Node__', '__Entity__')
-        );
-    ELSE
-        new_labels := '[]'::jsonb;
-    END IF;
-
-    UPDATE label_catalog
-    SET labels = (
-        SELECT jsonb_agg(DISTINCT elems)
-        FROM jsonb_array_elements(COALESCE(labels, '[]'::jsonb) || COALESCE(new_labels, '[]'::jsonb)) AS elems
-    )
-    WHERE graph_id = graphid;
-
-    RETURN NEW;
-END;
-$$ LANGUAGE plpgsql;
-
-"""
 
 # Collect the DISTINCT *types* per property rather than the DISTINCT *values*.
 # Deduplicating values forced the server to materialize (and ship) every
@@ -135,10 +76,8 @@ $$ LANGUAGE plpgsql;
 # separately, with a bound, when ``enhanced_schema`` is enabled).
 node_properties_query = f"""
     MATCH (a:"{BASE_NODE_LABEL}")
-    UNWIND a.labels AS label
     UNWIND keys(properties(a)) AS prop
-    WITH label, prop, typeof(properties(a)[prop]) AS vtype
-    WHERE prop != 'labels' AND prop != '__type__' AND label != '{BASE_ENTITY_LABEL}'
+    WITH label(a) AS label, prop, typeof(properties(a)[prop]) AS vtype
     WITH label, prop AS property, COLLECT(DISTINCT vtype) AS types
     RETURN label, COLLECT({{'property': property, 'type': types[0]}}) as props;
 """
@@ -152,14 +91,10 @@ edge_properties_query = f"""
     RETURN label, COLLECT(DISTINCT {{'property': property, type: types[0]}}) as props;
 """
 
-rel_query = f"""
+rel_query = """
     MATCH (start_node)-[r]->(end_node)
-    WITH DISTINCT start_node.labels AS start_labels, type(r) AS relationship_type, end_node.labels AS end_labels
-    UNWIND start_labels AS start_label
-    UNWIND end_labels AS end_label
-    WITH DISTINCT start_label, relationship_type, end_label
-    WHERE start_label != '{BASE_ENTITY_LABEL}' AND end_label != '{BASE_ENTITY_LABEL}'
-    RETURN {{start: start_label, type: relationship_type, end: end_label}} AS output
+    RETURN DISTINCT
+        {start: label(start_node), type: type(r), end: label(end_node)} AS output
 """
 
 constraint_wrapper = """
@@ -201,22 +136,22 @@ typeof_function = r"""
 
 logger = logging.getLogger(__name__)
 
-# Default Text2Cypher prompt tuned for this store's storage model. LlamaIndex's
-# generic DEFAULT_CYPHER_TEMPALTE assumes Neo4j-style labels and makes the LLM emit
-# Cypher this store cannot run -- every node lives on one "__Node__" vertex label
-# with its entity type held in a `labels` list, so `(:Person)` matches nothing, and
-# AgensGraph rejects Neo4j-only constructs. This template teaches that model.
+# Default Text2Cypher prompt for this store. LlamaIndex's generic
+# DEFAULT_CYPHER_TEMPALTE does not describe what this store rejects: AgensGraph wants a
+# label double-quoted and refuses the Neo4j-only constructs that template invites, so a
+# model given it writes Cypher that does not run. This one says how an element is
+# stored and what the dialect will not take.
 AGENS_CYPHER_TEMPLATE_STR = """\
 Task: generate a single read-only AgensGraph (openCypher) query to answer the question.
 
 How this graph is stored (important):
-- EVERY node uses one vertex label: "__Node__". Match nodes as (n:"__Node__").
-- The entity TYPES in the schema below (e.g. Person, Organization) are NOT Cypher
-  labels -- they are string values held in each node's `labels` list property. To
-  restrict to a type, filter the list: WHERE 'Person' IN n.labels.
+- An entity's TYPE is its vertex label, written double-quoted: match a person as
+  (n:"Person"). The types available are the ones in the schema below.
+- Every type inherits from "__Node__", so (n:"__Node__") matches an element of any
+  type, and label(n) returns the type of one.
 - The human-readable name of an entity is the property n.name; other properties are
   as named in the schema.
-- Relationship TYPES are real edge labels: write them double-quoted, e.g.
+- Relationship TYPES are edge labels, also double-quoted, e.g.
   (a)-[r:"WORKS_AT"]->(b), or use an untyped (a)-[r]->(b) and read type(r). Use only
   relationship types shown in the schema.
 
@@ -236,13 +171,12 @@ Hard rules:
 
 Examples:
   Q: Which authors have the most papers?
-  MATCH (a:"__Node__") WHERE 'Author' IN a.labels
-  MATCH (a)<-[:"AUTHORED_BY"]-(p:"__Node__")
+  MATCH (a:"Author")<-[:"AUTHORED_BY"]-(p)
   RETURN a.name AS author, count(*) AS papers ORDER BY papers DESC LIMIT 10
 
   Q: How many entities of each type?
-  MATCH (n:"__Node__") UNWIND n.labels AS t WITH t WHERE t <> '__Entity__'
-  RETURN t AS type, count(*) AS n ORDER BY n DESC LIMIT 50
+  MATCH (n:"__Node__")
+  RETURN label(n) AS type, count(*) AS n ORDER BY n DESC LIMIT 50
 
 Schema:
 {schema}
@@ -355,6 +289,9 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 graphid = get_graph_id(curs, graph_name)
 
             self.graphid = graphid
+            # Element labels this store has already declared, so a repeated
+            # write does not re-issue the DDL.
+            self._declared_labels: set = {BASE_NODE_LABEL}
             set_graph_path(curs, graph_name)
 
             # One builder at a time. Every one of the statements below is a CREATE OR
@@ -367,14 +304,14 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 "SELECT pg_advisory_xact_lock(%s)", (int(self.graphid),)
             )
 
-            # Create functions, triggers and catalog to handle multiple labels
-            execute_query(curs, append_label_function)
-            execute_query(curs, label_catalog)
-            execute_query(curs, track_labels.format(self.graphid))
+            # `typeof` is what the schema read asks a value's type with. The label
+            # list this used to keep, and the catalog and trigger that maintained it,
+            # are gone: an element is written on the label naming what it is.
             execute_query(curs, typeof_function)
             execute_query(curs, sql.SQL("CREATE VLABEL IF NOT EXISTS {};").format(
                 sql.Identifier(BASE_NODE_LABEL)
             ))
+
             self.connection.commit()
 
         # Schema introspection scans every node's properties (O(N)). With
@@ -401,9 +338,15 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                         ASSERT id IS UNIQUE;"""
                 )
             )
-            # btree on the scalar primary type so `WHERE n.__type__ = 'X'` is
-            # index-backed instead of a full __Node__ scan.
-            self.create_property_index(TYPE_PROPERTY)
+            # A chunk is written on its own label like anything else, and a constraint
+            # on the base label does not reach a child -- so without this, reading a
+            # chunk by id has no index to use and two writers can make two of one.
+            self._ensure_element_labels([CHUNK_LABEL])
+            # Nothing indexes the type: an element is written on the label naming it,
+            # so asking for one type reads that label's storage and nothing else.
+            # Measured on twenty thousand of each of two types, counting one of them:
+            # 248 buffers by label against 495 through a btree over a scalar copy,
+            # which also cost a property in every element and an index on every write.
             if self._supports_vector_index:
                 # The HNSW index expression must match what the Cypher vector
                 # query emits (n.embedding::vector(N)) for the planner to use it.
@@ -427,14 +370,10 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                     )
                 )
 
-        # Also add constraint to ensure that labels property is always a jsonb array
-        self.structured_query(
-            constraint_wrapper.format(
-                f"""CREATE CONSTRAINT labels_array
-                    ON "{BASE_NODE_LABEL}"
-                    ASSERT jsonb_typeof(properties->'labels') = 'array';"""
-            )
-        )
+        # An element says what it is by the label it is written on, so there is no list
+        # to assert the shape of. The assertion that stood here read
+        # `properties->'labels'` against a map that is already the properties, so it
+        # asked about `properties.properties.labels` and never held anything back.
 
         # Setup is done; runtime queries may now use the pool.
         self._engine = engine
@@ -621,6 +560,46 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             ]
         )
 
+    def _ensure_element_labels(self, labels: Iterable[str]) -> None:
+        """Declare the labels about to be written, once per store.
+
+        A label is an identifier and cannot be a parameter, so a write is grouped by it
+        and the label has to exist first. Each inherits from the base label: a read that
+        matches the parent still sees every element, which is what leaves the rest of
+        this class's statements alone.
+
+        Each also carries its own uniqueness on ``id``. A constraint on the parent does
+        not reach a child -- measured, the same id written to two child labels gave two
+        elements -- so without one per label two writers merging the same id would each
+        create an element rather than find one.
+        """
+        wanted = [label for label in labels if label and label not in self._declared_labels]
+        if not wanted:
+            return
+        with self._acquire() as conn:
+            with conn.cursor() as curs:
+                for label in wanted:
+                    curs.execute(
+                        sql.SQL(
+                            "CREATE VLABEL IF NOT EXISTS {child} INHERITS ({parent})"
+                        ).format(
+                            child=sql.Identifier(label),
+                            parent=sql.Identifier(BASE_NODE_LABEL),
+                        )
+                    )
+                    # No IF NOT EXISTS arm exists for a constraint, so a second store
+                    # opening the same graph would raise on one that is already there.
+                    # The statement inside the block carries its own terminator.
+                    quoted = sql.Identifier(label).as_string(None)
+                    name = sql.Identifier(f"{label}_unique_id").as_string(None)
+                    curs.execute(
+                        constraint_wrapper.format(
+                            f"CREATE CONSTRAINT {name} ON {quoted} ASSERT id IS UNIQUE;"
+                        )
+                    )
+            conn.commit()
+        self._declared_labels.update(wanted)
+
     def _build_upsert_nodes_ops(
         self, nodes: List[LabelledNode]
     ) -> List[Tuple[sql.Composed, Dict[str, Any]]]:
@@ -648,33 +627,34 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 ops.append((
                     sql.SQL("""
                     UNWIND %(chunked_params)s AS row
-                    MERGE (c:{BASE_NODE_LABEL} {{id: row.id}})
-                    SET c.text = row.text, c.labels = append_label(c.labels, 'Chunk')
+                    MERGE (c:{CHUNK_LABEL} {{id: row.id}})
+                    SET c.text = row.text
                     WITH c, row
-                    SET c += row.properties, c.embedding = row.embedding, c.__type__ = 'Chunk'
+                    SET c += row.properties, c.embedding = row.embedding
                     RETURN count(*)
                     """).format(
-                        BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL)
+                        CHUNK_LABEL=sql.Identifier(CHUNK_LABEL)
                     ), {"chunked_params": Jsonb(chunked_params)}
                 ))
 
-        if entity_dicts:
-            for index in range(0, len(entity_dicts), CHUNK_SIZE):
-                chunked_params = entity_dicts[index : index + CHUNK_SIZE]
+        # Grouped by label, because a label is an identifier and cannot be bound. The
+        # element carries its type by being written on it, so nothing appends to a list
+        # and nothing keeps a scalar copy of the label beside it.
+        by_label: Dict[str, List[dict]] = {}
+        for entity in entity_dicts:
+            by_label.setdefault(entity["label"], []).append(entity)
+
+        for label, entities in by_label.items():
+            for index in range(0, len(entities), CHUNK_SIZE):
+                chunked_params = entities[index : index + CHUNK_SIZE]
                 ops.append((
                     sql.SQL("""
                     UNWIND %(chunked_params)s AS row
-                    MERGE (e:{BASE_NODE_LABEL} {{id: row.id}})
+                    MERGE (e:{label} {{id: row.id}})
                     SET e += CASE WHEN row.properties IS NOT NULL THEN row.properties ELSE properties(e) END
-                    SET e.name = CASE WHEN row.name IS NOT NULL THEN row.name ELSE e.name END,
-                        e.labels = append_label(e.labels, {BASE_ENTITY_LABEL})
-                    WITH e, row
-                    SET e.labels = append_label(e.labels, row.label),
-                        e.__type__ = row.label
-                    """).format(
-                        BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL),
-                        BASE_ENTITY_LABEL=sql.Literal(BASE_ENTITY_LABEL)
-                    ), {"chunked_params": Jsonb(chunked_params)}
+                    SET e.name = CASE WHEN row.name IS NOT NULL THEN row.name ELSE e.name END
+                    """).format(label=sql.Identifier(label)),
+                    {"chunked_params": Jsonb(chunked_params)}
                 ))
                 # Write embeddings in a SEPARATE statement from the MENTIONS link
                 # below: AgensGraph does not persist an earlier SET when a later
@@ -683,12 +663,11 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 ops.append((
                     sql.SQL("""
                     UNWIND %(chunked_params)s AS row
-                    MATCH (e:{BASE_NODE_LABEL} {{id: row.id}})
+                    MATCH (e:{label} {{id: row.id}})
                     WHERE row.embedding IS NOT NULL
                     SET e.embedding = row.embedding
-                    """).format(
-                        BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL)
-                    ), {"chunked_params": Jsonb(chunked_params)}
+                    """).format(label=sql.Identifier(label)),
+                    {"chunked_params": Jsonb(chunked_params)}
                 ))
                 # Link each entity to its source chunk via MENTIONS, for the rows
                 # that carry a triplet_source_id.
@@ -696,22 +675,29 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                     sql.SQL("""
                     UNWIND %(chunked_params)s AS row
                     WITH row WHERE row.properties.triplet_source_id IS NOT NULL
-                    MATCH (e:{BASE_NODE_LABEL} {{id: row.id}})
-                    MERGE (c:{BASE_NODE_LABEL} {{id: row.properties.triplet_source_id}})
+                    MATCH (e:{label} {{id: row.id}})
+                    MERGE (c:{CHUNK_LABEL} {{id: row.properties.triplet_source_id}})
                     MERGE (e)<-[:"MENTIONS"]-(c)
                     """).format(
-                        BASE_NODE_LABEL=sql.Identifier(BASE_NODE_LABEL)
+                        label=sql.Identifier(label),
+                        CHUNK_LABEL=sql.Identifier(CHUNK_LABEL),
                     ), {"chunked_params": Jsonb(chunked_params)}
                 ))
 
         return ops
 
     def upsert_nodes(self, nodes: List[LabelledNode]) -> None:
+        self._ensure_element_labels(
+            item.label for item in nodes if isinstance(item, EntityNode)
+        )
         for query, params in self._build_upsert_nodes_ops(nodes):
             self.structured_query(query, params)
 
     async def aupsert_nodes(self, nodes: List[LabelledNode]) -> None:
         """True-async counterpart of :meth:`upsert_nodes`."""
+        self._ensure_element_labels(
+            item.label for item in nodes if isinstance(item, EntityNode)
+        )
         for query, params in self._build_upsert_nodes_ops(nodes):
             await self.astructured_query(query, params)
 
@@ -722,9 +708,15 @@ class AgensPropertyGraphStore(PropertyGraphStore):
 
         Relations are grouped by label and each group is UNWIND-batched in
         CHUNK_SIZE rows (the relationship type must be a literal in MERGE, so a
-        batch can only span one label). This replaces the previous
-        one-query-per-relation behavior; the batched ``MERGE (n {id: row.id})``
-        is still index-backed.
+        batch can only span one label). The batched ``MERGE (n {id: row.id})`` is
+        index-backed.
+
+        The endpoints are merged on the base label, which reaches an element of any
+        type because every element label inherits from it -- so a relation finds the
+        entity a caller wrote whatever type it was given. An endpoint that is not there
+        is created on the base label itself, carrying no type, since a relation names
+        only an id. Nodes are written before relations by the ingest that calls this,
+        so that is the out-of-order case rather than the ordinary one.
         """
         by_label: Dict[str, List[dict]] = {}
         for r in relations:
@@ -747,9 +739,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                     sql.SQL("""
                     UNWIND %(rows)s AS row
                     MERGE (source: {BASE_NODE_LABEL} {{id: row.source_id}})
-                    ON CREATE SET source.labels = append_label(source.labels, 'Chunk')
                     MERGE (target: {BASE_NODE_LABEL} {{id: row.target_id}})
-                    ON CREATE SET target.labels = append_label(target.labels, 'Chunk')
                     WITH source, target, row
                     MERGE (source)-[r:{label}]->(target)
                     SET r += row.properties
@@ -797,7 +787,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         """Build the (query, params) for :meth:`get`."""
         query = """SELECT t.name,
                             t.type,
-                            (t.properties - 'labels' - '__type__') - 'embedding' - 'id' AS properties
+                            t.properties - 'embedding' - 'id' AS properties
                      FROM ("""
         params: Dict[str, Any] = {}
         query += 'MATCH (e:{BASE_NODE_LABEL}) '
@@ -817,18 +807,9 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             params.update(prop_params)
 
         query += """
-            WITH e, e.labels as labels
             RETURN
             e.id AS name,
-            CASE
-                WHEN {BASE_ENTITY_LABEL} IN labels THEN
-                    CASE
-                        WHEN length(labels) > 2 THEN labels[2]
-                        WHEN length(labels) > 1 THEN labels[1]
-                        ELSE NULL
-                    END
-                ELSE labels[0]
-            END AS type,
+            label(e) AS type,
             properties(e) AS properties
         """
         query += ")t"
@@ -908,10 +889,10 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                         t.rel_prop,
                         t.source_id,
                         t.source_type,
-                        (t.source_properties - 'labels' - '__type__') - 'embedding' - 'name' AS source_properties,
+                        t.source_properties - 'embedding' - 'name' AS source_properties,
                         t.target_id,
                         t.target_type,
-                        (t.target_properties - 'labels' - '__type__') - 'embedding' - 'name' AS target_properties
+                        t.target_properties - 'embedding' - 'name' AS target_properties
                 FROM ("""
         query += "MATCH (e)-[r]->(t) "
 
@@ -919,7 +900,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         # combination nobody had tried emitted `AND AND` or two fragments with nothing
         # between them -- six of the fifteen combinations of these four arguments were
         # a syntax error, and the one test covering the method passes only entity_names.
-        predicates = ["{BASE_ENTITY_LABEL} IN e.labels"]
+        predicates = [f"label(e) <> '{CHUNK_LABEL}'"]
 
         if entity_names:
             frag, p = self._or_equalities("e.name", entity_names, "etn")
@@ -942,32 +923,14 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             predicates.append(frag)
             params.update(prop_params)
 
-        predicates.append("NOT ANY(label IN e.labels WHERE label = 'Chunk')")
         query += "WHERE " + " AND ".join(predicates) + " "
 
         query += """
-            WITH *, e.labels as e_labels, t.labels as t_labels
             RETURN type(r) as type, properties(r) as rel_prop, e.id as source_id,
-            CASE
-                WHEN {BASE_ENTITY_LABEL} IN e_labels THEN
-                    CASE
-                        WHEN length(e_labels) > 2 THEN e_labels[2]
-                        WHEN length(e_labels) > 1 THEN e_labels[1]
-                        ELSE NULL
-                    END
-                ELSE e_labels[0]
-            END AS source_type,
+            label(e) AS source_type,
             properties(e) AS source_properties,
             t.id as target_id,
-            CASE
-                WHEN {BASE_ENTITY_LABEL} IN t_labels THEN
-                    CASE
-                        WHEN length(t_labels) > 2 THEN t_labels[2]
-                        WHEN length(t_labels) > 1 THEN t_labels[1]
-                        ELSE NULL
-                    END
-                ELSE t_labels[0]
-            END AS target_type, properties(t) AS target_properties
+            label(t) AS target_type, properties(t) AS target_properties
             LIMIT %(triplet_limit)s
         """
 
@@ -1016,12 +979,12 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             return triples
         query = """SELECT t.source_id,
                             t.source_type,
-                            (t.source_properties - 'labels' - '__type__') - 'embedding' - 'id' AS source_properties,
+                            t.source_properties - 'embedding' - 'id' AS source_properties,
                             t.type,
                             t.rel_properties,
                             t.target_id,
                             t.target_type,
-                            (t.target_properties - 'labels' - '__type__') - 'embedding' - 'id' AS target_properties
+                            t.target_properties - 'embedding' - 'id' AS target_properties
                       FROM (
                 """
         # OR-of-equalities seed match uses the id index (BitmapOr), whereas the
@@ -1055,31 +1018,14 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             WITH startNode(rel) AS source,
                 type(rel) AS type,
                 rel AS rel_properties,
-                endNode(rel) AS endNode,
-                startNode(rel).labels AS source_labels,
-                endNode(rel).labels AS target_labels
+                endNode(rel) AS endNode
             RETURN source.id AS source_id,
-                CASE
-                    WHEN {BASE_ENTITY_LABEL} IN source_labels THEN
-                        CASE
-                            WHEN length(source_labels) > 2 THEN source_labels[2]
-                            WHEN length(source_labels) > 1 THEN source_labels[1]
-                            ELSE NULL
-                        END
-                    ELSE source_labels[0]
-                END AS source_type,
+                label(source) AS source_type,
                 properties(source) AS source_properties,
                 type,
                 properties(rel_properties) as rel_properties,
                 endNode.id AS target_id,
-                CASE
-                    WHEN {BASE_ENTITY_LABEL} IN target_labels THEN
-                        CASE
-                            WHEN length(target_labels) > 2 THEN target_labels[2]
-                            WHEN length(target_labels) > 1 THEN target_labels[1] ELSE NULL
-                        END
-                    ELSE target_labels[0]
-                END AS target_type,
+                label(endNode) AS target_type,
                 properties(endNode) AS target_properties
             LIMIT %(limit)s
             """
@@ -1180,25 +1126,17 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 SELECT
                     t.name,
                     t.type,
-                    (t.properties - 'labels' - '__type__') - 'embedding' - 'name' - 'id' AS properties,
+                    t.properties - 'embedding' - 'name' - 'id' AS properties,
                     t.similarity
                 FROM (
                     MATCH (n: {BASE_NODE_LABEL})
                     WHERE n.embedding IS NOT NULL {filter_clause}
-                    WITH n, n.labels AS labels,
+                    WITH n,
                          (n.embedding::vector({dim}) <=> %(query_embedding)s::vector({dim})) AS dist
                     RETURN n.id as name,
                            properties(n) AS properties,
                            (1 - dist) AS similarity,
-                           CASE
-                                WHEN {BASE_ENTITY_LABEL} IN labels THEN
-                                    CASE
-                                        WHEN length(labels) > 2 THEN labels[2]
-                                        WHEN length(labels) > 1 THEN labels[1]
-                                        ELSE NULL
-                                    END
-                                ELSE labels[0]
-                           END AS type
+                           label(n) AS type
                     ORDER BY dist
                     LIMIT %(top_k)s
                 )t;
@@ -1221,27 +1159,18 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             vector_query = """SELECT t.name,
                                 t.type,
                                 t.similarity,
-                                (t.properties - 'labels' - '__type__') - 'embedding' - 'name' - 'id' AS properties
+                                t.properties - 'embedding' - 'name' - 'id' AS properties
                             FROM (
                             """
             vector_query += """
                             MATCH (n: {BASE_NODE_LABEL})
                             WHERE n.embedding IS NOT NULL {filter_clause}
                             WITH n,
-                                n.labels AS labels,
                                 %(query_embedding)s::vector <=> n.embedding::vector AS cos_d
                             RETURN n.id as name,
                                 properties(n) AS properties,
                                 1-cos_d as similarity,
-                                CASE
-                                    WHEN {BASE_ENTITY_LABEL} IN labels THEN
-                                        CASE
-                                            WHEN length(labels) > 2 THEN labels[2]
-                                            WHEN length(labels) > 1 THEN labels[1]
-                                            ELSE NULL
-                                        END
-                                    ELSE labels[0]
-                                END AS type
+                                label(n) AS type
                             ORDER BY cos_d
                             LIMIT %(top_k)s
                             """
@@ -1505,7 +1434,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         # its embedding).
         rows = self.structured_query(
             sql.SQL(
-                "MATCH (a:{base_label}) WHERE a.__type__ = %(label)s RETURN count(*) AS c"
+                "MATCH (a:{base_label}) WHERE label(a) = %(label)s RETURN count(*) AS c"
             ).format(base_label=sql.Identifier(BASE_NODE_LABEL)),
             {"label": Jsonb(label)},
         )
@@ -1570,7 +1499,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             else sql.SQL("")
         )
         subquery = sql.SQL(
-            "MATCH (a:{base_label}) WHERE %(label)s IN a.labels AND a.{prop} IS NOT NULL "
+            "MATCH (a:{base_label}) WHERE label(a) = %(label)s AND a.{prop} IS NOT NULL "
             "RETURN a.{prop} AS v {limit}"
         ).format(
             base_label=sql.Identifier(BASE_NODE_LABEL),

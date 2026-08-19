@@ -7,9 +7,10 @@ retriever stack:
   - VectorContextRetriever — entity vector_query (HNSW) + get_rel_map expansion
   - TextToCypherRetriever  — NL → AgensGraph Cypher (custom dialect prompt)
 
-The Text2Cypher prompt is the AgensGraph-specific one in _common/cypher.py: the
-store keeps every node on "__Node__" with the entity type in a `labels` list, so
-the default LlamaIndex prompt (which emits (:Person)-style Cypher) does NOT work.
+The Text2Cypher prompt is the store's own, which teaches the dialect the default
+LlamaIndex one does not know. The generated statement runs in a transaction the
+server will not let write, so what it is allowed to do is the server's decision
+rather than a reading of the text.
 
     cd llama-index
     .venv/bin/python examples/demos/02_wikipedia_pgindex/ask.py
@@ -31,7 +32,10 @@ from llama_index.core.indices.property_graph import (
 from llama_index.core.query_engine import RetrieverQueryEngine
 
 from _common import agens, config, console
-from _common.cypher import SafeTextToCypherRetriever, read_only_validator
+from llama_index_agensgraph.retrievers import (
+    SafeTextToCypherRetriever,
+    strip_markdown,
+)
 from _common.models import EMBED_DIM, configure_settings, get_embed_model, get_llm
 
 GRAPH = "wikipedia_kg"
@@ -48,7 +52,7 @@ def text2cypher_demo(store, llm) -> None:
     t2c = SafeTextToCypherRetriever(
         graph_store=store,
         llm=llm,
-        cypher_validator=read_only_validator,
+        cypher_validator=strip_markdown,
     )
     for q in DEFAULT_QUESTIONS[:2]:
         console.sub(q)
@@ -67,7 +71,7 @@ def ask(index, llm, questions) -> None:
     )
     t2c = SafeTextToCypherRetriever(
         graph_store=store, llm=llm,
-        cypher_validator=read_only_validator,
+        cypher_validator=strip_markdown,
     )
     retriever = index.as_retriever(sub_retrievers=[syn, vec, t2c])
     qe = RetrieverQueryEngine.from_args(retriever, llm=llm)

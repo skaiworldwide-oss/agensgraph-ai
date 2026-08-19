@@ -50,6 +50,7 @@ from llama_index.core.prompts import PromptTemplate
 from llama_index.core.vector_stores.types import VectorStoreQuery
 import agensgraph
 from agensgraph import Edge, RetryPolicy, Vertex
+from agensgraph.cypher import check_single_statement
 from agensgraph.errors import safe_message
 from agensgraph.introspect import (
     MAX_IDENTIFIER,
@@ -256,6 +257,9 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         # Properties a caller has asked to be indexed, kept so a label
         # declared later is indexed on the way in.
         self._indexed_properties: set = set()
+        # Depth, not a flag: a caller's read-only block can hold another.
+        self._read_only_depth = 0
+        self._allow_server_programs = False
         self.sanitize_query_output = sanitize_query_output
         self.enhanced_schema = enhanced_schema
         self.create_indexes = create_indexes
@@ -1362,41 +1366,84 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         """
 
         bound = _cypher_params(param_map if param_map is not None else params)
+        if self._read_only_depth:
+            check_single_statement(str(query))
         return self._run_with_retry(lambda: self._run_once(query, bound))
+
+    @contextmanager
+    def read_only(self, *, allow_server_programs: bool = False) -> Iterator[None]:
+        """Run the statements in this block in a transaction that cannot write.
+
+        For statements this store did not write -- an LLM's, most often. The
+        refusal is the server's, so a write is refused however it is spelled, and
+        nothing here has to recognise what writing looks like. That is the whole
+        argument for it: it is PostgreSQL underneath, so ``INSERT``, ``TRUNCATE``,
+        ``GRANT`` and ``COPY`` are all available and none of them is Cypher, and
+        the keyword list this replaces let every one of them through while
+        refusing a read whose text merely contained the word DELETE.
+
+        Text arriving this way is also held to one statement. A statement sent
+        with no parameters goes over the protocol that runs the whole string and
+        reports only the first result, so a read with a write after a semicolon
+        runs the write and looks like the read.
+        """
+        self._read_only_depth += 1
+        if self._read_only_depth == 1:
+            self._allow_server_programs = allow_server_programs
+        try:
+            yield
+        finally:
+            self._read_only_depth -= 1
 
     def _run_once(
         self, query: str, bound: Optional[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
         """One attempt at a statement, rolling back if the server refuses it."""
         with self._acquire() as conn:
-            with conn.cursor(row_factory=psycopg.rows.namedtuple_row) as curs:
-                try:
-                    curs.execute(query, bound)
+            if self._read_only_depth:
+                with conn.read_only_transaction(
+                    allow_server_programs=self._allow_server_programs
+                ):
+                    return self._rows(conn, query, bound)
+            return self._rows(conn, query, bound)
+
+    def _rows(
+        self,
+        conn: "psycopg.Connection",
+        query: str,
+        bound: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Send one statement and decode what comes back."""
+        with conn.cursor(row_factory=psycopg.rows.namedtuple_row) as curs:
+            try:
+                curs.execute(query, bound)
+                if not self._read_only_depth:
                     conn.commit()
-                except psycopg.Error as e:
+            except psycopg.Error as e:
+                if not self._read_only_depth:
                     try:
                         conn.rollback()
                     except psycopg.Error:
-                        # A connection the server has already dropped cannot be
-                        # rolled back, and saying so here would replace the real
-                        # reason the statement failed.
+                        # A connection the server has already dropped cannot
+                        # be rolled back, and saying so here would replace the
+                        # real reason the statement failed.
                         pass
-                    raise query_failed(query, e) from e
-                try:
-                    data = curs.fetchall()
-                except psycopg.ProgrammingError:
-                    data = []  # Handle queries that don’t return data
+                raise query_failed(query, e) from e
+            try:
+                data = curs.fetchall()
+            except psycopg.ProgrammingError:
+                data = []  # Handle queries that don’t return data
 
-                if data is None:
-                    result = []
-                # convert to dictionaries
-                else:
-                    result = [self._record_to_dict(d) for d in data]
+            if data is None:
+                result = []
+            # convert to dictionaries
+            else:
+                result = [self._record_to_dict(d) for d in data]
 
-                if self.sanitize_query_output:
-                    result = [value_sanitize(el) for el in result]
+            if self.sanitize_query_output:
+                result = [value_sanitize(el) for el in result]
 
-                return result
+            return result
 
     def _retry_decision(self, cause: BaseException, number: int):
         """Whether to try again after ``cause``, and how long to wait first.
@@ -1450,6 +1497,8 @@ class AgensPropertyGraphStore(PropertyGraphStore):
     ) -> List[Dict[str, Any]]:
         """Async counterpart of :meth:`structured_query` (true async I/O)."""
         bound = _cypher_params(param_map if param_map is not None else params)
+        if self._read_only_depth:
+            check_single_statement(str(query))
 
         number = 0
         while True:
@@ -1471,30 +1520,46 @@ class AgensPropertyGraphStore(PropertyGraphStore):
     ) -> List[Dict[str, Any]]:
         """Async sibling of :meth:`_run_once`."""
         async with self._aacquire() as conn:
-            async with conn.cursor(row_factory=psycopg.rows.namedtuple_row) as curs:
-                try:
-                    await curs.execute(query, bound)
+            if self._read_only_depth:
+                async with conn.read_only_transaction(
+                    allow_server_programs=self._allow_server_programs
+                ):
+                    return await self._arows(conn, query, bound)
+            return await self._arows(conn, query, bound)
+
+    async def _arows(
+        self,
+        conn: "psycopg.AsyncConnection",
+        query: str,
+        bound: Optional[Dict[str, Any]],
+    ) -> List[Dict[str, Any]]:
+        """Async sibling of :meth:`_rows`."""
+        async with conn.cursor(row_factory=psycopg.rows.namedtuple_row) as curs:
+            try:
+                await curs.execute(query, bound)
+                if not self._read_only_depth:
                     await conn.commit()
-                except psycopg.Error as e:
+            except psycopg.Error as e:
+                if not self._read_only_depth:
                     try:
                         await conn.rollback()
                     except psycopg.Error:
                         pass
-                    raise query_failed(query, e) from e
-                try:
-                    data = await curs.fetchall()
-                except psycopg.ProgrammingError:
-                    data = []
+                raise query_failed(query, e) from e
+            try:
+                data = await curs.fetchall()
+            except psycopg.ProgrammingError:
+                data = []
 
-                if data is None:
-                    result = []
-                else:
-                    result = [self._record_to_dict(d) for d in data]
+            if data is None:
+                result = []
+            else:
+                result = [self._record_to_dict(d) for d in data]
 
-                if self.sanitize_query_output:
-                    result = [value_sanitize(el) for el in result]
+            if self.sanitize_query_output:
+                result = [value_sanitize(el) for el in result]
 
-                return result
+            return result
 
     def _describe(self) -> Any:
         """What the graph holds, read from the catalogs rather than from the graph.

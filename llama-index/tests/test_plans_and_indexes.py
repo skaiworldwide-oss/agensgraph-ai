@@ -14,6 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 '''
 
+"""What each statement reaches, and what it does not read.
+
+Named test_regression_perf before, which suggested timings: it held none, and no
+thresholds either. What it does hold is worth more -- the plan a statement gets.
+Almost everything this migration got wrong was an index that existed and was
+never used, and a timing on a small fixture cannot see that while the plan says
+it outright.
+
+Where a number is asserted it is a shape rather than a duration: that planning
+does not grow with the size of an id list, that a read makes one statement per
+label rather than one per row.
+"""
+
 import os
 
 import pytest
@@ -52,6 +65,20 @@ def _conf():
         "host": agens_host,
         "port": agens_port,
     }
+
+
+def _drop_graph(name: str) -> None:
+    """Start from nothing.
+
+    A fixture that keeps its graph and only deletes the elements keeps the schema
+    too, so a test about what construction declares reads what an earlier run
+    declared instead.
+    """
+    import agensgraph
+
+    conn = agensgraph.Connection.connect(autocommit=True, **_conf())
+    conn.execute(f"DROP GRAPH IF EXISTS {name} CASCADE")
+    conn.close()
 
 
 @pytest.fixture()
@@ -438,9 +465,7 @@ def test_bulk_ingest_puts_the_vector_indexes_back(
     assert "BIRD_entity" in vector_indexes()
 
 
-def test_the_embedding_gets_a_column_and_the_index_matches_it(
-    vec_store: AgensPropertyGraphStore,
-):
+def test_the_embedding_gets_a_column_and_the_index_matches_it():
     """Read out of the property map an embedding is text in a TOASTed bag, parsed
     once per element a filter kept -- which is where a filtered search spent its
     time: 538.9 ms against 3.0 ms over 20,000 entities with a filter keeping one
@@ -451,6 +476,13 @@ def test_the_embedding_gets_a_column_and_the_index_matches_it(
     cast cannot serve it: 568 ms against 1.8 ms, with nothing to say it went
     unused.
     """
+    # A graph of its own, made here: sharing one with the other tests meant the
+    # column an earlier run added was still there, and this passed with promotion
+    # turned off entirely.
+    _drop_graph("test_promotion")
+    vec_store = AgensPropertyGraphStore(
+        "test_promotion", conf=_conf(), vector_dimension=4, create=True
+    )
     declared = {
         prop.name
         for prop in vec_store.connection.declared_properties(
@@ -472,7 +504,7 @@ def test_the_embedding_gets_a_column_and_the_index_matches_it(
     )
     definitions = {
         index.name: index.definition
-        for index in vec_store.connection.indexes("CAT", graph=vec_store.graph_name)
+        for index in vec_store.connection.indexes("CAT", graph="test_promotion")
     }
     vec_store.connection.commit()
     assert "::vector(" not in definitions["CAT_entity"]
@@ -488,6 +520,7 @@ def test_the_embedding_gets_a_column_and_the_index_matches_it(
 def test_promotion_can_be_declined():
     """A server that cannot give a property a column keeps it in the map, and so
     does a caller who says so -- and the index is then spelled with the cast."""
+    _drop_graph("test_no_promotion")
     store = AgensPropertyGraphStore(
         "test_no_promotion",
         conf=_conf(),
@@ -495,7 +528,6 @@ def test_promotion_can_be_declined():
         create=True,
         promote_embedding=False,
     )
-    store.structured_query("MATCH (n) DETACH DELETE n")
     declared = {
         prop.name
         for prop in store.connection.declared_properties(
@@ -569,3 +601,21 @@ def test_reading_many_ids_returns_them(vec_store: AgensPropertyGraphStore):
     ids = [n.id for n in vec_store.get(properties={"name": "r7"})]
     assert len(ids) == 1
     assert {n.name for n in vec_store.get(ids=ids)} == {"r7"}
+
+
+def test_every_element_label_carries_its_own_uniqueness_on_id(
+    vec_store: AgensPropertyGraphStore,
+):
+    """A constraint on the parent does not reach a child -- measured, the same id
+    written to two child labels gave two elements -- so each label needs one, or
+    two writers merging the same id each create rather than find."""
+    vec_store.upsert_nodes(
+        [EntityNode(name=f"u{i}", label="UNIQUELABEL") for i in range(3)]
+    )
+    unique = {
+        constraint.label
+        for constraint in vec_store.connection.constraints(graph=vec_store.graph_name)
+        if constraint.unique
+    }
+    vec_store.connection.commit()
+    assert "UNIQUELABEL" in unique, sorted(unique)

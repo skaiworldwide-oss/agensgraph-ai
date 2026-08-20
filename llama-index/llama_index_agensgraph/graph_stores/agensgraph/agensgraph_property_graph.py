@@ -575,11 +575,11 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         }
 
     def _promoted(self) -> bool:
-        """Whether the embedding has a column of its own.
+        """Whether the base label's embedding has a column of its own.
 
-        Asked of the base label only. Every element label inherits from it, and a
-        column on a parent is a column on each child -- an element written to the
-        child fills it, and an index over it builds on the child.
+        A column on a parent is a column on each label that inherits it -- an
+        element written to the child fills it, and an index over it builds on the
+        child -- so this is asked of the base once.
         """
         if self._promotion_read:
             return self._is_promoted
@@ -590,6 +590,33 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         self._is_promoted = any(prop.name == "embedding" for prop in declared)
         self._promotion_read = True
         return self._is_promoted
+
+    def _promoted_label(self, label: str) -> bool:
+        """Whether *this* label's embedding is in a column.
+
+        Inheriting the base is what carries the column down, so a label that
+        stands outside it -- one the graph already held, written by something
+        else -- keeps its embedding in the property map however the base is
+        stored. Indexed as though it had the column, the server refuses it:
+        "operator class vector_cosine_ops does not accept data type jsonb".
+        """
+        if not self._promoted():
+            return False
+        if label == BASE_NODE_LABEL:
+            return True
+        parents = {
+            entry.name: entry.parent
+            for entry in self.connection.labels(graph=self.graph_name)
+        }
+        self.connection.commit()
+        seen: Set[str] = set()
+        name: Optional[str] = label
+        while name and name not in seen:
+            seen.add(name)
+            name = parents.get(name)
+            if name == BASE_NODE_LABEL:
+                return True
+        return False
 
     def _ensure_promoted_column(self) -> None:
         """Give the embedding a column of its own, on the label every element is a.
@@ -658,7 +685,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             # against 1.8 ms, and nothing says the index went unused.
             expression = (
                 sql.SQL("(embedding vector_cosine_ops)")
-                if self._promoted()
+                if self._promoted_label(label)
                 else sql.SQL(
                     "((embedding::vector("
                     + str(int(self.vector_dimension))

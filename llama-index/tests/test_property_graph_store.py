@@ -289,10 +289,20 @@ def test_12_get_schema(agens_store: AgensPropertyGraphStore):
     e1 = EntityNode(label="PERSON", name="Alice")
     agens_store.upsert_nodes([e1])
 
+    agens_store.upsert_relations(
+        [Relation(label="KNOWS", source_id=e1.id, target_id=e1.id)]
+    )
     schema = agens_store.get_schema(refresh=True)
-    assert "node_props" in schema
-    assert "rel_props" in schema
-    assert "relationships" in schema
+
+    # It used to check that the three keys were present, which they are on an
+    # empty graph too, so the schema read could have returned nothing at all.
+    assert "PERSON" in schema["node_props"], schema["node_props"].keys()
+    assert {p["property"] for p in schema["node_props"]["PERSON"]} >= {"id", "name"}
+    types = {p["property"]: p["type"] for p in schema["node_props"]["PERSON"]}
+    assert types["name"] == "STRING"
+    # The base label is left out: it inherits every element, so reporting it
+    # would repeat each child's properties under a name nothing is written on.
+    assert "__Node__" not in schema["node_props"]
 
 
 def test_13_get_schema_str(agens_store: AgensPropertyGraphStore):
@@ -356,63 +366,74 @@ def test_15_refresh_schema(agens_store: AgensPropertyGraphStore):
     assert "age" in prop_names, "Expected 'age' property in PERSON schema."
 
 def test_16_pg_store_all(agens_store: AgensPropertyGraphStore) -> None:
-    """Test functions for Agensgraph graph store."""
+    """A whole round trip, with every step checked.
 
-    # Test inserting nodes into AgensGraph.
+    This made fifteen calls and asserted once, on the first of them, so the
+    relations, the source node, the property read, the update and both deletes
+    could each have done nothing.
+    """
+    agens_store.structured_query("MATCH (n) DETACH DELETE n")
+
     entity1 = EntityNode(label="PERSON", name="Logan", properties={"age": 28})
     entity2 = EntityNode(label="ORGANIZATION", name="LlamaIndex")
     agens_store.upsert_nodes([entity1, entity2])
-    # Assert the nodes are inserted correctly
-    kg_nodes = agens_store.get(ids=[entity1.id])
-    assert kg_nodes[0].name == entity1.name
+    assert {n.name for n in agens_store.get(ids=[entity1.id, entity2.id])} == {
+        "Logan",
+        "LlamaIndex",
+    }
 
-    # Test inserting relations into AgensGraph.
     relation = Relation(
         label="WORKS_FOR",
         source_id=entity1.id,
         target_id=entity2.id,
         properties={"since": 2023},
     )
-
     agens_store.upsert_relations([relation])
-    # Assert the relation is inserted correctly by retrieving the relation map
-    kg_nodes = agens_store.get(ids=[entity1.id])
-    agens_store.get_rel_map(kg_nodes, depth=1)
-
-    # Test inserting a source text node and 'MENTIONS' relations.
-    source_node = TextNode(text='Logan (age 28), works for "LlamaIndex" since 2023.')
-
-    relations = [
-        Relation(label="MENTIONS", target_id=entity1.id, source_id=source_node.node_id),
-        Relation(label="MENTIONS", target_id=entity2.id, source_id=source_node.node_id),
+    rel_map = agens_store.get_rel_map(agens_store.get(ids=[entity1.id]), depth=1)
+    assert [(t[0].name, t[1].label, t[2].name) for t in rel_map] == [
+        ("Logan", "WORKS_FOR", "LlamaIndex")
     ]
+    assert rel_map[0][1].properties["since"] == 2023
 
+    source_node = TextNode(text='Logan (age 28), works for "LlamaIndex" since 2023.')
     agens_store.upsert_llama_nodes([source_node])
-    agens_store.upsert_relations(relations)
-
-    # Assert the source node and relations are inserted correctly
-    agens_store.get_llama_nodes([source_node.node_id])
-
-    # Test retrieving nodes by properties.
-    kg_nodes = agens_store.get(properties={"age": 28})
-
-    # Test executing a structured query in AgensGraph.
-    query = """MATCH (n:"__Node__") WHERE '__Entity__' IN n.labels
-               RETURN n"""
-    agens_store.structured_query(query)
-
-    # Test upserting a new node with additional properties.
-    new_node = EntityNode(
-        label="PERSON", name="Logan", properties={"age": 28, "location": "Canada"}
+    agens_store.upsert_relations(
+        [
+            Relation(
+                label="MENTIONS", target_id=entity1.id, source_id=source_node.node_id
+            ),
+            Relation(
+                label="MENTIONS", target_id=entity2.id, source_id=source_node.node_id
+            ),
+        ]
     )
-    agens_store.upsert_nodes([new_node])
+    fetched = agens_store.get_llama_nodes([source_node.node_id])
+    assert [n.get_content() for n in fetched] == [source_node.get_content()]
 
-    # Assert the node has been updated with the new property
-    kg_nodes = agens_store.get(properties={"age": 28})
+    assert [n.name for n in agens_store.get(properties={"age": 28})] == ["Logan"]
 
-    # Test deleting nodes from AgensGraph.
+    # The label is what an element is written on, so this is how a type is asked
+    # for. The statement here used to read a `labels` list that no longer exists.
+    rows = agens_store.structured_query(
+        'MATCH (n:"__Node__") WHERE label(n) = %(label)s RETURN n.name AS name',
+        param_map={"label": "PERSON"},
+    )
+    assert [r["name"] for r in rows] == ["Logan"]
+
+    agens_store.upsert_nodes(
+        [
+            EntityNode(
+                label="PERSON",
+                name="Logan",
+                properties={"age": 28, "location": "Canada"},
+            )
+        ]
+    )
+    updated = agens_store.get(properties={"age": 28})
+    assert len(updated) == 1, "the update made a second node instead of finding one"
+    assert updated[0].properties["location"] == "Canada"
+
     agens_store.delete(ids=[source_node.node_id])
+    assert agens_store.get_llama_nodes([source_node.node_id]) == []
     agens_store.delete(ids=[entity1.id, entity2.id])
-
-    # Assert the nodes have been deleted
-    agens_store.get(ids=[entity1.id, entity2.id])
+    assert agens_store.get(ids=[entity1.id, entity2.id]) == []

@@ -37,7 +37,7 @@ from _common import agens, config, console
 from _common.datautil import batched, env_int, stream_hf
 from _common.models import EMBED_DIM, get_embed_model
 
-GRAPH = "arxiv"
+GRAPH = os.getenv("DEMO_ARXIV_GRAPH", "arxiv")
 DATASET = "UniverseTBD/arxiv-abstracts-large"
 MAX_AUTHORS = 20  # cap fan-out from pathological author lists
 

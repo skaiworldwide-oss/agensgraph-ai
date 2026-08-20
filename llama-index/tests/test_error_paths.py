@@ -248,3 +248,63 @@ def test_a_label_outside_the_base_keeps_its_embedding_in_the_map(store):
     store.connection.commit()
     assert definitions and "::vector(4)" in definitions[0], definitions
     store.structured_query('MATCH (n:"OUTSIDER") DETACH DELETE n')
+
+
+def test_a_chunk_is_written_in_one_pass(store):
+    """Setting the text, then the properties, then the embedding was three passes
+    over the same row.
+
+    Three tuple versions per chunk, each of them indexed -- and on a real corpus
+    the server refused the second update outright with "attempted to delete
+    invisible tuple" (55000), which is what stopped this package's own README
+    example from running. One map, one write.
+    """
+    from llama_index.core.graph_stores.types import ChunkNode
+
+    ops = store._build_upsert_nodes_ops(
+        [
+            ChunkNode(
+                id_="one-pass",
+                text="body",
+                embedding=[1.0, 0.0, 0.0, 0.0],
+                properties={"file_name": "f", "_node_content": '{"a": 1}'},
+            )
+        ]
+    )
+    chunk_ops = [
+        (query, params)
+        for query, params in ops
+        if "Chunk" in query.as_string(store.connection)
+    ]
+    assert chunk_ops, [q.as_string(store.connection) for q, _ in ops]
+    text = chunk_ops[0][0].as_string(store.connection)
+    assert text.count("SET") == 1, text
+
+    # and it writes what it was given
+    store.upsert_nodes(
+        [
+            ChunkNode(
+                id_="one-pass",
+                text="body",
+                embedding=[1.0, 0.0, 0.0, 0.0],
+                properties={"file_name": "f"},
+            )
+        ]
+    )
+    got = store.get(ids=["one-pass"])
+    assert len(got) == 1
+    assert got[0].text == "body"
+    assert got[0].properties["file_name"] == "f"
+
+
+def test_a_node_type_it_cannot_write_is_reported(store, caplog):
+    """Twenty TextNodes passed to upsert_nodes went missing without a word."""
+    import logging
+
+    from llama_index.core.schema import TextNode
+
+    with caplog.at_level(logging.WARNING):
+        store.upsert_nodes([TextNode(id_="dropped", text="nowhere")])
+    assert any("upsert_llama_nodes" in r.getMessage() for r in caplog.records), [
+        r.getMessage() for r in caplog.records
+    ]

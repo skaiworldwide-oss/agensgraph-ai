@@ -40,13 +40,17 @@ Short, single-feature notebooks:
   extension is used for schema introspection when present, with a catalog
   fallback otherwise.
 
-## What's new in 0.2.0
+## Changes since 0.1
 
-- **Fixed `AgensPropertyGraphStore.vector_query`.** It previously hard-coded a
-  3-dimension embedding cast and ordered by a fixed literal vector, so results
-  ignored the query embedding and errored at any other dimension. It now uses
-  the configured `vector_dimension` consistently and ranks by the actual query
-  embedding, backed by the HNSW index.
+Not released yet -- this is what is in the tree.
+
+- **`AgensPropertyGraphStore.vector_query` works.** It hard-coded a 3-dimension
+  cast and ordered by a fixed literal vector, so results ignored the query
+  embedding and it errored at any other dimension. Repairing that left it
+  emitting `ORDER BY` after a `WITH` inside a SQL sub-query, which the grammar
+  does not allow, so every call raised until the ordering moved onto the final
+  `RETURN` -- where it still reaches the HNSW index, which is the part worth
+  checking rather than assuming.
 - **Metadata-filtered vector search.** Both `AgensPropertyGraphStore.vector_query`
   and `AgensgraphVectorStore.query` honor `MetadataFilters`, translated into a
   fully parameterized (injection-safe) Cypher `WHERE`. All 14 `FilterOperator`
@@ -58,16 +62,36 @@ Short, single-feature notebooks:
   modality is queried against its own index (so both stay index-backed) and the
   two rankings are merged.
 - **AgensGraph-dialect Text2Cypher.** The property graph store sets a default
-  `text_to_cypher_template` that knows the storage model (every node on a single
-  `"__Node__"` label, entity type held in a `labels` list) and avoids Neo4j-only
-  syntax, so `TextToCypherRetriever` generates runnable Cypher out of the box.
+  `text_to_cypher_template` that knows the storage model -- an element is written
+  on the label naming what it is, and every such label inherits `"__Node__"` --
+  and avoids Neo4j-only syntax, so `TextToCypherRetriever` generates runnable
+  Cypher out of the box.
+- **A generated statement runs read-only.** `SafeTextToCypherRetriever` runs what
+  a model wrote in a transaction the server will not let write, so what it may do
+  is the server's decision. A list of Cypher's write keywords is not that: it is
+  PostgreSQL underneath, so `INSERT`, `TRUNCATE`, `GRANT` and `COPY` are all
+  available and none of them is on such a list, while a read whose text merely
+  mentions DELETE looks like a write.
 - **Lazy schema introspection.** `AgensPropertyGraphStore(refresh_schema=False)`
   defers the (O(N)) schema scan to the first `get_schema()`/`get_schema_str()`
   call, so opening a large existing graph is instant.
-- **Indexed type filter.** Each node also stores its primary type in a
-  btree-indexed `__type__` scalar, so a type-scoped query
-  (`WHERE n.__type__ = 'X'`) is an index scan rather than a `'X' IN n.labels`
-  jsonb membership scan.
+- **An element is written on the label naming what it is.** `MATCH (n:Author)`
+  reads that label's storage and nothing else, so nothing has to keep a list of
+  types or a scalar copy of one beside every element. Measured on twenty thousand
+  of each of two types, counting one of them: 248 buffers by label against 495
+  through a btree over such a copy, which also cost an index entry on every
+  write. Each label carries its own uniqueness on `id`, because a constraint on
+  the label they inherit does not reach them.
+- **The embedding has a column of its own.** Read out of the property map it is
+  text in a bag that has to come out of TOAST and be parsed before a distance can
+  be taken, once per element a filter kept -- which is where a metadata-filtered
+  search spent its time. Over 20,000 entities with a filter keeping one in ten:
+  538.9 ms against 3.0 ms. Decline it with `promote_embedding=False`.
+- **The query's mode is read.** `VectorStoreQuery.mode` was never looked at, so
+  every mode got a plain vector search. Hybrid, text search and MMR are answered
+  now, `alpha`/`sparse_top_k`/`hybrid_top_k` do what they say, a metadata filter
+  reaches both halves of a hybrid search, and `distance_strategy` takes `l2` and
+  `inner_product` as well as `cosine`.
 - **Correctness fixes.** Entity embeddings are persisted on `upsert_nodes` even
   when the entity has no source chunk; `get(ids=[])` returns nothing (instead of
   the whole graph); and depth-1 `get_rel_map` uses a fixed pattern (AgensGraph's
@@ -87,7 +111,15 @@ Short, single-feature notebooks:
   longer materializes every distinct property value. Metadata-filter keys can be
   indexed with `create_property_index(...)`. See
   [Performance & indexing](#performance--indexing).
-- **True async + connection pooling.** See [Async & connection pooling](#async--connection-pooling).
+- **True async.** All twelve async methods the contract declares are implemented
+  here. The base class answers most of them by calling the synchronous one, which
+  holds the event loop for the whole round trip: twelve concurrent rel maps ran in
+  76.9 ms with the loop doing nothing else at all, against 31.8 ms with it still
+  running other work. See [Async & connection pooling](#async--connection-pooling).
+- **Nothing is installed in your database.** Opening a store used to create three
+  plpgsql functions there. The catalogs answer the same questions, and faster: on
+  twenty thousand elements carrying embeddings, 1,213 ms of walking every one of
+  them against 19 ms.
 - **Breaking change.** The deprecated triplet `AgensGraphStore` (Knowledge Graph
   Store) has been removed. Use `AgensPropertyGraphStore` with `PropertyGraphIndex`.
 
@@ -116,22 +148,19 @@ os.environ[
     "OPENAI_API_KEY"
 ] = "<YOUR_API_KEY>"  # Replace with your OpenAI API key
 
-os.makedirs("data/paul_graham/", exist_ok=True)
-
-url = "https://raw.githubusercontent.com/run-llama/llama_index/main/docs/docs/examples/data/paul_graham/paul_graham_essay.txt"
+url = (
+    "https://raw.githubusercontent.com/run-llama/llama_index/main/docs/"
+    "examples/data/paul_graham/paul_graham_essay.txt"
+)
 output_path = "data/paul_graham/paul_graham_essay.txt"
+os.makedirs("data/paul_graham/", exist_ok=True)
 urllib.request.urlretrieve(url, output_path)
 
 nest_asyncio.apply()
 
-with open(output_path, "r", encoding="utf-8") as file:
-    content = file.read()
-
-modified_content = content.replace("'", "\\'")
-
-with open(output_path, "w", encoding="utf-8") as file:
-    file.write(modified_content)
-
+# Nothing to escape: every value reaches the server as a bound parameter, so an
+# apostrophe in the text is just an apostrophe. This used to replace them, which
+# put backslashes into the reader's own documents.
 documents = SimpleDirectoryReader("./data/paul_graham/").load_data()
 
 # Setup AgensGraph connection (ensure AgensGraph is running)
@@ -200,7 +229,10 @@ os.environ["OPENAI_API_KEY"] = "<YOUR_API_KEY>"  # Replace with your key
 
 # Download example data
 os.makedirs("data/paul_graham/", exist_ok=True)
-url = "https://raw.githubusercontent.com/run-llama/llama_index/main/docs/docs/examples/data/paul_graham/paul_graham_essay.txt"
+url = (
+    "https://raw.githubusercontent.com/run-llama/llama_index/main/docs/"
+    "examples/data/paul_graham/paul_graham_essay.txt"
+)
 output_path = "data/paul_graham/paul_graham_essay.txt"
 urllib.request.urlretrieve(url, output_path)
 
@@ -304,5 +336,5 @@ scan and then ranks them — instead of scanning every node.
 
 **Counting and type filters.** Prefer `count(*)` over `count(n)` in aggregations:
 `count(n)` materializes each matched node (including its embedding), so it is much
-slower on a graph that stores embeddings. For "all nodes of type X", filter on the
-indexed `n.__type__` scalar rather than `'X' IN n.labels`.
+slower on a graph that stores embeddings. For "all nodes of type X", match the label
+itself with `MATCH (n:X)`, which reads only that label's storage.

@@ -30,7 +30,7 @@ from _common import agens, config, console
 from _common.datautil import env_int, stream_hf
 from _common.models import get_embed_model
 
-GRAPH = "news"
+GRAPH = os.getenv("DEMO_NEWS_GRAPH", "news")
 NODE_LABEL = "Article"
 DATASET = "vblagoje/cc_news"
 

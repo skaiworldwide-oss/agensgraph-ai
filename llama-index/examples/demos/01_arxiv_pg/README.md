@@ -91,5 +91,6 @@ keep in sync.
 - Pass `vector_dimension=` when constructing the store, or the HNSW index isn't
   built and vector search falls back to a sequential scan.
 - For analytics, prefer `count(*)` over `count(p)` and walk the **edges** rather
-  than filtering on node type (`'Author' IN n.labels`) — both are much faster on
-  a graph whose nodes carry embeddings.
+  than matching a node type and filtering: the edge implies what its endpoints
+  are, and its endpoints carry no embedding to read. Where a type is needed,
+  `MATCH (n:Author)` reads that label's storage and nothing else.

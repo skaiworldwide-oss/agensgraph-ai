@@ -89,6 +89,22 @@ LONG_TEXT_THRESHOLD = 52
 
 
 
+# Properties no example value is drawn from. The embedding is a vector nobody
+# reads as text, and the rest is LlamaIndex's own bookkeeping: `_node_content`
+# holds the whole serialised node, so one example of it was 1,800 characters of
+# JSON in a prompt that is charged by the token and says nothing about the graph.
+UNSAMPLED_PROPERTIES = frozenset(
+    {
+        "embedding",
+        "labels",
+        "_node_content",
+        "_node_type",
+        "document_id",
+        "doc_id",
+        "ref_doc_id",
+    }
+)
+
 logger = logging.getLogger(__name__)
 
 # Default Text2Cypher prompt for this store. LlamaIndex's generic
@@ -1020,22 +1036,42 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             elif isinstance(item, ChunkNode):
                 chunk_dicts.append({**item.model_dump(), "id": item.id})
             else:
-                # Log that we do not support these types of nodes
-                # Or raise an error?
-                pass
+                # Said out loud rather than dropped. A TextNode passed here looks
+                # like it was written and is not: upsert_llama_nodes is the way in
+                # for one, and twenty of them went missing without a word.
+                logger.warning(
+                    "upsert_nodes does not write a %s; pass an EntityNode or a "
+                    "ChunkNode, or use upsert_llama_nodes for a TextNode",
+                    type(item).__name__,
+                )
 
         ops: List[Tuple[sql.Composed, Dict[str, Any]]] = []
 
         if chunk_dicts:
+            # Everything a chunk carries goes in one map, so the element is
+            # written once. Setting the text, then the properties, then the
+            # embedding was three passes over the same row: three tuple versions
+            # for every chunk, each of them indexed -- and on a real corpus the
+            # server refused the second update outright, "attempted to delete
+            # invisible tuple", which is what stopped this README's own first
+            # example from running.
             for index in range(0, len(chunk_dicts), CHUNK_SIZE):
-                chunked_params = chunk_dicts[index : index + CHUNK_SIZE]
+                chunked_params = [
+                    {
+                        "id": row["id"],
+                        "all": {
+                            **(row.get("properties") or {}),
+                            "text": row.get("text"),
+                            "embedding": row.get("embedding"),
+                        },
+                    }
+                    for row in chunk_dicts[index : index + CHUNK_SIZE]
+                ]
                 ops.append((
                     sql.SQL("""
                     UNWIND %(chunked_params)s AS row
                     MERGE (c:{CHUNK_LABEL} {{id: row.id}})
-                    SET c.text = row.text
-                    WITH c, row
-                    SET c += row.properties, c.embedding = row.embedding
+                    SET c += row.all
                     RETURN count(*)
                     """).format(
                         CHUNK_LABEL=sql.Identifier(CHUNK_LABEL)
@@ -2258,7 +2294,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
 
             for prop in props:
                 name = prop["property"]
-                if name in ("embedding", "labels"):
+                if name in UNSAMPLED_PROPERTIES:
                     continue
                 try:
                     if prop.get("type") in self._NUMERIC_TYPES:

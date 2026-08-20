@@ -18,6 +18,7 @@ Run after prepare.py. Demonstrates, against the same AgensPropertyGraphStore:
 
 from __future__ import annotations
 
+import os
 import pathlib
 import sys
 
@@ -35,7 +36,7 @@ from llama_index_agensgraph.graph_stores.agensgraph import AgensPropertyGraphSto
 from _common import agens, config, console
 from _common.models import EMBED_DIM, get_embed_model, get_llm
 
-GRAPH = "arxiv"
+GRAPH = os.getenv("DEMO_ARXIV_GRAPH", "arxiv")
 DEFAULT_QUESTION = "What are recent approaches to graph neural networks for molecular property prediction?"
 
 # Cypher analytics — two rules that keep these fast at scale on this store:
@@ -44,8 +45,9 @@ DEFAULT_QUESTION = "What are recent approaches to graph neural networks for mole
 #  2. Drive aggregations off the EDGES (top authors / categories): the edge implies
 #     the endpoint type, so no node-type filter is needed and the endpoints carry
 #     no embedding to read.
-# A type-scoped node filter `WHERE n.__type__ = 'X'` (indexed) beats
-# `'X' IN n.labels` (a jsonb scan); papers-per-year reads `year` from each Paper,
+# Asking for one type by name reads that label's storage and nothing else, since
+# an element is written on the label naming what it is -- there is no scalar copy
+# of the type and no list to search. Papers-per-year reads `year` from each Paper,
 # so it filters on `year` directly.
 ANALYTICS = [
     ("most prolific authors", """

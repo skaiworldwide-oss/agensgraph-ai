@@ -15,6 +15,8 @@ from agensgraph.errors import ConfigurationError
 from llama_index.core.indices.property_graph import TextToCypherRetriever
 from llama_index.core.schema import NodeWithScore, QueryBundle
 
+from llama_index_agensgraph.graph_stores.agensgraph.utils import AgensQueryException
+
 logger = logging.getLogger(__name__)
 
 FENCE = re.compile(r"```(?:cypher)?", re.IGNORECASE)
@@ -59,7 +61,7 @@ class SafeTextToCypherRetriever(TextToCypherRetriever):
         self._allow_server_programs = allow_server_programs
 
     def _read_only(self) -> Any:
-        return self.graph_store.read_only(
+        return self._graph_store.read_only(
             allow_server_programs=self._allow_server_programs
         )
 
@@ -72,7 +74,11 @@ class SafeTextToCypherRetriever(TextToCypherRetriever):
             # role cannot be held to a read. Swallowed, every query would answer
             # with nothing and say only that the Cypher did not run.
             raise
-        except Exception as e:  # noqa: BLE001 -- one bad generation is not fatal
+        except (AgensQueryException, ValueError) as e:
+            # A statement the server refused, or one held back before it was
+            # sent. Anything else -- a name that does not exist here, a wrong
+            # argument -- is a mistake in this file, and catching it made a demo
+            # answer with nothing five times and look as though it had run.
             logger.warning(
                 "the generated Cypher did not run, skipping it: %s",
                 str(e).splitlines()[0][:160],
@@ -87,7 +93,7 @@ class SafeTextToCypherRetriever(TextToCypherRetriever):
                 return await super().aretrieve_from_graph(query_bundle)
         except ConfigurationError:
             raise
-        except Exception as e:  # noqa: BLE001
+        except (AgensQueryException, ValueError) as e:
             logger.warning(
                 "the generated Cypher did not run, skipping it: %s",
                 str(e).splitlines()[0][:160],

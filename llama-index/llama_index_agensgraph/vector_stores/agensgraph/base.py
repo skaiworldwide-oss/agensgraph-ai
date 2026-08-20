@@ -154,7 +154,7 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
     Agensgraph Vector Store.
 
     Examples:
-        # `pip install TODO`
+        `pip install llama-index-agensgraph`
 
 
         ```python

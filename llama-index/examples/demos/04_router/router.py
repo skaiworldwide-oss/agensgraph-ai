@@ -16,6 +16,7 @@ Run after 01_arxiv_pg/prepare.py and 03_news_vector_rag/ingest.py.
 from __future__ import annotations
 
 import asyncio
+import os
 import pathlib
 import sys
 
@@ -31,8 +32,8 @@ from llama_index.core.tools import QueryEngineTool
 from _common import agens, config, console
 from _common.models import EMBED_DIM, configure_settings, get_embed_model, get_llm
 
-ARXIV_GRAPH = "arxiv"
-NEWS_GRAPH = "news"
+ARXIV_GRAPH = os.getenv("DEMO_ARXIV_GRAPH", "arxiv")
+NEWS_GRAPH = os.getenv("DEMO_NEWS_GRAPH", "news")
 DEFAULT_QUESTIONS = [
     "What approaches use neural networks for scientific prediction tasks?",
     "What are companies doing with artificial intelligence?",

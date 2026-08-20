@@ -30,7 +30,7 @@ from _common import agens, config, console
 from _common.datautil import env_int, stream_hf
 from _common.models import EMBED_DIM, configure_settings, get_embed_model, get_llm
 
-GRAPH = "wikipedia_kg"
+GRAPH = os.getenv("DEMO_WIKIPEDIA_GRAPH", "wikipedia_kg")
 DATASET = "wikimedia/wikipedia"
 DATASET_CONFIG = "20231101.en"
 
@@ -109,9 +109,14 @@ def main() -> None:
             )
         print("  " + t.rate(len(docs), "articles"))
 
-        # report what got built (entities live on __Node__ with the type in labels)
+        # What got built. An element is written on the label naming what it is,
+        # so an entity is anything on a label other than the chunk one -- this
+        # asked for '__Entity__' in a labels list that no longer exists, and
+        # reported nothing every time.
         n_entities = store.structured_query(
-            "MATCH (n:\"__Node__\") WHERE '__Entity__' IN n.labels RETURN count(*) AS c")[0]["c"]
+            'MATCH (n:"__Node__") WHERE label(n) <> %(chunk)s RETURN count(*) AS c',
+            param_map={"chunk": "Chunk"},
+        )[0]["c"]
         n_rels = store.structured_query(
             "MATCH (:\"__Node__\")-[r]->(:\"__Node__\") RETURN count(*) AS c")[0]["c"]
         console.section("done")

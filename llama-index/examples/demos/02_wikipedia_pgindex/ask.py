@@ -19,6 +19,7 @@ rather than a reading of the text.
 
 from __future__ import annotations
 
+import os
 import pathlib
 import sys
 
@@ -38,7 +39,7 @@ from llama_index_agensgraph.retrievers import (
 )
 from _common.models import EMBED_DIM, configure_settings, get_embed_model, get_llm
 
-GRAPH = "wikipedia_kg"
+GRAPH = os.getenv("DEMO_WIKIPEDIA_GRAPH", "wikipedia_kg")
 DEFAULT_QUESTIONS = [
     "How many entities of each type are in the graph?",
     "Which 5 entities are connected to the most other entities?",
@@ -53,6 +54,12 @@ def text2cypher_demo(store, llm) -> None:
         graph_store=store,
         llm=llm,
         cypher_validator=strip_markdown,
+        # The generated statement runs in a transaction the server will not let
+        # write. That is not a boundary against a role which may run a command on
+        # the server's host, and a superuser may -- which is what a demo connects
+        # as, against a database it owns. Accepted here deliberately; a service
+        # exposing this should connect as a role that holds neither.
+        allow_server_programs=True,
     )
     for q in DEFAULT_QUESTIONS[:2]:
         console.sub(q)
@@ -72,6 +79,7 @@ def ask(index, llm, questions) -> None:
     t2c = SafeTextToCypherRetriever(
         graph_store=store, llm=llm,
         cypher_validator=strip_markdown,
+        allow_server_programs=True,  # see the note in text2cypher_demo above
     )
     retriever = index.as_retriever(sub_retrievers=[syn, vec, t2c])
     qe = RetrieverQueryEngine.from_args(retriever, llm=llm)

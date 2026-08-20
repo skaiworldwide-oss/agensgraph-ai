@@ -17,6 +17,7 @@ LlamaIndex VectorStoreIndex:
 
 from __future__ import annotations
 
+import os
 import pathlib
 import sys
 
@@ -35,7 +36,7 @@ from llama_index.core.vector_stores import (
 from _common import agens, config, console
 from _common.models import EMBED_DIM, configure_settings, get_embed_model
 
-GRAPH = "news"
+GRAPH = os.getenv("DEMO_NEWS_GRAPH", "news")
 NODE_LABEL = "Article"
 DEFAULT_QUESTION = "What is happening with artificial intelligence in business?"
 

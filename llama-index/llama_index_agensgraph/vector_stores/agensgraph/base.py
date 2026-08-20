@@ -16,7 +16,12 @@ from contextlib import asynccontextmanager, contextmanager
 
 import agensgraph
 from agensgraph import Edge, Vertex
-from agensgraph.vector import Vector, generated_column
+from agensgraph.vector import (
+    Distance,
+    Vector,
+    generated_column,
+    search_option_statements,
+)
 from agensgraph.errors import safe_message
 from agensgraph.introspect import DesiredIndex
 import psycopg
@@ -32,9 +37,11 @@ from llama_index.core.schema import BaseNode, MetadataMode
 from llama_index.core.vector_stores.types import (
     BasePydanticVectorStore,
     VectorStoreQuery,
+    VectorStoreQueryMode,
     VectorStoreQueryResult,
     MetadataFilters,
 )
+from llama_index.core.indices.query.embedding_utils import get_top_k_mmr_embeddings
 from llama_index.core.vector_stores.utils import (
     metadata_dict_to_node,
     node_to_metadata_dict,
@@ -61,6 +68,17 @@ TEXT_INDEX_EXPR = re.compile(
         "?(?P<property>[A-Za-z_][A-Za-z0-9_]*)"? \s* \)""",
     re.VERBOSE,
 )
+
+
+# How a distance is asked for and how it is indexed. The operator in a query and
+# the operator class of the index have to agree, or the index cannot serve the
+# ordering and the search reads every row instead -- with nothing to say so.
+DISTANCES = {
+    "cosine": (Distance.COSINE, "vector_cosine_ops"),
+    "l2": (Distance.L2, "vector_l2_ops"),
+    "euclidean": (Distance.L2, "vector_l2_ops"),
+    "inner_product": (Distance.INNER_PRODUCT, "vector_ip_ops"),
+}
 
 
 def check_if_not_null(props: List[str], values: List[Any]) -> None:
@@ -163,6 +181,8 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
     retrieval_query: str
     embedding_dimension: int
     promote_embedding: bool
+    index_options: Dict[str, Any]
+    search_options: Dict[str, Any]
 
     _graph_name: Optional[str] = "vector_store"
     _support_metadata_filter: bool = PrivateAttr()
@@ -189,6 +209,8 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         hybrid_search: bool = False,
         retrieval_query: str = "",
         promote_embedding: bool = True,
+        index_options: Optional[Dict[str, Any]] = None,
+        search_options: Optional[Dict[str, Any]] = None,
         engine: Optional[AgensEngine] = None,
         **kwargs: Any,
     ) -> None:
@@ -203,10 +225,15 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
             retrieval_query=retrieval_query,
             embedding_dimension=embedding_dimension,
             promote_embedding=promote_embedding,
+            index_options=index_options or {},
+            search_options=search_options or {},
         )
 
-        if distance_strategy not in ["cosine"]:
-            raise ValueError("Only cosine distance strategy is supported for now")
+        if distance_strategy not in DISTANCES:
+            raise ValueError(
+                f"{distance_strategy!r} is not a distance this store measures; it "
+                "can do " + ", ".join(sorted(DISTANCES))
+            )
 
         self._graph_name = graph_name
         # The engine (pool) is wired in only after setup completes: graph/index
@@ -426,16 +453,28 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         """
         self.verify_label_existence()
         self._promote_embedding_column()
+        operator_class = sql.SQL(DISTANCES[self.distance_strategy][1])
         expression = (
-            sql.SQL("({} vector_cosine_ops)").format(
-                sql.Identifier(self.embedding_node_property)
-            )
+            sql.SQL("({} ") .format(sql.Identifier(self.embedding_node_property))
+            + operator_class
+            + sql.SQL(")")
             if self._embedding_is_promoted()
-            else sql.SQL("(({}::vector({})) vector_cosine_ops)").format(
+            else sql.SQL("(({}::vector({})) ").format(
                 sql.Identifier(self.embedding_node_property),
                 sql.SQL(str(int(self.embedding_dimension))),
             )
+            + operator_class
+            + sql.SQL(")")
         )
+        # m and ef_construction decide how much of the graph an insertion walks and
+        # how well the finished one connects; the defaults suit a small corpus and
+        # are worth raising for a large one.
+        options = sql.SQL("")
+        if self.index_options:
+            options = sql.SQL(" WITH (") + sql.SQL(", ").join(
+                sql.SQL("{} = {}").format(sql.SQL(name), sql.Literal(value))
+                for name, value in sorted(self.index_options.items())
+            ) + sql.SQL(")")
         self.database_query(
             sql.SQL(
                 "CREATE PROPERTY INDEX IF NOT EXISTS {index_name} "
@@ -445,6 +484,7 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
                 node_label=sql.Identifier(self.node_label),
             )
             + expression
+            + options
         )
 
     def _graph_indexes(self) -> List[Any]:
@@ -681,9 +721,16 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         )
 
     def _build_query(
-        self, query: VectorStoreQuery
+        self,
+        query: VectorStoreQuery,
+        mode: Optional[VectorStoreQueryMode] = None,
     ) -> Tuple[sql.Composed, Dict[str, Any]]:
-        """Build the formatted query SQL and parameters for a vector query."""
+        """Build the formatted query SQL and parameters for a vector query.
+
+        For MMR the candidates come back carrying their embeddings, and there are
+        more of them than were asked for: the discounting happens afterwards and
+        can only choose among what the search handed it.
+        """
         # Filter only on IS NOT NULL. An `array_size(embedding) = dim` guard is
         # evaluated per row, which stops the planner from using the HNSW index
         # (forcing a sequential scan); the IS NOT NULL check plus the ::vector(N)
@@ -694,7 +741,7 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         )
 
         base_cosine_query = """
-            WITH n, n.{embedding_property}::vector({embedding_dimension}) <=> {bound_embedding} AS inv_score
+            WITH n, n.{embedding_property}::vector({embedding_dimension}) {distance} {bound_embedding} AS inv_score
             ORDER BY inv_score
             LIMIT %(k)s
             WITH n, 1 - inv_score AS score 
@@ -703,22 +750,13 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         filter_params: Dict[str, Any] = {}
         filter_clause: sql.Composed = sql.SQL("")
         if query.filters:
-            # Metadata filtering and hybrid doesn't work
-            if self.hybrid_search:
-                raise ValueError(
-                    "Metadata filtering can't be use in combination with "
-                    "a hybrid search approach"
-                )
-
             snippet, filter_params = metadata_filters_to_cypher(
                 query.filters, alias="n"
             )
             filter_clause = sql.SQL("AND (") + snippet + sql.SQL(")")
-            index_query = base_index_query + base_cosine_query
-        else:
-            # hybrid is handled in query()/aquery() (RRF over two top-level
-            # queries), so a bare hybrid store with no query_str is plain vector.
-            index_query = base_index_query + base_cosine_query
+        # A hybrid store asked for a plain vector search gets one; the modes that
+        # search the text are run from query()/aquery(), filter and all.
+        index_query = base_index_query + base_cosine_query
 
         index_query = index_query + " WITH *, n as node "
         default_retrieval = """
@@ -728,17 +766,31 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
             {embedding_property_literal}, Null, 'id', Null) AS metadata
         """
 
-        index_query += self.retrieval_query or default_retrieval
-
+        mmr_retrieval = """
+            RETURN node.{text_property} AS text, score,
+            node.id AS id,
+            node.{embedding_property} AS mmr_embedding,
+            node || jsonb_build_object({text_property_literal}, Null,
+            {embedding_property_literal}, Null, 'id', Null) AS metadata
+        """
+        if mode is VectorStoreQueryMode.MMR:
+            index_query += mmr_retrieval
+            # Four times what was asked for, so there is something to choose
+            # between; discounting a list of exactly k changes nothing.
+            fetch_k = max(query.similarity_top_k * 4, query.similarity_top_k + 10)
+        else:
+            index_query += self.retrieval_query or default_retrieval
+            fetch_k = query.similarity_top_k
 
         parameters = {
-            "k": query.similarity_top_k,
+            "k": fetch_k,
             "embedding": self._bind_embedding(query.query_embedding),
             "query": remove_lucene_chars(query.query_str),
             **filter_params,
         }
 
         formatted_query = sql.SQL(index_query).format(
+            distance=sql.SQL(DISTANCES[self.distance_strategy][0].value),
             label=sql.Identifier(self.node_label),
             embedding_property=sql.Identifier(self.embedding_node_property),
             text_property=sql.Identifier(self.text_node_property),
@@ -766,10 +818,16 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
 
         return VectorStoreQueryResult(nodes=nodes, similarities=similarities, ids=ids)
 
-    def _hybrid_modality_sql(self, modality: str) -> sql.Composed:
+    def _hybrid_modality_sql(
+        self, modality: str, filter_clause: Optional[sql.Composed] = None
+    ) -> sql.Composed:
         """Top-level Cypher for one hybrid modality, returning (id, text, metadata)
         ordered by relevance. Kept top-level (not nested in a SQL sub-query) so the
-        HNSW / full-text index is used; the modalities are fused in _rrf_fuse."""
+        HNSW / full-text index is used; the modalities are fused in _rrf_fuse.
+
+        A metadata filter reaches both modalities. Asked for together they used to
+        raise, saying filtering does not work with hybrid -- what did not work was
+        that nothing passed the filter down to here."""
         tail = """
             WITH n AS node
             RETURN node.{text_property} AS text, node.id AS id,
@@ -778,19 +836,22 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         """
         if modality == "semantic":
             head = """
-                MATCH (n:{label}) WHERE n.{embedding_property} IS NOT NULL
-                WITH n, n.{embedding_property}::vector({embedding_dimension}) <=> {bound_embedding} AS d
-                ORDER BY d LIMIT %(k)s
+                MATCH (n:{label}) WHERE n.{embedding_property} IS NOT NULL {filter_clause}
+                WITH n, n.{embedding_property}::vector({embedding_dimension}) {distance} {bound_embedding} AS d
+                ORDER BY d LIMIT %(semantic_k)s
             """
         else:  # keyword
             head = """
                 MATCH (n:{label})
                 WHERE n.{text_property} IS NOT NULL AND
                       to_tsvector('english', n.{text_property}) @@ plainto_tsquery('english', %(query)s)
+                      {filter_clause}
                 WITH n, ts_rank_cd(to_tsvector('english', n.{text_property}), plainto_tsquery('english', %(query)s)) AS s
-                ORDER BY s DESC LIMIT %(k)s
+                ORDER BY s DESC LIMIT %(keyword_k)s
             """
         return sql.SQL(head + tail).format(
+            distance=sql.SQL(DISTANCES[self.distance_strategy][0].value),
+            filter_clause=filter_clause if filter_clause is not None else sql.SQL(""),
             label=sql.Identifier(self.node_label),
             embedding_property=sql.Identifier(self.embedding_node_property),
             embedding_dimension=self.embedding_dimension,
@@ -801,52 +862,165 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         )
 
     def _rrf_fuse(
-        self, modalities: List[List[Dict[str, Any]]], k: int
+        self,
+        modalities: List[List[Dict[str, Any]]],
+        k: int,
+        weights: Optional[List[float]] = None,
     ) -> List[Dict[str, Any]]:
-        """Reciprocal-rank-fusion of ranked per-modality result rows."""
+        """Reciprocal-rank-fusion of ranked per-modality result rows.
+
+        ``weights`` says how much each modality counts, which is what ``alpha`` on
+        the query asks for: 1.0 is the vector side alone, 0.0 the text side alone.
+        Every modality counted equally before, so alpha did nothing."""
         rc = 60  # RRF rank constant in 1/(rc+rank); 60 is the de-facto default
+        if weights is None:
+            weights = [1.0] * len(modalities)
         scores: Dict[str, float] = {}
         data: Dict[str, Dict[str, Any]] = {}
-        for rows in modalities:
+        for rows, weight in zip(modalities, weights):
             for rank, r in enumerate(rows):
-                scores[r["id"]] = scores.get(r["id"], 0.0) + 1.0 / (rc + rank + 1)
+                scores[r["id"]] = scores.get(r["id"], 0.0) + weight / (rc + rank + 1)
                 data.setdefault(r["id"], r)
         top = sorted(scores, key=lambda i: scores[i], reverse=True)[:k]
         return [{**data[i], "score": scores[i]} for i in top]
 
-    def query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
-        if self.hybrid_search and query.query_str:
-            params = {
-                "k": query.similarity_top_k,
-                "embedding": self._bind_embedding(query.query_embedding),
-                "query": remove_lucene_chars(query.query_str),
-            }
-            sem = self.database_query(self._hybrid_modality_sql("semantic"), params=params)
-            kw = self.database_query(self._hybrid_modality_sql("keyword"), params=params)
-            return self._results_to_query_result(
-                self._rrf_fuse([sem, kw], query.similarity_top_k)
+    # The modes this store answers. The rest of the enum names a classifier that
+    # ranks by fitting a model over the candidates, which is not something a graph
+    # query does -- refused by name rather than quietly answered as a plain vector
+    # search, which is what every mode used to get, because the field was never
+    # read at all.
+    _MODES = frozenset(
+        {
+            VectorStoreQueryMode.DEFAULT,
+            VectorStoreQueryMode.HYBRID,
+            VectorStoreQueryMode.SEMANTIC_HYBRID,
+            VectorStoreQueryMode.TEXT_SEARCH,
+            VectorStoreQueryMode.SPARSE,
+            VectorStoreQueryMode.MMR,
+        }
+    )
+    _TEXT_MODES = frozenset(
+        {
+            VectorStoreQueryMode.HYBRID,
+            VectorStoreQueryMode.SEMANTIC_HYBRID,
+            VectorStoreQueryMode.TEXT_SEARCH,
+            VectorStoreQueryMode.SPARSE,
+        }
+    )
+
+    def _check_mode(self, query: VectorStoreQuery) -> VectorStoreQueryMode:
+        """What the query asked for, and whether this store can answer it."""
+        mode = query.mode or VectorStoreQueryMode.DEFAULT
+        if mode not in self._MODES:
+            raise ValueError(
+                f"{mode.value} is not a mode this store answers; it can do "
+                + ", ".join(sorted(m.value for m in self._MODES))
             )
-        formatted_query, parameters = self._build_query(query)
+        if mode in (VectorStoreQueryMode.HYBRID, VectorStoreQueryMode.SEMANTIC_HYBRID):
+            if not self.hybrid_search:
+                raise ValueError(
+                    "asked for a hybrid search on a store built without one; pass "
+                    "hybrid_search=True so the full-text index is there to search"
+                )
+        if mode in self._TEXT_MODES and not query.query_str:
+            raise ValueError(f"{mode.value} searches the text, so it needs query_str")
+        return mode
+
+    def _text_plan(
+        self, query: VectorStoreQuery, mode: VectorStoreQueryMode
+    ) -> Tuple[List[sql.Composed], Dict[str, Any], List[float], int]:
+        """The statements a text-involving search runs, and how to weigh them."""
+        filter_clause: sql.Composed = sql.SQL("")
+        filter_params: Dict[str, Any] = {}
+        if query.filters:
+            snippet, filter_params = metadata_filters_to_cypher(query.filters, alias="n")
+            filter_clause = sql.SQL("AND (") + snippet + sql.SQL(")")
+
+        keyword_k = query.sparse_top_k or query.similarity_top_k
+        params = {
+            "semantic_k": query.similarity_top_k,
+            "keyword_k": keyword_k,
+            "embedding": self._bind_embedding(query.query_embedding),
+            "query": remove_lucene_chars(query.query_str),
+            **filter_params,
+        }
+        if mode in (VectorStoreQueryMode.TEXT_SEARCH, VectorStoreQueryMode.SPARSE):
+            return (
+                [self._hybrid_modality_sql("keyword", filter_clause)],
+                params,
+                [1.0],
+                keyword_k,
+            )
+        # alpha weighs the vector side: 1.0 is that alone, 0.0 the text alone.
+        alpha = 0.5 if query.alpha is None else float(query.alpha)
+        return (
+            [
+                self._hybrid_modality_sql("semantic", filter_clause),
+                self._hybrid_modality_sql("keyword", filter_clause),
+            ],
+            params,
+            [alpha, 1.0 - alpha],
+            query.hybrid_top_k or query.similarity_top_k,
+        )
+
+    def _mmr_rerank(
+        self, query: VectorStoreQuery, results: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Keep the nearest that are not also near each other.
+
+        The candidates come back carrying their embeddings, because the distance
+        between two stored rows is not something the index answers -- the
+        discounting is done here, over the candidates the search was given.
+        """
+        # Not named with a leading underscore: a row factory building named
+        # tuples renames a field that cannot be a Python identifier, and the key
+        # silently became "f_embedding".
+        embeddings = [record.pop("mmr_embedding", None) for record in results]
+        usable = [i for i, e in enumerate(embeddings) if e]
+        if not usable:
+            return results[: query.similarity_top_k]
+        _, chosen = get_top_k_mmr_embeddings(
+            query.query_embedding,
+            [list(embeddings[i]) for i in usable],
+            similarity_top_k=query.similarity_top_k,
+            embedding_ids=usable,
+            mmr_threshold=query.mmr_threshold,
+        )
+        return [results[i] for i in chosen]
+
+    def query(self, query: VectorStoreQuery, **kwargs: Any) -> VectorStoreQueryResult:
+        mode = self._check_mode(query)
+        if mode in self._TEXT_MODES:
+            statements, params, weights, fused_k = self._text_plan(query, mode)
+            ranked = [self.database_query(st, params=params) for st in statements]
+            return self._results_to_query_result(
+                self._rrf_fuse(ranked, fused_k, weights)
+            )
+        formatted_query, parameters = self._build_query(query, mode=mode)
         results = self.database_query(formatted_query, params=parameters)
+        if mode is VectorStoreQueryMode.MMR:
+            results = self._mmr_rerank(query, results)
         return self._results_to_query_result(results)
 
     async def aquery(
         self, query: VectorStoreQuery, **kwargs: Any
     ) -> VectorStoreQueryResult:
         """True-async counterpart of :meth:`query`."""
-        if self.hybrid_search and query.query_str:
-            params = {
-                "k": query.similarity_top_k,
-                "embedding": self._bind_embedding(query.query_embedding),
-                "query": remove_lucene_chars(query.query_str),
-            }
-            sem = await self.adatabase_query(self._hybrid_modality_sql("semantic"), params=params)
-            kw = await self.adatabase_query(self._hybrid_modality_sql("keyword"), params=params)
-            return self._results_to_query_result(
-                self._rrf_fuse([sem, kw], query.similarity_top_k)
+        mode = self._check_mode(query)
+        if mode in self._TEXT_MODES:
+            statements, params, weights, fused_k = self._text_plan(query, mode)
+            # The modalities do not depend on each other and each borrows its own
+            # connection, so they go at once rather than one after the other.
+            ranked = await asyncio.gather(
+                *[self.adatabase_query(st, params=params) for st in statements]
             )
-        formatted_query, parameters = self._build_query(query)
+            return self._results_to_query_result(
+                self._rrf_fuse(list(ranked), fused_k, weights)
+            )
+        formatted_query, parameters = self._build_query(query, mode=mode)
         results = await self.adatabase_query(formatted_query, params=parameters)
+        if mode is VectorStoreQueryMode.MMR:
+            results = self._mmr_rerank(query, results)
         return self._results_to_query_result(results)
 
     def _build_delete(self, ref_doc_id: str) -> Tuple[sql.Composed, Dict[str, Any]]:
@@ -1055,6 +1229,26 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
 
         return d
 
+    def _apply_search_options(self, cursor: Any) -> None:
+        """Set what a vector search may be tuned with, for this statement.
+
+        ``hnsw.ef_search`` says how much of the index a search walks before it
+        settles: more of it finds more of the true nearest at more cost.
+        ``set local`` lasts as long as the transaction, so it cannot leak onto a
+        connection somebody else borrows next.
+        """
+        if not self.search_options:
+            return
+        for statement in search_option_statements(self.search_options):
+            cursor.execute(statement)
+
+    async def _aapply_search_options(self, cursor: Any) -> None:
+        """Async sibling of :meth:`_apply_search_options`."""
+        if not self.search_options:
+            return
+        for statement in search_option_statements(self.search_options):
+            await cursor.execute(statement)
+
     def database_query(self, query: str, params: dict = {}) -> List[Dict[str, Any]]:
         """
         Query the graph by taking a cypher query, executing it and
@@ -1072,6 +1266,7 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         with self._acquire() as conn:
             with conn.cursor(row_factory=psycopg.rows.namedtuple_row) as curs:
                 try:
+                    self._apply_search_options(curs)
                     curs.execute(query, params)
                     conn.commit()
                 except psycopg.Error as e:
@@ -1175,6 +1370,7 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         async with self._aacquire() as conn:
             async with conn.cursor(row_factory=psycopg.rows.namedtuple_row) as curs:
                 try:
+                    await self._aapply_search_options(curs)
                     await curs.execute(query, params)
                     await conn.commit()
                 except psycopg.Error as e:

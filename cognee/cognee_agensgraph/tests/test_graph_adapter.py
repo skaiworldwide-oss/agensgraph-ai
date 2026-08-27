@@ -106,26 +106,24 @@ async def test_nodeset_subgraph(adapter):
 
 async def test_name_lookup_uses_index(adapter):
     await adapter.add_nodes([Ent(name=f"e{i}") for i in range(30)])
-    async with adapter._engine.aconnection(graph_path=adapter.graph_name) as conn:
-        async with conn.cursor() as cur:
+    async with adapter._engine.connection() as conn:
+        async with conn.transaction(), conn.cursor() as cur:
             await cur.execute("SET LOCAL enable_seqscan = off")
             await cur.execute(
                 'EXPLAIN MATCH (n:"__Node__" {name: \'"e5"\'}) RETURN n'
             )
             plan = "\n".join(r[0] for r in await cur.fetchall())
-        await conn.rollback()
     assert "base_name_idx" in plan and "Seq Scan" not in plan
 
 
 async def test_ingest_and_lookup_use_id_index(adapter):
     # The MERGE-by-id ingest and id lookups must use base_id_idx, not seq-scan.
     await adapter.add_nodes([Ent(name=f"n{i}") for i in range(30)])
-    async with adapter._engine.aconnection(graph_path=adapter.graph_name) as conn:
-        async with conn.cursor() as cur:
+    async with adapter._engine.connection() as conn:
+        async with conn.transaction(), conn.cursor() as cur:
             await cur.execute("SET LOCAL enable_seqscan = off")
             await cur.execute(
                 'EXPLAIN MATCH (n:"__Node__" {id: \'x\'}) RETURN n'
             )
             plan = "\n".join(r[0] for r in await cur.fetchall())
-        await conn.rollback()
     assert "base_id_idx" in plan and "Seq Scan" not in plan

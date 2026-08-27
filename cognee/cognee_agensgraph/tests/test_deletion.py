@@ -1,10 +1,7 @@
-import os
-import shutil
 import cognee
-import pathlib
 from cognee.shared.logging_utils import get_logger
 from cognee.modules.data.methods import get_dataset_data
-import cognee_agensgraph
+import cognee_agensgraph  # noqa: F401  (registers the adapters)
 
 logger = get_logger()
 

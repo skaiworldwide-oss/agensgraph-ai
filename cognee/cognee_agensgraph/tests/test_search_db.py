@@ -10,7 +10,7 @@ from cognee.modules.retrieval.graph_summary_completion_retriever import (
 )
 from cognee.shared.logging_utils import get_logger
 from cognee.modules.search.types import SearchType
-import cognee_agensgraph
+import cognee_agensgraph  # noqa: F401  (registers the adapters)
 
 logger = get_logger()
 

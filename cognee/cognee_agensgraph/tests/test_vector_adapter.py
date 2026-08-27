@@ -87,13 +87,12 @@ async def test_search_uses_hnsw_index(vector):
     await vector.create_data_points(
         COLLECTION, [Item(text=f"text {i}") for i in range(30)]
     )
-    async with vector._engine.aconnection(graph_path=None) as conn:
-        async with conn.cursor() as cur:
+    async with vector._engine.connection() as conn:
+        async with conn.transaction(), conn.cursor() as cur:
             await cur.execute("SET LOCAL enable_seqscan = off")
             await cur.execute(
                 f'EXPLAIN SELECT id FROM "{COLLECTION}" '
                 "ORDER BY vector <=> '[0,0,0,0,0,0,0,1]'::vector LIMIT 5"
             )
             plan = "\n".join(r[0] for r in await cur.fetchall())
-        await conn.rollback()
     assert "hnsw" in plan.lower() and "Seq Scan" not in plan

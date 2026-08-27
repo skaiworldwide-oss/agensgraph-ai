@@ -71,7 +71,7 @@ class AgensgraphVectorAdapter(VectorDBInterface):
 
     async def _ensure_engine(self) -> AgensEngine:
         if self._engine is None:
-            self._engine = await AgensEngine.acquire(self.conninfo)
+            self._engine = AgensEngine.get(self.conninfo)
         return self._engine
 
     async def embed_data(self, data: List[str]) -> List[List[float]]:
@@ -79,7 +79,7 @@ class AgensgraphVectorAdapter(VectorDBInterface):
 
     async def has_collection(self, collection_name: str) -> bool:
         engine = await self._ensure_engine()
-        async with engine.aconnection(graph_path=None) as conn:
+        async with engine.connection() as conn:
             async with conn.cursor() as cur:
                 # Exact-case match: collection names are created as quoted
                 # (case-sensitive) identifiers, which to_regclass would fold.
@@ -93,7 +93,7 @@ class AgensgraphVectorAdapter(VectorDBInterface):
     async def create_collection(self, collection_name: str, payload_schema=None):
         engine = await self._ensure_engine()
         dim = int(self.embedding_engine.get_vector_size())
-        async with engine.aconnection(graph_path=None) as conn:
+        async with engine.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     sql.SQL(
@@ -110,7 +110,6 @@ class AgensgraphVectorAdapter(VectorDBInterface):
                         t=sql.Identifier(collection_name),
                     )
                 )
-            await conn.commit()
 
     async def create_data_points(
         self, collection_name: str, data_points: List[DataPoint]
@@ -132,11 +131,10 @@ class AgensgraphVectorAdapter(VectorDBInterface):
             "INSERT INTO {t} (id, payload, vector) VALUES (%s, %s, %s::vector) "
             "ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, vector = EXCLUDED.vector"
         ).format(t=sql.Identifier(collection_name))
-        async with engine.aconnection(graph_path=None) as conn:
+        async with engine.connection() as conn:
             async with conn.cursor() as cur:
                 for start in range(0, len(params), CHUNK_SIZE):
                     await cur.executemany(query, params[start : start + CHUNK_SIZE])
-            await conn.commit()
 
     async def create_vector_index(self, index_name: str, index_property_name: str):
         """Create the collection cognee indexes a DataPoint field into."""
@@ -158,7 +156,7 @@ class AgensgraphVectorAdapter(VectorDBInterface):
         if not data_point_ids or not await self.has_collection(collection_name):
             return []
         engine = await self._ensure_engine()
-        async with engine.aconnection(graph_path=None) as conn:
+        async with engine.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute(
                     sql.SQL("SELECT id, payload FROM {t} WHERE id = ANY(%(ids)s)").format(
@@ -189,7 +187,7 @@ class AgensgraphVectorAdapter(VectorDBInterface):
 
         engine = await self._ensure_engine()
         limit_clause = sql.SQL("LIMIT {n}").format(n=sql.SQL(str(int(limit)))) if limit and limit > 0 else sql.SQL("")
-        async with engine.aconnection(graph_path=None) as conn:
+        async with engine.connection() as conn:
             async with conn.cursor(row_factory=dict_row) as cur:
                 await cur.execute(
                     sql.SQL(
@@ -237,7 +235,7 @@ class AgensgraphVectorAdapter(VectorDBInterface):
         if not data_point_ids or not await self.has_collection(collection_name):
             return
         engine = await self._ensure_engine()
-        async with engine.aconnection(graph_path=None) as conn:
+        async with engine.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     sql.SQL("DELETE FROM {t} WHERE id = ANY(%(ids)s)").format(
@@ -245,14 +243,13 @@ class AgensgraphVectorAdapter(VectorDBInterface):
                     ),
                     {"ids": [str(i) for i in data_point_ids]},
                 )
-            await conn.commit()
 
     async def prune(self):
         # Drop every collection this adapter created. They are uniquely
         # identified by their (payload jsonb + vector) column signature, so this
         # never touches the graph tables or unrelated user tables.
         engine = await self._ensure_engine()
-        async with engine.aconnection(graph_path=None) as conn:
+        async with engine.connection() as conn:
             async with conn.cursor() as cur:
                 await cur.execute(
                     """
@@ -273,4 +270,3 @@ class AgensgraphVectorAdapter(VectorDBInterface):
                             t=sql.Identifier(table)
                         )
                     )
-            await conn.commit()

@@ -1,6 +1,6 @@
 from cognee_agensgraph.tests.tasks.descriptive_metrics.metrics_test_utils import assert_metrics
 import asyncio
-import cognee_agensgraph
+import cognee_agensgraph  # noqa: F401  (registers the adapters)
 
 
 if __name__ == "__main__":

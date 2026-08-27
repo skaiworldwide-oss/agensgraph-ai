@@ -1,24 +1,27 @@
-"""Agensgraph Adapter for Graph Database"""
+"""AgensGraph graph adapter for cognee."""
 
-import json, re
-from cognee.shared.logging_utils import get_logger, ERROR
 import asyncio
-from typing import Optional, Any, List, Dict, Type, Tuple, Union, NamedTuple, Pattern
-from contextlib import asynccontextmanager
+import re
+from typing import Any, Dict, List, Optional, Tuple, Type
 from uuid import UUID
-from cognee.infrastructure.engine import DataPoint
+
+import psycopg
+from agensgraph import Edge, GraphId, Path, RetryPolicy, Vertex, to_builtins
+from agensgraph.cypher import check_single_statement
+from agensgraph.errors import safe_message
 from cognee.infrastructure.databases.graph.graph_db_interface import (
     GraphDBInterface,
     record_graph_changes,
 )
-from .metrics import *
-
-import psycopg
-from psycopg import sql
+from cognee.infrastructure.engine import DataPoint
+from cognee.shared.logging_utils import ERROR, get_logger
+from psycopg import errors, sql
+from psycopg.conninfo import make_conninfo
+from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
-from psycopg.rows import namedtuple_row
 
 from ._engine import AgensEngine
+from .metrics import count_self_loops, get_edge_density
 
 logger = get_logger("AgensgraphAdapter", level=ERROR)
 BASE_LABEL = "__Node__"
@@ -135,22 +138,32 @@ get_label_name_function = """
 
 """
 
-class AgensgraphQueryException(Exception):
-    """Exception for the Agensgraph queries."""
+# Neo4j's edge shorthand between two pattern nodes: (a)--(b), (a)-->(b), (a)<--(b), where
+# what follows looks like a node: (b, (b:Label, (:Label, ({...} or ().
+_EDGE_SHORTHAND = re.compile(r"\)\s*(<-|-)-(>?)\s*\((?=\s*(?:\w+\s*)?[:{)])")
+_LITERALS = re.compile(r"'(?:[^'\\]|\\.|'')*'|\"(?:[^\"\\]|\\.|\"\")*\"")
 
-    def __init__(self, exception: Union[str, Dict]) -> None:
-        if isinstance(exception, dict):
-            self.message = exception["message"] if "message" in exception else "unknown"
-            self.details = exception["details"] if "details" in exception else "unknown"
-        else:
-            self.message = exception
-            self.details = "unknown"
 
-    def get_message(self) -> str:
-        return self.message
+def spell_out_edges(statement: str) -> str:
+    """Rewrite ``(a)--(b)`` as ``(a)-[]-(b)``, and the two arrow forms likewise.
 
-    def get_details(self) -> Any:
-        return self.details
+    In AgensGraph ``--`` starts a comment, so the rest of such a statement is dropped
+    and it fails as incomplete. Between two pattern nodes ``--`` cannot mean a comment
+    in any statement that runs, so only that form is rewritten, and only outside string
+    literals and quoted identifiers. Language models write this shorthand in most
+    statements they generate.
+    """
+    blanked = _LITERALS.sub(lambda m: " " * len(m.group(0)), statement)
+    out = []
+    last = 0
+    for m in _EDGE_SHORTHAND.finditer(blanked):
+        left, arrow = m.group(1), m.group(2)
+        out.append(statement[last : m.start()])
+        out.append(")" + ("<-[]-" if left == "<-" else "-[]-" + arrow) + "(")
+        last = m.end()
+    out.append(statement[last:])
+    return "".join(out)
+
 
 class AgensgraphAdapter(GraphDBInterface):
     """
@@ -189,96 +202,177 @@ class AgensgraphAdapter(GraphDBInterface):
     - get_graph_metrics
     """
 
-    vertex_regex: Pattern = re.compile(r"(\w+)\[(\d+\.\d+)\](\{.*\})")
-    edge_regex: Pattern = re.compile(r"(\w+)\[(\d+\.\d+)\]\[(\d+\.\d+),\s*(\d+\.\d+)\](\{.*\})")
-
     def __init__(
         self,
         graph_database_url: str,
         graph_database_username: Optional[str] = None,
         graph_database_password: Optional[str] = None,
         driver: Optional[Any] = None,
+        *,
+        query_read_only: bool = True,
+        query_allow_server_programs: bool = True,
+        retry_attempts: int = 6,
     ):
-        # The pool is shared/opened lazily by the engine in initialize().
-        self.conninfo = graph_database_url
+        conninfo = graph_database_url
+        credentials = {}
+        if graph_database_username:
+            credentials["user"] = graph_database_username
+        if graph_database_password:
+            credentials["password"] = graph_database_password
+        if credentials:
+            conninfo = make_conninfo(conninfo, **credentials)
+        self.conninfo = conninfo
         self.graph_name = "cognee"
         self.graph_id = None
         self._engine: Optional[AgensEngine] = None
+        # query() runs statements written by a user or by a language model. It refuses
+        # writes unless the caller turns this off.
+        self.query_read_only = query_read_only
+        # A read-only transaction does not stop a superuser from running a program on
+        # the server, so the driver refuses one for such a role unless told to go ahead.
+        # Development setups run as a superuser, so the default is to go ahead.
+        self.query_allow_server_programs = query_allow_server_programs
+        self.retry_policy = RetryPolicy(attempts=retry_attempts)
 
     async def initialize(self):
-        """Acquire the shared engine and bootstrap the graph (once)."""
-        self._engine = await AgensEngine.acquire(self.conninfo)
+        """Connect once and create what the graph needs. Cheap when called again."""
+        self._engine = AgensEngine.get(self.conninfo, graph_name=self.graph_name)
+        await self._engine.setup_once(f"graph:{self.graph_name}", self._bootstrap)
+        self.graph_id = self._engine.graph_id
 
-        async def _ddl(cur):
-            # graph_path is already set by ensure_graph; create the label,
-            # the edge label, and the lookup index on the ACTUAL key (id).
-            await cur.execute(
-                "SELECT oid from ag_graph WHERE graphname = %s", (self.graph_name,)
-            )
-            graph_id = (await cur.fetchone())[0]
-            await cur.execute(f'CREATE VLABEL IF NOT EXISTS "{BASE_LABEL}"')
-            await cur.execute('CREATE ELABEL IF NOT EXISTS "DIRECTED"')
-            await cur.execute(
-                f'CREATE PROPERTY INDEX IF NOT EXISTS base_id_idx ON "{BASE_LABEL}" (id)'
-            )
-            # name is the lookup key for nodeset / document subgraph queries.
-            await cur.execute(
-                f'CREATE PROPERTY INDEX IF NOT EXISTS base_name_idx ON "{BASE_LABEL}" (name)'
-            )
-            await cur.execute(append_label_function)
-            await cur.execute(get_labels_function)
-            await cur.execute(track_labels.format(graph_id))
-            await cur.execute(label_catalog.format(self.graph_name, BASE_LABEL))
-            await cur.execute(get_label_name_function)
-
-        await self._engine.ensure_graph(self.graph_name, _ddl)
-
-        # graph_id is used by label-catalog lookups; fetch it every init (the
-        # DDL above runs only once, so don't rely on it for this).
-        async with self._engine.aconnection(graph_path=self.graph_name) as conn:
-            async with conn.cursor() as curs:
-                await curs.execute(
-                    "SELECT oid from ag_graph WHERE graphname = %s", (self.graph_name,)
-                )
-                self.graph_id = (await curs.fetchone())[0]
-            await conn.commit()
-
-        logger.info(f"Agensgraph storage initialized for graph: {self.graph_name}")
+    async def _bootstrap(self, conn) -> None:
+        await conn.execute(f'CREATE VLABEL IF NOT EXISTS "{BASE_LABEL}"')
+        await conn.execute('CREATE ELABEL IF NOT EXISTS "DIRECTED"')
+        await conn.execute(
+            f'CREATE PROPERTY INDEX IF NOT EXISTS base_id_idx ON "{BASE_LABEL}" (id)'
+        )
+        # name is the lookup key for nodeset / document subgraph queries.
+        await conn.execute(
+            f'CREATE PROPERTY INDEX IF NOT EXISTS base_name_idx ON "{BASE_LABEL}" (name)'
+        )
+        await conn.execute(append_label_function)
+        await conn.execute(get_labels_function)
+        await conn.execute(track_labels.format(self._engine.graph_id))
+        await conn.execute(label_catalog)
+        await conn.execute(get_label_name_function)
 
     async def finalize(self):
-        """Release the shared engine (closes the pool when last to release)."""
+        """Close this event loop's pool. The next call opens a new one."""
         if self._engine is not None:
-            await self._engine.release()
-            self._engine = None
+            await self._engine.aclose()
+
+    # ---- statements ----
 
     async def query(
         self,
         query: str,
         params: Optional[Dict[str, Any]] = None,
     ) -> List[Dict[str, Any]]:
+        """Run a statement written by a user or by a language model.
+
+        One statement at a time, and read-only unless ``query_read_only`` is off.
         """
-        Execute a provided query on the Agensgraph database and return the results.
+        if isinstance(query, str):
+            query = spell_out_edges(query)
+        if not params:
+            params = None
+            if isinstance(query, str):
+                check_single_statement(query)
+        if not self.query_read_only:
+            return await self._write(query, params)
+
+        async def attempt():
+            async with self._engine.connection() as conn:
+                async with conn.read_only_transaction(
+                    allow_server_programs=self.query_allow_server_programs
+                ):
+                    return await self._execute(conn, query, params)
+
+        return await self._run_with_retry(attempt, wrote=False)
+
+    async def _read(self, query, params=None) -> List[Dict[str, Any]]:
+        async def attempt():
+            async with self._engine.connection() as conn:
+                return await self._execute(conn, query, params)
+
+        return await self._run_with_retry(attempt, wrote=False)
+
+    async def _write(self, query, params=None) -> List[Dict[str, Any]]:
+        async def attempt():
+            async with self._engine.connection() as conn:
+                return await self._execute(conn, query, params)
+
+        return await self._run_with_retry(attempt, wrote=True)
+
+    async def _run_with_retry(self, attempt, *, wrote: bool):
+        """Run ``attempt`` again while the driver says the failure was timing.
+
+        Concurrent writers merging onto the same keys fail each other for the moment
+        one of them takes to commit. A merge that loses such a race under a uniqueness
+        constraint is reported as an exclusion violation (23P01), so it is judged as the
+        unique violation it is.
         """
-        async with self._engine.aconnection(graph_path=self.graph_name) as conn:
-            async with conn.cursor(row_factory=namedtuple_row) as curs:
-                try:
-                    await curs.execute(query, params)
-                    await conn.commit()
-                except psycopg.Error as e:
-                    await conn.rollback()
-                    raise AgensgraphQueryException(
-                        {
-                            "message": f"Error executing graph query: {query}",
-                            "detail": str(e),
-                        }
-                    ) from e
-                try:
-                    data = await curs.fetchall()
-                except psycopg.ProgrammingError:
-                    data = []  # Handle queries that don’t return data
-                if data is None:
-                    return []
-                return [self._record_to_dict(d) for d in data]
+        number = 0
+        while True:
+            try:
+                result = await attempt()
+            except psycopg.Error as exc:
+                number += 1
+                decision = self.retry_policy.decide(
+                    exc, number=number, wrote=wrote, merging=wrote
+                )
+                if not decision.retry and isinstance(exc, errors.ExclusionViolation):
+                    decision = self.retry_policy.decide(
+                        errors.UniqueViolation(), number=number, wrote=wrote, merging=True
+                    )
+                if not decision.retry:
+                    logger.error("AgensGraph statement failed: %s", safe_message(exc))
+                    raise
+                await asyncio.sleep(decision.delay)
+            else:
+                self.retry_policy.succeeded()
+                return result
+
+    @staticmethod
+    async def _execute(conn, query, params) -> List[Dict[str, Any]]:
+        async with conn.cursor(row_factory=dict_row) as cur:
+            await cur.execute(query, params)
+            if cur.description is None:
+                return []
+            rows = await cur.fetchall()
+        return [AgensgraphAdapter._convert_row(row) for row in rows]
+
+    @staticmethod
+    def _convert_row(row: Dict[str, Any]) -> Dict[str, Any]:
+        """Turn the driver's graph values into what cognee expects.
+
+        A vertex becomes its property map. An edge becomes
+        ``(start properties, label, end properties)``, with the endpoints taken from the
+        vertices returned in the same row.
+        """
+        vertices: Dict[GraphId, Dict[str, Any]] = {}
+        for value in row.values():
+            if isinstance(value, Vertex):
+                vertices[value.id] = value.properties
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, Vertex):
+                        vertices[item.id] = item.properties
+        return {key: AgensgraphAdapter._convert(value, vertices) for key, value in row.items()}
+
+    @staticmethod
+    def _convert(value: Any, vertices: Dict[GraphId, Dict[str, Any]]) -> Any:
+        if isinstance(value, Vertex):
+            return value.properties
+        if isinstance(value, Edge):
+            return (vertices.get(value.start, {}), value.label, vertices.get(value.end, {}))
+        if isinstance(value, GraphId):
+            return str(value)
+        if isinstance(value, Path):
+            return to_builtins(value)
+        if isinstance(value, list):
+            return [AgensgraphAdapter._convert(item, vertices) for item in value]
+        return value
 
     async def has_node(self, node_id: str) -> bool:
         """
@@ -294,7 +388,7 @@ class AgensgraphAdapter(GraphDBInterface):
 
             - bool: True if the node exists, otherwise False.
         """
-        results = await self.query(sql.SQL(
+        results = await self._read(sql.SQL(
             """
                 MATCH (n:{BASE_LABEL})
                 WHERE n.id = %(node_id)s
@@ -358,7 +452,7 @@ class AgensgraphAdapter(GraphDBInterface):
         RETURN ID(n) AS internal_id, n.id AS nodeId
         """
 
-        results = await self.query(
+        results = await self._write(
             sql.SQL(query).format(label=sql.Identifier(BASE_LABEL)),
             {"nodes": Jsonb(nodes)},
         )
@@ -403,7 +497,7 @@ class AgensgraphAdapter(GraphDBInterface):
 
         params = {"node_ids": Jsonb(node_ids)}
 
-        results = await self.query(
+        results = await self._read(
             sql.SQL(query).format(label=sql.Identifier(BASE_LABEL)),
             params,
         )
@@ -430,7 +524,7 @@ class AgensgraphAdapter(GraphDBInterface):
         """
         params = {"node_id": Jsonb(node_id)}
 
-        return await self.query(
+        return await self._write(
             sql.SQL(query).format(label=sql.Identifier(BASE_LABEL)),
             params
         )
@@ -456,7 +550,7 @@ class AgensgraphAdapter(GraphDBInterface):
 
         params = {"node_ids": Jsonb(node_ids)}
 
-        return await self.query(
+        return await self._write(
             sql.SQL(query).format(label=sql.Identifier(BASE_LABEL)),
             params,
         )
@@ -489,7 +583,7 @@ class AgensgraphAdapter(GraphDBInterface):
             "to_node": Jsonb(str(to_node)),
         }
 
-        results = await self.query(
+        results = await self._read(
             sql.SQL(query).format(
                 BASE_LABEL=sql.Identifier(BASE_LABEL),
                 edge_label=sql.Identifier(edge_label)
@@ -528,7 +622,7 @@ class AgensgraphAdapter(GraphDBInterface):
 
         params = {"edges": Jsonb(edges)}
 
-        results = await self.query(query, params)
+        results = await self._read(query, params)
         return results
 
     async def add_edge(
@@ -570,7 +664,7 @@ class AgensgraphAdapter(GraphDBInterface):
             "properties": Jsonb(self.serialize_properties(edge_properties)),
         }
 
-        return await self.query(
+        return await self._write(
             sql.SQL(query).format(
                 BASE_LABEL=sql.Identifier(BASE_LABEL),
                 relationship_name=sql.Identifier(relationship_name),
@@ -627,7 +721,7 @@ class AgensgraphAdapter(GraphDBInterface):
                 relationship_name=sql.Identifier(relationship_name),
             )
             for start in range(0, len(rows), CHUNK_SIZE):
-                await self.query(
+                await self._write(
                     formatted, {"rows": Jsonb(rows[start : start + CHUNK_SIZE])}
                 )
 
@@ -650,7 +744,7 @@ class AgensgraphAdapter(GraphDBInterface):
         RETURN n, r, m
         """
 
-        results = await self.query(
+        results = await self._read(
             sql.SQL(query).format(BASE_LABEL=sql.Identifier(BASE_LABEL)),
             {"node_id": Jsonb(node_id)}
         )
@@ -681,7 +775,7 @@ class AgensgraphAdapter(GraphDBInterface):
             "WHERE deg = 0 "
             "RETURN COLLECT(n.id) AS ids"
         )
-        results = await self.query(query)
+        results = await self._read(query)
         return results[0]["ids"] if results else []
 
     async def get_predecessors(self, node_id: str, edge_label: str = None) -> list[str]:
@@ -706,7 +800,7 @@ class AgensgraphAdapter(GraphDBInterface):
             RETURN predecessor
             """
 
-            results = await self.query(
+            results = await self._read(
                 sql.SQL(query).format(
                     BASE_LABEL=sql.Identifier(BASE_LABEL),
                     edge_label=sql.Identifier(edge_label),
@@ -722,7 +816,7 @@ class AgensgraphAdapter(GraphDBInterface):
             RETURN predecessor
             """
 
-            results = await self.query(
+            results = await self._read(
                 sql.SQL(query).format(BASE_LABEL=sql.Identifier(BASE_LABEL)),
                 {"node_id": Jsonb(node_id)}
             )
@@ -751,7 +845,7 @@ class AgensgraphAdapter(GraphDBInterface):
             RETURN successor
             """
 
-            results = await self.query(
+            results = await self._read(
                 sql.SQL(query).format(
                     BASE_LABEL=sql.Identifier(BASE_LABEL),
                     edge_label=sql.Identifier(edge_label),
@@ -767,7 +861,7 @@ class AgensgraphAdapter(GraphDBInterface):
             RETURN successor
             """
 
-            results = await self.query(
+            results = await self._read(
                 sql.SQL(query).format(BASE_LABEL=sql.Identifier(BASE_LABEL)),
                 {"node_id": Jsonb(node_id)}
             )
@@ -792,7 +886,7 @@ class AgensgraphAdapter(GraphDBInterface):
             MATCH (n: {BASE_LABEL} {{id: %(node_id)s}})-[r]-(m: {BASE_LABEL})
             RETURN DISTINCT m
         """
-        results = await self.query(
+        results = await self._read(
             sql.SQL(query).format(BASE_LABEL=sql.Identifier(BASE_LABEL)),
             {"node_id": Jsonb(node_id)},
         )
@@ -817,7 +911,7 @@ class AgensgraphAdapter(GraphDBInterface):
         MATCH (node: {BASE_LABEL} {{id: %(node_id)s}})
         RETURN node
         """
-        results = await self.query(
+        results = await self._read(
             sql.SQL(query).format(BASE_LABEL=sql.Identifier(BASE_LABEL)),
             {"node_id": Jsonb(node_id)}
         )
@@ -842,7 +936,7 @@ class AgensgraphAdapter(GraphDBInterface):
         MATCH (node:{label} {{id: id}})
         RETURN node
         """
-        results = await self.query(
+        results = await self._read(
             sql.SQL(query).format(label=sql.Identifier(BASE_LABEL)),
             {"node_ids": Jsonb(node_ids)},
         )
@@ -874,12 +968,12 @@ class AgensgraphAdapter(GraphDBInterface):
         """
 
         predecessors, successors = await asyncio.gather(
-            self.query(
+            self._read(
                 sql.SQL(predecessors_query).format(
                     BASE_LABEL=sql.Identifier(BASE_LABEL)
                 ), {"node_id": Jsonb(str(node_id))}
             ),
-            self.query(
+            self._read(
                 sql.SQL(successors_query).format(
                     BASE_LABEL=sql.Identifier(BASE_LABEL)
                 ), {"node_id": Jsonb(str(node_id))}
@@ -924,7 +1018,7 @@ class AgensgraphAdapter(GraphDBInterface):
 
         params = {"node_ids": Jsonb(node_ids)}
 
-        return await self.query(
+        return await self._write(
             sql.SQL(query).format(
                 label1=sql.Identifier(BASE_LABEL),
                 label2=sql.Identifier(edge_label),
@@ -958,7 +1052,7 @@ class AgensgraphAdapter(GraphDBInterface):
 
         params = {"node_ids": Jsonb(node_ids)}
 
-        return await self.query(
+        return await self._write(
             sql.SQL(query).format(
                 label1=sql.Identifier(BASE_LABEL),
                 label2=sql.Identifier(edge_label),
@@ -978,7 +1072,7 @@ class AgensgraphAdapter(GraphDBInterface):
         query = """MATCH (node:{label})
                 DETACH DELETE node;"""
 
-        return await self.query(
+        return await self._write(
             sql.SQL(query).format(label=sql.Identifier(BASE_LABEL))
         )
 
@@ -1019,10 +1113,10 @@ class AgensgraphAdapter(GraphDBInterface):
             A tuple of nodes and edges data.
         """
         query_nodes = "MATCH (n) RETURN collect(properties(n)) AS nodes"
-        nodes = await self.query(query_nodes)
+        nodes = await self._read(query_nodes)
 
         query_edges = "MATCH (n)-[r]->(m) RETURN collect([properties(n), properties(r), properties(m)]) AS edges"
-        edges = await self.query(query_edges)
+        edges = await self._read(query_edges)
 
         return (nodes, edges)
     
@@ -1042,7 +1136,7 @@ class AgensgraphAdapter(GraphDBInterface):
         """
         query = "MATCH (n) RETURN ID(n) AS id, get_labels(n) AS labels, properties(n) AS properties"
 
-        result = await self.query(query)
+        result = await self._read(query)
         nodes = [
             (
                 record["properties"]["id"],
@@ -1055,7 +1149,7 @@ class AgensgraphAdapter(GraphDBInterface):
         MATCH (n)-[r]->(m)
         RETURN ID(n) AS source, ID(m) AS target, TYPE(r) AS type, properties(r) AS properties
         """
-        result = await self.query(query)
+        result = await self._read(query)
         edges = [
             (
                 record["properties"]["source_node_id"],
@@ -1104,7 +1198,7 @@ class AgensgraphAdapter(GraphDBInterface):
         RETURN collect(DISTINCT properties(n)) AS centers,
                collect(DISTINCT properties(nbr)) AS nbrs
         """
-        result = await self.query(
+        result = await self._read(
             nodes_query, {"names": Jsonb(node_name), "label": Jsonb(node_type.__name__)}
         )
         if not result:
@@ -1124,7 +1218,7 @@ class AgensgraphAdapter(GraphDBInterface):
         WHERE a.id IN %(ids)s AND b.id IN %(ids)s
         RETURN TYPE(r) AS type, properties(r) AS properties
         """
-        edge_result = await self.query(edges_query, {"ids": Jsonb(node_ids)})
+        edge_result = await self._read(edges_query, {"ids": Jsonb(node_ids)})
 
         nodes = [(prop["id"], prop) for prop in by_id.values()]
         edges = [
@@ -1168,7 +1262,7 @@ class AgensgraphAdapter(GraphDBInterface):
         WHERE {where_clause}
         RETURN ID(n) AS id, get_labels(n) AS labels, properties(n) AS properties
         """
-        result_nodes = await self.query(query_nodes)
+        result_nodes = await self._read(query_nodes)
 
         nodes = [
             (
@@ -1183,7 +1277,7 @@ class AgensgraphAdapter(GraphDBInterface):
         WHERE {where_clause} AND {where_clause.replace("n.", "m.")}
         RETURN ID(n) AS source, ID(m) AS target, TYPE(r) AS type, properties(r) AS properties
         """
-        result_edges = await self.query(query_edges)
+        result_edges = await self._read(query_edges)
 
         edges = [
             (
@@ -1213,7 +1307,7 @@ class AgensgraphAdapter(GraphDBInterface):
             True if the graph exists, otherwise False.
         """
         query = "SELECT 1 FROM ag_graph WHERE graphname = %(graph_name)s"
-        result = await self.query(query, {"graph_name": graph_name})
+        result = await self._read(query, {"graph_name": graph_name})
         if (len(result) > 0):
             return True
         
@@ -1229,7 +1323,7 @@ class AgensgraphAdapter(GraphDBInterface):
             A formatted string of node labels.
         """
         node_labels_query = "SELECT labels FROM label_catalog WHERE graph_id = {self.graph_id}::oid"
-        node_labels_result = await self.query(node_labels_query)
+        node_labels_result = await self._read(node_labels_query)
         node_labels = node_labels_result[0]["labels"] if node_labels_result else []
 
         if not node_labels:
@@ -1253,7 +1347,7 @@ class AgensgraphAdapter(GraphDBInterface):
               labkind = 'e' AND
               labname <> 'ag_edge'
         """
-        relationship_types_result = await self.query(relationship_types_query)
+        relationship_types_result = await self._read(relationship_types_query)
         relationship_types = (
             relationship_types_result[0]["relationships"] if relationship_types_result else []
         )
@@ -1269,17 +1363,12 @@ class AgensgraphAdapter(GraphDBInterface):
         return relationship_types_undirected_str
 
     async def drop_graph(self, graph_name="cognee"):
-        """
-        Drop an existing graph from the database based on its name.
-
-        Parameters:
-        -----------
-
-            - graph_name: The name of the graph to drop, defaults to 'cognee'. (default
-              'cognee')
-        """
-        drop_query = f"DROP GRAPH IF EXISTS {graph_name} CASCADE"
-        await self.query(drop_query)
+        """Drop the graph and everything in it."""
+        await self._write(
+            sql.SQL("DROP GRAPH IF EXISTS {} CASCADE").format(sql.Identifier(graph_name))
+        )
+        if graph_name == self.graph_name:
+            self._engine.forget_graph()
 
     async def get_graph_metrics(self, include_optional=False):
         """
@@ -1375,7 +1464,7 @@ class AgensgraphAdapter(GraphDBInterface):
             collect(DISTINCT properties(made_node)) as made_from_nodes,
             collect(DISTINCT properties(type)) as orphan_types
         """
-        result = await self.query(query, {"content_hash": Jsonb(content_hash)})
+        result = await self._read(query, {"content_hash": Jsonb(content_hash)})
         return result[0] if result else None
 
     async def get_degree_one_nodes(self, node_type: str):
@@ -1402,128 +1491,5 @@ class AgensgraphAdapter(GraphDBInterface):
         WHERE count=1
         RETURN n
         """
-        result = await self.query(query)
+        result = await self._read(query)
         return [record["n"] for record in result] if result else []
-
-    @staticmethod
-    def _record_to_dict(record: NamedTuple) -> Dict[str, Any]:
-        """
-        Convert a record returned from an agensgraph query to a dictionary
-
-        Args:
-            record (): a record from an agensgraph query result
-
-        Returns:
-            Dict[str, Any]: a dictionary representation of the record where
-                the dictionary key is the field name and the value is the
-                value converted to a python type
-        """
-        # result holder
-        d = {}
-
-        # prebuild a mapping of vertex_id to vertex mappings to be used
-        # later to build edges
-        vertices = {}
-        for k in record._fields:
-            v = getattr(record, k)
-
-            # records comes back label[id]{properties} which must be parsed
-            if isinstance(v, str):
-                vertex = AgensgraphAdapter.vertex_regex.match(v)
-                if vertex:
-                    label, vertex_id, properties = vertex.groups()
-                    properties = json.loads(properties)
-                    vertices[str(vertex_id)] = properties
-
-        # iterate returned fields and parse appropriately
-        for k in record._fields:
-            v = getattr(record, k)
-
-            if isinstance(v, str):
-                vertex = AgensgraphAdapter.vertex_regex.match(v)
-                edge = AgensgraphAdapter.edge_regex.match(v)
-
-                if vertex:
-                    d[k] = json.loads(vertex.group(3))
-                elif edge:
-                    elabel, edge_id, start_id, end_id, properties = edge.groups()
-                    d[k] = (
-                        vertices.get(start_id, {}),
-                        elabel,
-                        vertices.get(end_id, {}),
-                    )
-                else:
-                    d[k] = v
-
-            else:
-                d[k] = v
-
-        return d
-
-    @staticmethod
-    def escape_str(val: str) -> str:
-        return val.replace("'", "''").replace("\\", "\\\\").replace('"', '\\"')
-
-    @staticmethod
-    def _format_properties(
-        properties: Dict[str, Any], id: Union[str, None] = None
-    ) -> str:
-        """
-        Convert a dictionary of properties to a string representation that
-        can be used in a cypher query insert/merge statement.
-
-        Args:
-            properties (Dict[str,str]): a dictionary containing node/edge properties
-            id (Union[str, None]): the id of the node or None if none exists
-
-        Returns:
-            str: the properties dictionary as a properly formatted string
-        """
-        props = []
-        for k, v in properties.items():
-            if isinstance(v, str):
-                v_escaped = AgensgraphAdapter.escape_str(v)
-                prop = f'"{k}": \'{v_escaped}\''
-            else:
-                prop = f'"{k}": {v}'
-            props.append(prop)
-
-        if id is not None and "id" not in properties:
-            id_val = AgensgraphAdapter.escape_str(v)(id) if isinstance(id, str) else id
-            props.append(f"id: '{id_val}'" if isinstance(id, str) else f"id: {id_val}")
-
-        return "{" + ", ".join(props) + "}"
-
-    async def _query(self, query: str) -> List[Dict[str, Any]]:
-        """
-        Query the graph by taking a cypher query, converting it to an
-        age compatible query, executing it and converting the result
-
-        Args:
-            query (str): a cypher query to be executed
-            params (dict): parameters for the query
-
-        Returns:
-            List[Dict[str, Any]]: a list of dictionaries containing the result set
-        """
-        # execute the query, rolling back on an error
-        async with self._engine.aconnection(graph_path=self.graph_name) as conn:
-            async with conn.cursor(row_factory=namedtuple_row) as curs:
-                try:
-                    await curs.execute(query)
-                    await conn.commit()
-                except psycopg.Error as e:
-                    await conn.rollback()
-                    raise AgensgraphQueryException(
-                        {
-                            "message": f"Error executing graph query: {query}",
-                            "detail": str(e),
-                        }
-                    ) from e
-                try:
-                    data = await curs.fetchall()
-                except psycopg.ProgrammingError:
-                    data = []  # Handle queries that don’t return data
-                if data is None:
-                    return []
-                return [self._record_to_dict(d) for d in data]

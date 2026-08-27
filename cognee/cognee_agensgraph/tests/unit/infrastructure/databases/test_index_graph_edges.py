@@ -1,7 +1,7 @@
 import pytest
 from unittest.mock import AsyncMock, patch
 from cognee.tasks.storage.index_graph_edges import index_graph_edges
-import cognee_agensgraph
+import cognee_agensgraph  # noqa: F401  (registers the adapters)
 
 
 @pytest.mark.asyncio

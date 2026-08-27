@@ -15,159 +15,202 @@ limitations under the License.
 """
 
 """
-Shared async connection pool for AgensGraph.
+Shared connection pool for AgensGraph.
 
-A Cognee run can configure both an AgensGraph graph adapter and an AgensGraph
-vector adapter against the same database. Rather than each opening its own
-``AsyncConnectionPool``, they share one ``AgensEngine`` per process — keyed by
-connection string in a refcounted registry: the pool opens once on first use
-and closes only when the last adapter releases it. ``graph_path`` is reapplied
-on every checkout because pooled connections are reused; relational/vector
-queries check out with ``graph_path=None``.
+The graph adapter and the vector adapter of one cognee run point at the same
+database, so they share one ``AgensEngine`` per connection string. The engine
+wraps the driver's ``AsyncConnectionPool``: the graph is selected once per
+connection, not once per checkout, and connections run in autocommit mode so a
+statement costs one round trip.
+
+The pool belongs to the event loop that opened it. cognee keeps one adapter for
+the life of the process, and a pool handed to a second ``asyncio.run()`` never
+answers, so the engine rebuilds the pool when it sees a different loop.
 """
 
 import asyncio
+import logging
+import threading
 from contextlib import asynccontextmanager
-from typing import Any, AsyncIterator, Dict, Optional
+from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional, Set
 
-import psycopg
-from psycopg import sql
-from psycopg_pool import AsyncConnectionPool, PoolTimeout
+import agensgraph
+from psycopg import errors, sql
+from psycopg.conninfo import conninfo_to_dict, make_conninfo
+
+logger = logging.getLogger(__name__)
 
 _ENGINES: Dict[str, "AgensEngine"] = {}
-_ENGINES_LOCK = asyncio.Lock()
+_ENGINES_LOCK = threading.Lock()
+
+APPLICATION_NAME = "cognee-agensgraph"
 
 
 class AgensEngine:
-    """A shareable async connection pool for AgensGraph."""
+    """A connection pool shared by every adapter that uses the same connection string."""
 
     def __init__(
         self,
         conninfo: str,
         *,
-        min_size: int = 4,
+        graph_name: str = "cognee",
+        min_size: int = 0,
         max_size: int = 16,
-        **pool_kwargs: Any,
     ) -> None:
+        if not conninfo_to_dict(conninfo).get("application_name"):
+            conninfo = make_conninfo(conninfo, application_name=APPLICATION_NAME)
         self.conninfo = conninfo
+        self.graph_name = graph_name
         self._min_size = min_size
         self._max_size = max_size
-        self._pool_kwargs = pool_kwargs
-        self._pool: Optional[AsyncConnectionPool] = None
-        self._opened = False
-        self._refcount = 0
-        self._lock = asyncio.Lock()
-        self._bootstrapped_graphs: set[str] = set()
-        self._bootstrapped_relational: set[str] = set()
-
-    # ---- lifecycle ----
+        self._pool: Optional[agensgraph.AsyncConnectionPool] = None
+        self._pool_loop: Optional[asyncio.AbstractEventLoop] = None
+        self._pool_open = False
+        # A plain lock. An asyncio.Lock binds to the first loop that waits on it and
+        # then fails from every other loop. Nothing held under this lock awaits.
+        self._lock = threading.Lock()
+        self._graph_ready = False
+        self.graph_id: Optional[int] = None
+        self.vectors = False
+        self._done: Set[str] = set()
 
     @classmethod
-    async def acquire(cls, conninfo: str, **kwargs: Any) -> "AgensEngine":
-        """Get-or-create the shared engine for ``conninfo`` and ref it."""
-        async with _ENGINES_LOCK:
+    def get(cls, conninfo: str, **kwargs: Any) -> "AgensEngine":
+        """The engine for ``conninfo``, created on first use."""
+        with _ENGINES_LOCK:
             engine = _ENGINES.get(conninfo)
             if engine is None:
                 engine = cls(conninfo, **kwargs)
                 _ENGINES[conninfo] = engine
-            engine._refcount += 1
-        await engine._open()
-        return engine
+            return engine
 
-    async def _open(self) -> None:
-        async with self._lock:
-            if not self._opened:
-                self._pool = AsyncConnectionPool(
+    # ---- the pool ----
+
+    async def _prepare(self) -> None:
+        """Create the graph if it is missing and learn what the database has.
+
+        Runs on a connection of its own, before the pool opens: the pool selects the
+        graph on every connection it makes, so the graph must exist first.
+        """
+        if self._graph_ready:
+            return
+        async with await agensgraph.AsyncConnection.connect(
+            self.conninfo, autocommit=True
+        ) as conn:
+            try:
+                await conn.execute(
+                    sql.SQL("CREATE GRAPH IF NOT EXISTS {}").format(
+                        sql.Identifier(self.graph_name)
+                    )
+                )
+            except (errors.DuplicateSchema, errors.DuplicateObject):
+                pass  # another process created it between the check and the create
+            cur = await conn.execute(
+                "SELECT oid FROM ag_graph WHERE graphname = %s", (self.graph_name,)
+            )
+            row = await cur.fetchone()
+            self.graph_id = row[0] if row else None
+            self.vectors = await conn.has_vectors()
+        self._graph_ready = True
+
+    async def _configure(self, conn: agensgraph.AsyncConnection) -> None:
+        """Prepare a new pooled connection. Runs once per connection, not per checkout."""
+        if self.vectors:
+            await conn.register_vectors()
+
+    async def pool(self) -> agensgraph.AsyncConnectionPool:
+        """The pool for the running event loop, opened on first use."""
+        running = asyncio.get_running_loop()
+        with self._lock:
+            if self._pool is None or self._pool_loop is not running:
+                if self._pool is not None:
+                    logger.warning(
+                        "the AgensGraph pool belongs to an event loop that has finished; "
+                        "its connections cannot be returned from another loop. Call "
+                        "finalize() before leaving a loop."
+                    )
+                self._pool = agensgraph.AsyncConnectionPool(
                     self.conninfo,
+                    graph=self.graph_name,
                     min_size=self._min_size,
                     max_size=self._max_size,
-                    open=False,
-                    **self._pool_kwargs,
+                    configure=self._configure,
+                    kwargs={"autocommit": True},
+                    check_connections=False,
                 )
-                await self._pool.open()
-                self._opened = True
+                self._pool_loop = running
+                self._pool_open = False
+            pool = self._pool
+            opened = self._pool_open
+        if not opened:
+            await self._prepare()
+            # Opening an open pool is not free: the driver checks the server with a
+            # connection of its own each time, about 3 ms. So the pool is opened once.
+            # Two callers arriving together both open it, which the pool itself allows.
+            await pool.open()
+            with self._lock:
+                if self._pool is pool:
+                    self._pool_open = True
+        return pool
 
-    async def release(self) -> None:
-        """Drop a reference; close the pool when the last holder releases."""
-        async with _ENGINES_LOCK:
-            self._refcount -= 1
-            if self._refcount <= 0:
-                self._refcount = 0
-                pool, self._pool, self._opened = self._pool, None, False
-                self._bootstrapped_graphs.clear()
-                self._bootstrapped_relational.clear()
-                _ENGINES.pop(self.conninfo, None)
-            else:
-                pool = None
+    @asynccontextmanager
+    async def connection(self) -> AsyncIterator[agensgraph.AsyncConnection]:
+        """Borrow a pooled connection. The graph is already selected on it."""
+        pool = await self.pool()
+        async with pool.connection() as conn:
+            yield conn
+
+    # ---- one-time work ----
+
+    async def setup_once(
+        self, tag: str, work: Callable[[agensgraph.AsyncConnection], Awaitable[None]]
+    ) -> None:
+        """Run ``work`` on a pooled connection once per engine.
+
+        Two callers arriving together may both run it; the work is DDL written with
+        IF NOT EXISTS, so that is harmless.
+        """
+        if tag in self._done:
+            return
+        async with self.connection() as conn:
+            await work(conn)
+        self._done.add(tag)
+
+    async def enable_vectors(self) -> None:
+        """Install pgvector if it is missing and make every pooled connection use it."""
+        if self.vectors:
+            return
+        async with await agensgraph.AsyncConnection.connect(
+            self.conninfo, autocommit=True
+        ) as conn:
+            try:
+                await conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
+            except errors.DuplicateObject:
+                pass
+            self.vectors = await conn.has_vectors()
+        with self._lock:
+            pool = self._pool if self._pool_loop is asyncio.get_running_loop() else None
+        if pool is not None and not pool.closed:
+            # Connections register the vector type when they are made; remake them.
+            await pool.drain()
+
+    async def aclose(self) -> None:
+        """Close the running loop's pool. The next use opens a new one."""
+        running = asyncio.get_running_loop()
+        with self._lock:
+            pool = self._pool if self._pool_loop is running else None
+            if pool is not None:
+                self._pool = None
+                self._pool_loop = None
+                self._pool_open = False
         if pool is not None:
             await pool.close()
 
-    # ---- connections ----
-
-    @asynccontextmanager
-    async def _checkout(self) -> AsyncIterator[psycopg.AsyncConnection]:
-        """Check out a pooled connection (workaround for a psycopg_pool bug)."""
-        try:
-            conn = await self._pool.getconn()
-        except PoolTimeout:
-            await self._pool._add_connection(None)  # pragma: no cover - pool workaround
-            conn = await self._pool.getconn()
-        try:
-            async with conn:
-                yield conn
-        finally:
-            await self._pool.putconn(conn)
-
-    @asynccontextmanager
-    async def aconnection(
-        self, *, graph_path: Optional[str] = None
-    ) -> AsyncIterator[psycopg.AsyncConnection]:
-        async with self._checkout() as conn:
-            if graph_path is not None:
-                async with conn.cursor() as cur:
-                    await cur.execute(
-                        sql.SQL("SET graph_path = {}").format(
-                            sql.Identifier(graph_path)
-                        )
-                    )
-            yield conn
-
-    # ---- one-time bootstrap ----
-
-    async def ensure_graph(self, graph_name: str, ddl) -> None:
-        """Run graph-creation DDL once per (engine, graph_name).
-
-        ``ddl`` is an async callable receiving a cursor with ``graph_path`` set.
-        """
-        async with self._lock:
-            if graph_name in self._bootstrapped_graphs:
-                return
-        async with self.aconnection() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    sql.SQL("CREATE GRAPH IF NOT EXISTS {}").format(
-                        sql.Identifier(graph_name)
-                    )
-                )
-                await cur.execute(
-                    sql.SQL("SET graph_path = {}").format(sql.Identifier(graph_name))
-                )
-                await ddl(cur)
-            await conn.commit()
-        async with self._lock:
-            self._bootstrapped_graphs.add(graph_name)
-
-    async def ensure_relational(self, tag: str, ddl) -> None:
-        """Run a named relational (table/index) bootstrap once per engine."""
-        async with self._lock:
-            if tag in self._bootstrapped_relational:
-                return
-        async with self.aconnection() as conn:
-            async with conn.cursor() as cur:
-                await ddl(cur)
-            await conn.commit()
-        async with self._lock:
-            self._bootstrapped_relational.add(tag)
+    def forget_graph(self) -> None:
+        """Called after the graph is dropped: the next use creates it again."""
+        self._graph_ready = False
+        self.graph_id = None
+        self._done.clear()
 
 
 __all__ = ["AgensEngine"]

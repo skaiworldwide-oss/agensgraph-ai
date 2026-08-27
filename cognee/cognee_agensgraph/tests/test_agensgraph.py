@@ -7,7 +7,7 @@ from cognee.modules.users.methods import get_default_user
 from cognee.shared.logging_utils import get_logger
 from cognee.modules.search.types import SearchType
 from cognee.modules.engine.models import NodeSet
-import cognee_agensgraph
+import cognee_agensgraph  # noqa: F401  (registers the adapters)
 
 logger = get_logger()
 

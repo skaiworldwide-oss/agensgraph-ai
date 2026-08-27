@@ -78,7 +78,7 @@ Not released yet -- this is what is in the tree.
 - **An element is written on the label naming what it is.** `MATCH (n:Author)`
   reads that label's storage and nothing else, so nothing has to keep a list of
   types or a scalar copy of one beside every element. Measured on twenty thousand
-  of each of two types, counting one of them: 248 buffers by label against 495
+  of each of two types, counting one of them: 217 buffers by label against 335
   through a btree over such a copy, which also cost an index entry on every
   write. Each label carries its own uniqueness on `id`, because a constraint on
   the label they inherit does not reach them.
@@ -86,7 +86,10 @@ Not released yet -- this is what is in the tree.
   text in a bag that has to come out of TOAST and be parsed before a distance can
   be taken, once per element a filter kept -- which is where a metadata-filtered
   search spent its time. Over 20,000 entities with a filter keeping one in ten:
-  538.9 ms against 3.0 ms. Decline it with `promote_embedding=False`.
+  1,209 ms against 171 ms for the same complete answer -- 7x, and 111x against
+  the un-promoted path once both are asked for every row they were asked for.
+  The 180x first published here compared a complete answer against a partial one.
+  Decline it with `promote_embedding=False`.
 - **The query's mode is read.** `VectorStoreQuery.mode` was never looked at, so
   every mode got a plain vector search. Hybrid, text search and MMR are answered
   now, `alpha`/`sparse_top_k`/`hybrid_top_k` do what they say, a metadata filter

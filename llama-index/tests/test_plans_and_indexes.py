@@ -228,7 +228,7 @@ def test_engine_pooling_roundtrip():
 
 
 # --------------------------------------------------------------------------- #
-# Performance-audit regression guards (index usage, batching)
+# Guards on index use and batching
 # --------------------------------------------------------------------------- #
 
 
@@ -619,3 +619,184 @@ def test_every_element_label_carries_its_own_uniqueness_on_id(
     }
     vec_store.connection.commit()
     assert "UNIQUELABEL" in unique, sorted(unique)
+
+
+def test_a_filtered_search_returns_as_many_rows_as_it_was_asked_for():
+    """An HNSW scan visits about ``hnsw.ef_search`` candidates and the metadata
+    filter is applied to those, so a filtered search for the ten nearest answered
+    with however many of those happened to pass -- two to eight of a requested ten
+    on 20,000 elements, and **none at all** in the shape below, with no error and
+    no warning either way.
+
+    Three things have to be true before this is visible, which is why every other
+    vector fixture in this suite is blind to it: the vector index has to be the
+    plan (left alone the planner reads a small label sequentially, which is
+    exact), there have to be more rows than the scan's window, and the filter has
+    to be selective enough that the window does not happen to contain ten
+    survivors. 5,000 rows and one bucket in fifty does it: 0 rows without the
+    setting, 10 with it.
+    """
+    import random
+
+    import agensgraph
+
+    graph = "test_filtered_completeness"
+    _drop_graph(graph)
+    store = AgensPropertyGraphStore(
+        graph, conf=_conf(), vector_dimension=8, create=True
+    )
+    store._ensure_element_labels(["THING"])
+
+    # Seeded, and random rather than arithmetic: a generated pattern repeats
+    # vectors often enough that HNSW behaves differently from real embeddings.
+    rng = random.Random(20260820)
+    conn = agensgraph.Connection.connect(autocommit=True, **_conf())
+    conn.register_vectors()
+    conn.graph(graph)
+    conn.load_vertices(
+        "THING",
+        [
+            {
+                "id": f"t{i}",
+                "name": f"t{i}",
+                "bucket": i % 50,
+                "embedding": [rng.random() for _ in range(8)],
+            }
+            for i in range(5000)
+        ],
+        graph=graph,
+    )
+    conn.execute("ANALYZE")
+    conn.close()
+
+    query = VectorStoreQuery(
+        query_embedding=[rng.random() for _ in range(8)],
+        similarity_top_k=10,
+        filters=MetadataFilters(
+            filters=[MetadataFilter(key="bucket", value=0, operator=FilterOperator.EQ)]
+        ),
+    )
+    store.connection.execute("SET enable_seqscan = off")
+    store.connection.commit()
+    try:
+        built = store._build_vector_query(query)
+        assert built is not None
+        plan = _plan_noseqscan(store.connection, *built)
+        assert "THING_entity" in plan, f"the vector index is not the plan: {plan[:300]}"
+
+        nodes, scores = store.vector_query(query)
+        assert len(nodes) == 10, (
+            f"asked for 10 and got {len(nodes)}; "
+            f"search options in force: {store.search_options}"
+        )
+        assert scores == sorted(scores, reverse=True), "scores came back out of order"
+    finally:
+        store.connection.execute("RESET enable_seqscan")
+        store.connection.commit()
+
+
+def test_the_search_settings_reach_a_pooled_connection():
+    """``SET LOCAL`` was the spelling, and a pooled connection is in autocommit --
+    there is no transaction for it to last for, so the settings silently did
+    nothing on every borrow, which is the one remedy for the row-count hole."""
+    from llama_index_agensgraph.engine import AgensEngine
+
+    graph = "test_filtered_completeness"
+    store = AgensPropertyGraphStore(
+        graph, conf=_conf(), vector_dimension=8, create=False, refresh_schema=False
+    )
+    assert store.search_options, "no search options were settled at construction"
+    engine = AgensEngine.from_conf(_conf(), graph=graph, min_size=1, max_size=3)
+    store._engine = engine
+    try:
+        # A row factory building named tuples cannot keep the dot, so the
+        # column comes back as hnsw_iterative_scan.
+        rows = store.structured_query("SHOW hnsw.iterative_scan")
+        assert rows[0]["hnsw_iterative_scan"] == "strict_order", rows
+    finally:
+        engine.close()
+
+
+def test_only_one_list_is_ever_bound_ahead_of_the_match(vec_store):
+    """Two row sources in front of one match is their product.
+
+    An OR of equalities is planned term by term, and on a property with no index
+    that growth is the whole cost -- a thousand names took 6.97 s against 74 ms.
+    So a list is bound instead; but binding both lists made five hundred of each
+    cost 221.8 ms against 102.8 ms for one. ``ids`` takes it when both are given,
+    being the key every element carries an index on. A single value takes neither:
+    the plain equality is asked of the index directly, 17.8 ms against a bound
+    list's 18.1 ms here and 15.1 against 22.8 on a larger graph.
+    """
+    def statement(**kwargs):
+        query, _ = vec_store._build_get_triplets(**kwargs)
+        return query.as_string(vec_store.connection)
+
+    one_name = statement(entity_names=["a"])
+    assert "UNWIND" not in one_name, one_name
+    assert one_name.count("e.name =") == 1
+
+    two_names = statement(entity_names=["a", "b"])
+    assert two_names.count("UNWIND") == 1, two_names
+    assert " OR " not in two_names, two_names
+
+    both = statement(ids=["i1", "i2"], entity_names=["a", "b"])
+    assert both.count("UNWIND") == 1, both
+    assert "e.id = gt_ids_key" in both, both
+    assert " OR " in both, both        # the names stay as they were
+
+    one_id = statement(ids=["i1"])
+    assert "UNWIND" not in one_id, one_id
+
+    # and every combination is still a statement the server accepts
+    for kwargs in (
+        {"entity_names": ["a"]},
+        {"entity_names": ["a", "b"]},
+        {"ids": ["i1"]},
+        {"ids": ["i1", "i2"]},
+        {"ids": ["i1", "i2"], "entity_names": ["a", "b"]},
+        {"entity_names": ["a", "b"], "relation_names": ["R"]},
+        {"ids": ["i1"], "properties": {"k": "v"}},
+        {"ids": ["i1", "i2"], "entity_names": ["a"], "relation_names": ["R"],
+         "properties": {"k": "v"}},
+    ):
+        vec_store.get_triplets(**kwargs)
+
+
+def test_a_bulk_load_leaves_the_labels_with_statistics(vec_store):
+    """A label written for the first time has none until the server's collector
+    reaches it on its own schedule, so the reads straight after a load are planned
+    from defaults -- ``get(ids=20)`` measured 18.84 ms that way against 2.24 ms
+    with statistics. Named label by label: a bare ``ANALYZE`` reaches every table
+    in the database, 35.6 s here.
+    """
+    from llama_index.core.graph_stores.types import EntityNode
+
+    vec_store.structured_query('MATCH (n:"Stat") DETACH DELETE n')
+    graph = vec_store.graph_name
+
+    def analyzed() -> set:
+        # read straight off the connection: a parameter given to the store is
+        # wrapped as jsonb for a Cypher comparison, which no catalog column takes
+        rows = vec_store.connection.execute(
+            "SELECT c.relname, s.last_analyze IS NOT NULL "
+            "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "LEFT JOIN pg_stat_all_tables s ON s.relid = c.oid "
+            "WHERE n.nspname = %s AND c.relkind = 'r'",
+            (graph,),
+        ).fetchall()
+        vec_store.connection.commit()
+        return {name for name, done in rows if done}
+
+    with vec_store.bulk_ingest():
+        vec_store.upsert_nodes([
+            EntityNode(label="Stat", name=f"s{i}", embedding=[0.1, 0.2, 0.3, 0.4])
+            for i in range(20)
+        ])
+    assert "Stat" in analyzed(), analyzed()
+
+    # and it is asked for this graph only, never as a bare ANALYZE
+    import inspect
+    source = inspect.getsource(type(vec_store).analyze)
+    assert "ANALYZE {}.{}" in source, source
+    vec_store.structured_query('MATCH (n:"Stat") DETACH DELETE n')

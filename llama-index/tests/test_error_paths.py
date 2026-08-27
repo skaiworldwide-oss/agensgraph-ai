@@ -19,7 +19,8 @@ import os
 import agensgraph
 import psycopg
 import pytest
-from llama_index.core.graph_stores.types import EntityNode
+from psycopg import sql
+from llama_index.core.graph_stores.types import EntityNode, Relation
 from llama_index.core.schema import TextNode
 from llama_index.core.vector_stores.types import VectorStoreQuery
 
@@ -308,3 +309,279 @@ def test_a_node_type_it_cannot_write_is_reported(store, caplog):
     assert any("upsert_llama_nodes" in r.getMessage() for r in caplog.records), [
         r.getMessage() for r in caplog.records
     ]
+
+
+def test_a_store_that_did_not_ask_for_vectors_installs_nothing():
+    """Opening a store used to run CREATE EXTENSION vector whatever it had been
+    asked for, putting 118 functions, six types and two access methods into a
+    database whose caller had asked for none of them -- and leaving them there if
+    construction failed after that."""
+    import agensgraph
+
+    admin = agensgraph.Connection.connect(
+        autocommit=True, **{**_conf(), "dbname": "postgres"}
+    )
+    admin.execute("DROP DATABASE IF EXISTS test_installs_nothing")
+    admin.execute("CREATE DATABASE test_installs_nothing")
+    admin.close()
+    fresh = {**_conf(), "dbname": "test_installs_nothing"}
+    try:
+        AgensPropertyGraphStore("plain", conf=fresh, create=True)
+        conn = agensgraph.Connection.connect(autocommit=True, **fresh)
+        try:
+            extensions = {
+                row[0] for row in conn.execute("SELECT extname FROM pg_extension")
+            }
+            functions = conn.execute(
+                "SELECT count(*) FROM pg_proc p JOIN pg_namespace n"
+                " ON n.oid = p.pronamespace WHERE n.nspname = 'public'"
+            ).fetchone()[0]
+        finally:
+            conn.close()
+        assert "vector" not in extensions, extensions
+        assert functions == 0, functions
+    finally:
+        admin = agensgraph.Connection.connect(
+            autocommit=True, **{**_conf(), "dbname": "postgres"}
+        )
+        admin.execute("DROP DATABASE IF EXISTS test_installs_nothing")
+        admin.close()
+
+
+def test_the_first_store_in_a_fresh_database_still_binds_vectors():
+    """``has_vectors()`` was asked before the extension was created, so the first
+    store in a database without it answered no, bound every embedding as decimal
+    text for its whole life, and gave back the 1.35x that binding a vector had
+    just won -- on the first-run, demo and notebook path."""
+    import agensgraph
+
+    admin = agensgraph.Connection.connect(
+        autocommit=True, **{**_conf(), "dbname": "postgres"}
+    )
+    admin.execute("DROP DATABASE IF EXISTS test_first_store")
+    admin.execute("CREATE DATABASE test_first_store")
+    admin.close()
+    fresh = {**_conf(), "dbname": "test_first_store"}
+    try:
+        store = AgensPropertyGraphStore(
+            "first", conf=fresh, create=True, vector_dimension=4
+        )
+        assert store._vectors_registered, (
+            "the first store in a fresh database is binding embeddings as jsonb"
+        )
+        built = store._build_vector_query(
+            VectorStoreQuery(query_embedding=[1.0, 0.0, 0.0, 0.0], similarity_top_k=2)
+        )
+        assert built is not None
+        from agensgraph.vector import Vector
+
+        assert isinstance(built[1]["query_embedding"], Vector)
+        store.close()
+    finally:
+        admin = agensgraph.Connection.connect(
+            autocommit=True, **{**_conf(), "dbname": "postgres"}
+        )
+        admin.execute("DROP DATABASE IF EXISTS test_first_store")
+        admin.close()
+
+
+def test_a_property_name_cannot_end_the_predicate_it_is_written_into(store):
+    """A property name is chosen by the caller and reaches the statement as an
+    identifier. Interpolated bare, a key of ``secret" IS NOT NULL OR e."secret``
+    turned a filter that matched nothing into one that matched everything -- and
+    gave ``delete`` the same reach.
+    """
+    store.structured_query('MATCH (n:"INJECT") DETACH DELETE n')
+    store.upsert_nodes(
+        [
+            EntityNode(label="INJECT", name="one", properties={"colour": "red"}),
+            EntityNode(label="INJECT", name="two", properties={"colour": "blue"}),
+        ]
+    )
+    payload = 'colour" IS NOT NULL OR e."colour'
+    assert store.get(properties={payload: "red"}) == []
+    # and the same name cannot widen a delete either
+    store.delete(properties={payload: "red"})
+    assert len(store.get(properties={"colour": "red"})) == 1
+    assert len(store.get(properties={"colour": "blue"})) == 1
+    store.structured_query('MATCH (n:"INJECT") DETACH DELETE n')
+
+
+def test_get_triplets_honours_the_limit_it_was_given(store):
+    """It was a literal 100 written into the statement, so a caller asking a broad
+    question was given a hundred rows and no way to know the answer had been cut.
+    No test passed ``limit``, so removing it again changes nothing the suite sees.
+    """
+    store.structured_query('MATCH (n:"LIMITED") DETACH DELETE n')
+    nodes = [EntityNode(label="LIMITED", name=f"l{i}") for i in range(6)]
+    store.upsert_nodes(nodes)
+    store.upsert_relations(
+        [
+            Relation(label="NEXT", source_id=nodes[i].id, target_id=nodes[i + 1].id)
+            for i in range(5)
+        ]
+    )
+    assert len(store.get_triplets(ids=[n.id for n in nodes])) == 5
+    assert len(store.get_triplets(ids=[n.id for n in nodes], limit=2)) == 2
+    store.structured_query('MATCH (n:"LIMITED") DETACH DELETE n')
+
+
+def test_get_triplets_filters_on_the_relation_and_the_properties_it_was_given(store):
+    """Both arguments were read off the call and then dropped."""
+    store.structured_query('MATCH (n:"FILTERED") DETACH DELETE n')
+    a = EntityNode(label="FILTERED", name="a", properties={"tier": "gold"})
+    b = EntityNode(label="FILTERED", name="b", properties={"tier": "tin"})
+    store.upsert_nodes([a, b])
+    store.upsert_relations(
+        [
+            Relation(label="LIKES", source_id=a.id, target_id=b.id),
+            Relation(label="AVOIDS", source_id=b.id, target_id=a.id),
+        ]
+    )
+    every = store.get_triplets(ids=[a.id, b.id])
+    assert len(every) == 2, [t[1].label for t in every]
+    only_likes = store.get_triplets(ids=[a.id, b.id], relation_names=["LIKES"])
+    assert [t[1].label for t in only_likes] == ["LIKES"]
+    only_gold = store.get_triplets(properties={"tier": "gold"})
+    assert [t[0].name for t in only_gold] == ["a"]
+    store.structured_query('MATCH (n:"FILTERED") DETACH DELETE n')
+
+
+def test_a_read_does_not_hand_back_the_keys_it_writes_with(store):
+    """``get`` used to add ``id`` and ``embedding`` to what it returned, so feeding
+    its result straight back to ``upsert_nodes`` set the node's own key to null --
+    the node became unreachable by id and a second one was created beside it."""
+    store.structured_query('MATCH (n:"ROUNDTRIP") DETACH DELETE n')
+    store.upsert_nodes(
+        [EntityNode(label="ROUNDTRIP", name="rt", properties={"colour": "green"})]
+    )
+    [read] = store.get(properties={"colour": "green"})
+    assert "id" not in read.properties, read.properties
+    assert "embedding" not in read.properties, read.properties
+
+    # written straight back, unchanged
+    store.upsert_nodes(
+        [EntityNode(label="ROUNDTRIP", name=read.name, properties=read.properties)]
+    )
+    again = store.get(properties={"colour": "green"})
+    assert len(again) == 1, [n.id for n in again]
+    assert again[0].id == read.id
+    store.structured_query('MATCH (n:"ROUNDTRIP") DETACH DELETE n')
+
+
+def test_two_entity_types_that_agree_for_63_bytes_stay_two_types(store):
+    """An identifier is 63 bytes and the server truncates a longer one rather than
+    refusing it, so two types agreeing that far arrived as one label: the second
+    ``CREATE VLABEL`` was refused as already there and that type's nodes were written
+    onto the first type's label. These are whatever a model called an entity type.
+    """
+    from llama_index_agensgraph.graph_stores.agensgraph.agensgraph_property_graph import (  # noqa: E501
+        _element_label,
+    )
+
+    stem = "Organisation" + "Subsidiary" * 6
+    assert len(stem.encode()) > 63
+    first, second = stem + "North", stem + "South"
+
+    bounded = {_element_label(first), _element_label(second)}
+    assert len(bounded) == 2, bounded
+    assert all(len(name.encode()) <= 63 for name in bounded)
+
+    for name in bounded:
+        store.structured_query(
+            sql.SQL("MATCH (n:{label}) DETACH DELETE n").format(
+                label=sql.Identifier(name)
+            )
+        )
+    store.upsert_nodes(
+        [
+            EntityNode(label=first, name="n1"),
+            EntityNode(label=second, name="s1"),
+        ]
+    )
+
+    # each type on its own label, and each with its own uniqueness on id
+    labels = {label.name for label in store.connection.labels(graph=GRAPH)}
+    store.connection.commit()
+    assert bounded <= labels, sorted(labels)
+    for name in bounded:
+        rows = store.structured_query(
+            sql.SQL("MATCH (n:{label}) RETURN n.id AS id").format(
+                label=sql.Identifier(name)
+            )
+        )
+        assert len(rows) == 1, (name, rows)
+
+    for name in bounded:
+        store.structured_query(
+            sql.SQL("MATCH (n:{label}) DETACH DELETE n").format(
+                label=sql.Identifier(name)
+            )
+        )
+
+
+def test_an_index_built_for_another_width_is_refused_not_adopted():
+    """A store opened against an existing index of a different width used to open
+    and then refuse every embedding written to it, one at a time, with nothing
+    pointing back at the mismatch. Where the embedding has a column of its own the
+    index names the column and nothing else, so the width has to be read from the
+    column's type -- without that spelling no index was recognised at all and the
+    two widths were never compared.
+    """
+    graph = "test_error_paths_dim"
+    first = AgensgraphVectorStore(url=_url(), embedding_dimension=4, graph_name=graph)
+    try:
+        first.add([
+            TextNode(id_="n1", text="one", embedding=[0.1, 0.2, 0.3, 0.4]),
+        ])
+        assert first.embedding_dimension == 4
+
+        # opened again for the same width: adopted, and the index is recognised
+        again = AgensgraphVectorStore(
+            url=_url(), embedding_dimension=4, graph_name=graph
+        )
+        assert again.retrieve_existing_index() is True
+        assert again.embedding_dimension == 4
+        again.close()
+
+        with pytest.raises(ValueError, match="4-dimensional"):
+            AgensgraphVectorStore(
+                url=_url(), embedding_dimension=384, graph_name=graph
+            )
+    finally:
+        first.close()
+        conn = agensgraph.Connection.connect(autocommit=True, **_conf())
+        conn.execute(f'DROP GRAPH IF EXISTS "{graph}" CASCADE')
+        conn.close()
+
+
+def test_a_copy_is_refused_before_it_ends_the_connection(store):
+    """``COPY`` needs the copy protocol, and the client library refuses it through
+    a plain execute only after the statement has reached the server -- leaving a
+    copy in progress that nothing can end. Every statement afterwards failed with
+    "another command is already in progress", and rollback, cancel and a second
+    rollback all failed the same way. Under a pool that connection goes back for
+    somebody else to borrow.
+    """
+    assert store.structured_query("RETURN 1 AS one") == [{"one": 1}]
+    for statement in (
+        "COPY (SELECT 1) TO STDOUT",
+        'COPY "Chunk" FROM STDIN',
+        "-- a comment\nCOPY x TO STDOUT",
+        "RETURN 1; COPY x FROM STDIN",
+    ):
+        with pytest.raises(ValueError, match="copy protocol"):
+            store.structured_query(statement)
+        # and the store still works, which is the whole point
+        assert store.structured_query("RETURN 1 AS one") == [{"one": 1}]
+
+    # a name or a string that merely contains the word is not the statement
+    store.structured_query("MATCH (n) WHERE n.copy IS NOT NULL RETURN count(*) AS c")
+    store.structured_query("RETURN 'COPY me' AS said")
+
+
+async def test_a_copy_is_refused_on_the_async_side_too(store):
+    with pytest.raises(ValueError, match="copy protocol"):
+        await store.astructured_query("COPY (SELECT 1) TO STDOUT")
+    assert await store.astructured_query("RETURN 1 AS one") == [{"one": 1}]
+    await store.aclose()

@@ -30,7 +30,8 @@ from typing import (
 )
 import re, json
 import asyncio
-import hashlib
+import threading
+from contextvars import ContextVar
 import logging
 import time
 from contextlib import asynccontextmanager, contextmanager
@@ -50,7 +51,16 @@ from llama_index.core.graph_stores.utils import value_sanitize
 from llama_index_agensgraph.engine import AgensEngine
 from llama_index_agensgraph.filters import metadata_filters_to_cypher
 from llama_index_agensgraph.graph_stores.agensgraph.utils import *
-from llama_index_agensgraph.graph_stores.agensgraph.utils import query_failed
+from llama_index_agensgraph.graph_stores.agensgraph.utils import (
+    COMPLETE_FILTERED_SEARCH,
+    aapply_search_options,
+    apply_search_options,
+    bounded_name,
+    check_no_copy,
+    known_search_options,
+    lost_the_creation_race,
+    query_failed,
+)
 from llama_index.core.prompts import PromptTemplate
 from llama_index.core.vector_stores.types import VectorStoreQuery
 import agensgraph
@@ -60,7 +70,6 @@ from agensgraph.vector import Vector, generated_column
 from agensgraph.cypher import check_single_statement
 from agensgraph.errors import safe_message
 from agensgraph.introspect import (
-    MAX_IDENTIFIER,
     Check,
     DesiredIndex,
     DesiredLabel,
@@ -204,26 +213,23 @@ def _property_equalities(
 
 
 
-def _bounded_name(*parts: str) -> str:
-    """A name for a constraint or an index that stays distinct after truncation.
+def _element_label(name: str) -> str:
+    """The label an element is written on.
 
-    An identifier is 63 bytes and a label can be longer -- these are whatever an LLM
-    called an entity type. Two labels agreeing for the first 63 bytes would be given
-    one name, and the second would be read as already there and skipped, leaving that
-    label without the uniqueness that stops two writers making two of one node.
+    A label name is limited to 63 bytes and the server truncates a longer one
+    instead of refusing it, so two entity types that match for 63 bytes become one
+    label and one type's nodes end up under the other's name. Entity types come
+    from a model, so names that long do happen.
+
+    A name that fits is used as it is. A longer one keeps what fits, plus a hash of
+    the whole name so the two stay apart.
     """
-    name = "_".join(parts)
-    encoded = name.encode()
-    if len(encoded) <= MAX_IDENTIFIER:
-        return name
-    digest = hashlib.blake2b(encoded, digest_size=8).hexdigest()
-    head = encoded[: MAX_IDENTIFIER - len(digest) - 1].decode("utf-8", "ignore")
-    return f"{head}_{digest}"
+    return bounded_name(name)
 
 
 def _unique_id_name(label: str) -> str:
     """The name for a label's assertion that ``id`` is unique."""
-    return _bounded_name(label, "unique_id")
+    return bounded_name(label, "unique_id")
 
 
 def _merge_race(exc: BaseException) -> bool:
@@ -263,16 +269,23 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         create: bool = True,
         refresh_schema: bool = True,
         engine: Optional[AgensEngine] = None,
-        retry_attempts: int = 3,
+        retry_attempts: int = 6,
         schema_sample: int = 100,
         async_pool_size: int = 10,
         promote_embedding: bool = True,
+        search_options: Optional[Dict[str, Any]] = None,
         statement_timeout: Optional[float] = None,
     ) -> None:
         """Create a new Agensgraph Graph instance."""
 
         self.graph_name = graph_name
         # How many times a statement the server says to try again is tried again.
+        # Six rather than the driver's three. A retry costs nothing when
+        # nothing is contending, and the alternative is a write that fails
+        # outright. How often a refusal escapes depends on how the writers
+        # happen to be scheduled -- ten of them over twenty-five shared keys
+        # let one through in one run of five and none in the next four -- so
+        # this is headroom, not a measured threshold.
         self.retry_policy = RetryPolicy(attempts=retry_attempts)
         # How many rows of a label establish its shape. Reading every row of a
         # label full of embeddings to learn that one key holds an array is
@@ -286,18 +299,33 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         # Labels whose embedding has a column of its own, so the index built over
         # it is spelled to match.
         self._promote_embedding = promote_embedding
+        self._asked_search_options = dict(search_options or {})
+        self.search_options: Dict[str, Any] = {}
         self._is_promoted = False
-        # Two coroutines reaching the first await would each build a pool
-        # and the second assignment would drop the first still holding its
-        # connections.
-        self._apool_lock = asyncio.Lock()
+        # Two coroutines reaching the first await would each build a pool and the
+        # second assignment would drop the first still holding its connections.
+        self._apool_lock = threading.Lock()
         self._promotion_read = False
         # Depth, not a flag: a caller's read-only block can hold another.
-        self._read_only_depth = 0
+        # Held per caller, not on the store. As plain attributes these were
+        # shared by everyone using it: one thread inside a read-only block made
+        # every other thread's write fail with 25006, and without an engine both
+        # died on the nesting. Worse, one caller's allow_server_programs=True was
+        # inherited by a caller that had asked for the safe default, skipping the
+        # refusal that is the whole boundary against COPY ... TO PROGRAM. A
+        # context variable is copied into each task and each thread and mutated
+        # only there, which is exactly the scope these want.
+        self._read_only_depth: ContextVar[int] = ContextVar(
+            f"agens_read_only_{id(self)}", default=0
+        )
         # Inside a bulk block the vector indexes are deliberately absent, so
         # a label first written there must not build one on the way in.
-        self._bulk_depth = 0
-        self._allow_server_programs = False
+        self._bulk_depth: ContextVar[int] = ContextVar(
+            f"agens_bulk_{id(self)}", default=0
+        )
+        self._allow_server_programs: ContextVar[bool] = ContextVar(
+            f"agens_server_programs_{id(self)}", default=False
+        )
         self.sanitize_query_output = sanitize_query_output
         self.enhanced_schema = enhanced_schema
         self.create_indexes = create_indexes
@@ -412,7 +440,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             # Nothing indexes the type: an element is written on the label naming it,
             # so asking for one type reads that label's storage and nothing else.
             # Measured on twenty thousand of each of two types, counting one of them:
-            # 248 buffers by label against 495 through a btree over a scalar copy,
+            # 217 buffers by label against 335 through a btree over a scalar copy,
             # which also cost a property in every element and an index on every write.
             if self._supports_vector_index:
                 self._create_vector_index()
@@ -449,11 +477,13 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         """
         if self._engine is not None:
             with self._engine.connection(graph_path=self.graph_name) as conn:
+                apply_search_options(conn, self.search_options)
                 yield conn
         else:
+            apply_search_options(self.connection, self.search_options)
             yield self.connection
 
-    async def _apool(self) -> "agensgraph.AsyncConnectionPool":
+    async def _apool(self) -> "agensgraph.AsyncNullConnectionPool":
         """The pool the async methods borrow from when no engine was supplied.
 
         One connection was held and handed to every caller, so two coroutines in
@@ -462,53 +492,74 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         at the wrong nesting level" and "graph_path is NULL". A borrower gets a
         connection to itself now.
 
-        It connects per borrow rather than keeping a set of connections warm. A
-        pool that keeps them runs its workers on the loop's executor, and
-        ``asyncio.run`` waits for that executor before it returns -- so a program
-        that used one async method and then ended would hang there, silently, with
-        nothing to suggest what it was waiting for. Keeping the connections is
-        worth having: twelve concurrent reads take 21.8 ms through a warm pool
-        against 104.3 ms connecting each time. It is offered as ``AgensEngine``,
-        which is a thing the caller holds and closes, rather than as a default
-        that hangs on the way out.
+        It connects per borrow rather than keeping connections warm, and that
+        costs: twelve concurrent rel maps take 118.3 ms this way against 51.8 ms
+        through the synchronous base class this replaced and 24.6 ms through a
+        warm pool. Warm is the better number and the wrong default. A pool that
+        keeps connections also keeps worker threads, and those outlive the loop
+        they were made on -- handed one loop per call, as a test runner does, it
+        wedges. Pass an :class:`AgensEngine` to get the warm pool: it is a thing
+        the caller holds for as long as their loop lives and closes when it ends,
+        which is exactly the lifetime the threads need and one this store cannot
+        know on its own.
 
-        Built on first use and keyed to the loop it was built on, since a pool
-        left over from a loop that has closed cannot be handed out.
+        Built on first use and keyed to the loop that built it, since a pool left
+        over from a loop that has closed cannot be handed out.
         """
         running = asyncio.get_running_loop()
-        if self._apool_pool is not None and self._apool_loop is running:
-            return self._apool_pool
-        async with self._apool_lock:
-            if self._apool_pool is not None and self._apool_loop is running:
-                return self._apool_pool
+        # A plain lock, not an asyncio one: an asyncio.Lock binds to the first
+        # loop that waits on it, and a store used from a second asyncio.run()
+        # then failed every read with "bound to a different event loop". Nothing
+        # held under this lock waits, so it does not need to be an async one.
+        with self._apool_lock:
+            if self._apool_pool is None or self._apool_loop is not running:
+                if self._apool_pool is not None:
+                    # Its loop is gone, so it cannot be closed from here and its
+                    # connections stay open until the process ends. Assigning
+                    # over it in silence is what let them accumulate: nineteen
+                    # backends across four loops, none given back.
+                    logger.warning(
+                        "this store's connection pool belongs to an event loop "
+                        "that has finished, so its connections cannot be given "
+                        "back from another one; await store.aclose() before "
+                        "leaving a loop, or use the store as an async context "
+                        "manager"
+                    )
 
-            async def configure(conn: "agensgraph.AsyncConnection") -> None:
-                if await conn.has_vectors():
-                    await conn.register_vectors()
+                async def configure(conn: "agensgraph.AsyncConnection") -> None:
+                    if await conn.has_vectors():
+                        await conn.register_vectors()
+                    await aapply_search_options(conn, self.search_options)
 
-            pool = agensgraph.AsyncNullConnectionPool(
-                make_conninfo(**self._conf),
-                graph=self.graph_name,
-                min_size=0,
-                max_size=self.async_pool_size,
-                configure=configure,
-                kwargs={"autocommit": True},
-                check_connections=False,
-            )
-            await pool.open()
-            self._apool_pool = pool
-            self._apool_loop = running
-        return self._apool_pool
+                self._apool_pool = agensgraph.AsyncNullConnectionPool(
+                    make_conninfo(**self._conf),
+                    graph=self.graph_name,
+                    min_size=0,
+                    max_size=self.async_pool_size,
+                    configure=configure,
+                    kwargs={"autocommit": True},
+                    check_connections=False,
+                )
+                self._apool_loop = running
+            pool = self._apool_pool
+        # Awaited by every caller, not only whoever built it. Publishing the pool
+        # and opening it afterwards let a second coroutine take it in between and
+        # be told "the pool is not open yet". Opening again is safe and takes the
+        # pool's own lock, so this opens it once and makes everyone wait for that.
+        await pool.open()
+        return pool
 
     @asynccontextmanager
     async def _aacquire(self) -> "AsyncIterator[psycopg.AsyncConnection]":
         """Async sibling of :meth:`_acquire`."""
         if self._engine is not None:
             async with self._engine.aconnection(graph_path=self.graph_name) as conn:
+                await aapply_search_options(conn, self.search_options)
                 yield conn
         else:
             pool = await self._apool()
             async with pool.connection() as conn:
+                await aapply_search_options(conn, self.search_options)
                 yield conn
 
     async def aclose(self) -> None:
@@ -527,6 +578,12 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             await self._aconn.close()
             self._aconn = None
 
+    async def __aenter__(self) -> "AgensPropertyGraphStore":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        await self.aclose()
+
     def close(self) -> None:
         """Close the connection this store opened for itself.
 
@@ -542,15 +599,32 @@ class AgensPropertyGraphStore(PropertyGraphStore):
 
     @require_psycopg
     def verify_vector_support(self) -> None:
+        """Whether this database can hold and search vectors.
+
+        The extension is only created for a store that was told a
+        ``vector_dimension`` -- that is what says the caller wants indexed vector
+        search. Creating it unconditionally put 118 functions, six types and two
+        access methods into the database of a store that had asked for none of
+        them, which is not this package's to decide, and left them there if
+        construction failed afterwards.
         """
-        Verify if the graph store supports vector operations
-        """
-        # check if the vector index is supported
         self._supports_vector_index = False
         self._supports_vector_store = False
         with self._get_cursor() as curs:
             try:
-                curs.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+                if self.vector_dimension:
+                    curs.execute("CREATE EXTENSION IF NOT EXISTS vector;")
+                    self.connection.commit()
+                    # Asked again now: the first store in a database without the
+                    # extension answered this before creating it, bound every
+                    # embedding as decimal text for its whole life, and gave back
+                    # the 1.35x that binding a vector had just won.
+                    if not self._vectors_registered and self.connection.has_vectors():
+                        self.connection.register_vectors()
+                        self._vectors_registered = True
+                elif not self.connection.has_vectors():
+                    self.connection.commit()
+                    return
                 self.connection.commit()
                 self._supports_vector_store = True
                 if self.vector_dimension:
@@ -561,6 +635,16 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                         self._promote_embedding
                         and self.connection.can_promote_properties()
                     )
+                # A filtered search visits about hnsw.ef_search candidates and
+                # filters those, so without this it answers with however many of
+                # them happened to pass -- two to eight of a requested ten.
+                # Whatever the caller asked for wins.
+                self.search_options = known_search_options(
+                    self.connection,
+                    {**COMPLETE_FILTERED_SEARCH, **self._asked_search_options},
+                )
+                self.connection.commit()
+                apply_search_options(self.connection, self.search_options)
             except psycopg.Error:
                 self.connection.rollback()
                 logger.log(logging.WARNING, """Vector extension not supported\nUnable to install pg_vector extension""")
@@ -651,12 +735,40 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             return
         if self._promoted():
             return
-        self.structured_query(
-            sql.SQL(
-                "ALTER VLABEL {} ADD COLUMN "
-                + generated_column("embedding", int(self.vector_dimension))
-            ).format(sql.Identifier(BASE_NODE_LABEL))
-        )
+        # Reading whether the column is there and then adding it is two steps, and
+        # there is no IF NOT EXISTS arm to close the gap, so several stores opening
+        # the same graph at once each found it missing: one won and the rest were
+        # told the column already exists. Under the graph's own lock, and content
+        # to lose the race, since losing it means the column is there.
+        try:
+            with self._acquire() as conn:
+                try:
+                    with conn.transaction():
+                        conn.execute(
+                            "SELECT pg_advisory_xact_lock(%s)", (int(self.graphid),)
+                        )
+                        declared = conn.declared_properties(
+                            BASE_NODE_LABEL, graph=self.graph_name
+                        )
+                        if not any(prop.name == "embedding" for prop in declared):
+                            conn.execute(
+                                sql.SQL(
+                                    "ALTER VLABEL {} ADD COLUMN "
+                                    + generated_column(
+                                        "embedding", int(self.vector_dimension)
+                                    )
+                                ).format(sql.Identifier(BASE_NODE_LABEL))
+                            )
+                finally:
+                    # The lock lasts as long as the *transaction*, and on a
+                    # connection that is not in autocommit there is already one
+                    # open -- so the block above is a savepoint, releasing it
+                    # keeps the lock, and the next store to construct waits on it
+                    # for as long as this one lives. Committing is what ends it.
+                    conn.commit()
+        except psycopg.Error as e:
+            if not lost_the_creation_race(e):
+                raise query_failed("promoting the embedding", e) from e
         self._is_promoted = True
         # Every index that was there was built over the property map, and the
         # query now asks about the column, so none of them can serve one. Dropped
@@ -675,7 +787,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             # What it has always been called, so a graph written before this keeps
             # the index it has instead of gaining a second one beside it.
             return VECTOR_INDEX_NAME
-        return _bounded_name(label, VECTOR_INDEX_NAME)
+        return bounded_name(label, VECTOR_INDEX_NAME)
 
     def _create_vector_index(self, labels: Optional[Iterable[str]] = None) -> None:
         """Build the HNSW index over the embeddings, on every label that holds any.
@@ -744,15 +856,48 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                     sql.Identifier(self._vector_index_name(label))
                 )
             )
-        self._bulk_depth += 1
+        depth = self._bulk_depth.set(self._bulk_depth.get() + 1)
         try:
             yield
         finally:
-            self._bulk_depth -= 1
-            if not self._bulk_depth:
+            self._bulk_depth.reset(depth)
+            if not self._bulk_depth.get():
                 # Every label, not only the ones dropped: a label first written
                 # inside the block needs one too.
                 self._create_vector_index()
+                self.analyze()
+
+    def analyze(self) -> None:
+        """Collect statistics for this graph's labels.
+
+        A new label has no statistics until the server gets round to it, so reads
+        straight after a load are planned from defaults. On 20,000 nodes and as
+        many edges: ``get(ids=20)`` 18.84 ms before, 2.24 ms after;
+        ``get(ids=200)`` 20.17 ms, then 5.50 ms. Not every call improves --
+        ``get_triplets(ids=200)`` went from 15.45 ms to 20.43 ms. Collecting cost
+        794 ms for that graph's seven tables.
+
+        Each label is named, because a bare ``ANALYZE`` covers every table in the
+        database and took 35.6 s here.
+        """
+        with self._acquire() as conn:
+            try:
+                tables = conn.execute(
+                    "SELECT c.relname FROM pg_class c "
+                    "JOIN pg_namespace n ON n.oid = c.relnamespace "
+                    "WHERE n.nspname = %s AND c.relkind = 'r'",
+                    (self.graph_name,),
+                ).fetchall()
+                for (name,) in tables:
+                    conn.execute(
+                        sql.SQL("ANALYZE {}.{}").format(
+                            sql.Identifier(self.graph_name), sql.Identifier(name)
+                        )
+                    )
+            except psycopg.Error as e:
+                raise query_failed("collecting statistics", e) from e
+            finally:
+                conn.commit()
 
     def create_property_index(
         self, property_name: str, label: Optional[str] = None
@@ -779,7 +924,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         """Make a btree index exist for each label and property named."""
         desired = [
             DesiredIndex(
-                label, (prop,), False, _bounded_name(label, prop, "idx"), "btree", None
+                label, (prop,), False, bounded_name(label, prop, "idx"), "btree", None
             )
             for label in labels
             for prop in properties
@@ -797,6 +942,8 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                         conn.ensure_indexes(desired, graph=self.graph_name)
                 except psycopg.Error as e:
                     raise query_failed("declaring property indexes", e) from e
+                finally:
+                    conn.commit()
 
         self._run_with_retry(once)
 
@@ -951,9 +1098,9 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         # same one twice is asking for two constraints of the same name.
         wanted = list(
             dict.fromkeys(
-                label
+                _element_label(label)
                 for label in labels
-                if label and label not in self._declared_labels
+                if label and _element_label(label) not in self._declared_labels
             )
         )
         if not wanted:
@@ -967,7 +1114,10 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             try:
                 # Everything here in one transaction, so a refusal takes the whole
                 # group back rather than leaving the connection unable to run
-                # anything else.
+                # anything else. Committed in the `finally` below: the advisory
+                # lock lasts as long as the transaction, and on a connection that
+                # is not in autocommit one is already open -- so this block is a
+                # savepoint, and releasing a savepoint keeps the lock.
                 with conn.transaction():
                     # Reconciling reads what is there and then creates what is not,
                     # which is two steps: eight writers all found Person missing and
@@ -995,6 +1145,8 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                     )
             except psycopg.Error as e:
                 raise query_failed(f"declaring labels {wanted}", e) from e
+            finally:
+                conn.commit()
         # A property asked for before this label existed is indexed on it now.
         if self._indexed_properties:
             self._ensure_property_indexes(wanted, sorted(self._indexed_properties))
@@ -1002,7 +1154,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         # label's storage and the base label's does not reach it. Not inside a bulk
         # block -- building it there is the cost that block exists to avoid, and
         # the block builds every label's on the way out.
-        if not self._bulk_depth:
+        if not self._bulk_depth.get():
             self._create_vector_index(wanted)
 
     def _ensure_constraints(self, desired: List[Any]) -> None:
@@ -1018,6 +1170,8 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                         conn.ensure_constraints(desired, graph=self.graph_name)
                 except psycopg.Error as e:
                     raise query_failed(f"declaring constraints {desired}", e) from e
+                finally:
+                    conn.commit()
 
         self._run_with_retry(once)
 
@@ -1083,7 +1237,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         # and nothing keeps a scalar copy of the label beside it.
         by_label: Dict[str, List[dict]] = {}
         for entity in entity_dicts:
-            by_label.setdefault(entity["label"], []).append(entity)
+            by_label.setdefault(_element_label(entity["label"]), []).append(entity)
 
         for label, entities in by_label.items():
             for index in range(0, len(entities), CHUNK_SIZE):
@@ -1162,7 +1316,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         by_label: Dict[str, List[dict]] = {}
         for r in relations:
             d = r.model_dump()
-            by_label.setdefault(d["label"], []).append(d)
+            by_label.setdefault(_element_label(d["label"]), []).append(d)
 
         ops: List[Tuple[sql.Composed, Dict[str, Any]]] = []
         for label, rels in by_label.items():
@@ -1224,19 +1378,30 @@ class AgensPropertyGraphStore(PropertyGraphStore):
     def _keyed_equalities(
         field: str, values: List[str], name: str
     ) -> Tuple[str, str, Dict[str, Any]]:
-        """A prelude and a predicate that ask the index once per value.
+        """A prelude and a predicate that check each value against the index.
 
-        An OR of equalities reaches the index too, and executes at the same speed
-        -- but the planner has to work through every term of it, and that grows
-        with the list: on 5,000 ids, 151.7 ms of planning against 0.2 ms, roughly
-        half the statement. One bound list costs the same to plan whatever its
-        length.
+        Writing the values out as ``a = v1 OR a = v2 OR ...`` also uses the index,
+        but the planner works through every term, so planning grows with the list:
+        5,000 ids cost 151.7 ms to plan against 0.2 ms here, about half the
+        statement. Binding one list costs the same at any length.
 
-        The form matters. ``UNWIND range(...) AS i ... WHERE e.id = ids[i]``,
-        subscripting the list inside the predicate, is not something the index can
-        serve and reads the whole label; unwinding the values themselves and
-        comparing against the unwound one is.
+        On an indexed property -- ``id`` always is, from the uniqueness each label
+        declares -- both forms run at the same speed and only planning differs. On
+        an unindexed one like ``name``, the difference is the whole cost: 1,000
+        names took 5.05 s the old way against 51 ms, and 5,000 took 33.0 s against
+        192 ms.
+
+        Only one list per statement can be bound this way. Two lists in front of one
+        match multiply out: 500 of each took 221.8 ms, against 102.8 ms with one
+        bound and the other written out.
         """
+        if len(values) == 1:
+            # A single value is faster written out: 15.1 ms against 22.8 ms, since
+            # binding a list still costs the extra step in front of the match. From
+            # two values on, the bound list wins and stays flat, while writing them
+            # out adds about 14 ms per value.
+            single = f"{name}_0"
+            return ("", f"{field} = %({single})s", {single: Jsonb(values[0])})
         key = f"{name}_key"
         return (
             f"UNWIND %({name})s AS {key} ",
@@ -1433,10 +1598,21 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                         t.target_type,
                         t.target_properties - 'embedding' - 'name' AS target_properties
                 FROM ("""
+        # Only one of these lists can be bound, since two UNWINDs in front of one
+        # MATCH multiply out: 500 of each took 221.8 ms, against 102.8 ms with one
+        # bound. `ids` gets it when both are given, because every element has an
+        # index on id, so it narrows the most.
+        keyed = name_keyed = None
         if ids:
             prelude, keyed, id_params = self._keyed_equalities("e.id", ids, "gt_ids")
             query += prelude
             params.update(id_params)
+        elif entity_names:
+            prelude, name_keyed, name_params = self._keyed_equalities(
+                "e.name", entity_names, "gt_names"
+            )
+            query += prelude
+            params.update(name_params)
         query += "MATCH (e)-[r]->(t) "
 
         # Collected and joined once. Each argument used to add its own separator, so a
@@ -1445,7 +1621,9 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         # a syntax error, and the one test covering the method passes only entity_names.
         predicates = [f"label(e) <> '{CHUNK_LABEL}'"]
 
-        if entity_names:
+        if name_keyed:
+            predicates.append(name_keyed)
+        elif entity_names:
             frag, p = self._or_equalities("e.name", entity_names, "etn")
             predicates.append(frag)
             params.update(p)
@@ -1565,10 +1743,9 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                             t.target_properties - 'embedding' - 'id' AS target_properties
                       FROM (
                 """
-        # The seeds are unwound and compared against the unwound value, which the
-        # id index serves. Subscripting the list inside the predicate --
-        # `UNWIND range(...) AS i ... WHERE e.id = ids[i]`, which stood here once
-        # -- is not something it can serve, and read the whole label per call.
+        # The seeds are bound as one list and compared against the unwound value,
+        # which the id index serves and which costs the same to plan however many
+        # there are.
         seed_prelude, seed_frag, seed_params = self._keyed_equalities(
             "e.id", ids, "rm_ids"
         )
@@ -1684,7 +1861,7 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 ops.append(
                     (
                         sql.SQL("MATCH ()-[r:{rel}]->() DELETE r").format(
-                            rel=sql.Identifier(rel)
+                            rel=sql.Identifier(_element_label(rel))
                         ),
                         {},
                     )
@@ -1943,7 +2120,8 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         """
 
         bound = _cypher_params(param_map if param_map is not None else params)
-        if self._read_only_depth:
+        check_no_copy(query)
+        if self._read_only_depth.get():
             check_single_statement(str(query))
         return self._run_with_retry(lambda: self._run_once(query, bound))
 
@@ -1964,22 +2142,24 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         reports only the first result, so a read with a write after a semicolon
         runs the write and looks like the read.
         """
-        self._read_only_depth += 1
-        if self._read_only_depth == 1:
-            self._allow_server_programs = allow_server_programs
+        depth = self._read_only_depth.set(self._read_only_depth.get() + 1)
+        # Set on every entry, not only the outermost: a nested block asking for
+        # the safe default must get it, whatever the block around it accepted.
+        programs = self._allow_server_programs.set(allow_server_programs)
         try:
             yield
         finally:
-            self._read_only_depth -= 1
+            self._read_only_depth.reset(depth)
+            self._allow_server_programs.reset(programs)
 
     def _run_once(
         self, query: str, bound: Optional[Dict[str, Any]]
     ) -> List[Dict[str, Any]]:
         """One attempt at a statement, rolling back if the server refuses it."""
         with self._acquire() as conn:
-            if self._read_only_depth:
+            if self._read_only_depth.get():
                 with conn.read_only_transaction(
-                    allow_server_programs=self._allow_server_programs
+                    allow_server_programs=self._allow_server_programs.get()
                 ):
                     return self._rows(conn, query, bound)
             return self._rows(conn, query, bound)
@@ -1994,10 +2174,10 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         with conn.cursor(row_factory=psycopg.rows.namedtuple_row) as curs:
             try:
                 curs.execute(query, bound)
-                if not self._read_only_depth:
+                if not self._read_only_depth.get():
                     conn.commit()
             except psycopg.Error as e:
-                if not self._read_only_depth:
+                if not self._read_only_depth.get():
                     try:
                         conn.rollback()
                     except psycopg.Error:
@@ -2047,11 +2227,19 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         Eight writers merging onto a shared set of keys refused 95 statements in 200
         without this, because every one of those refusals was another writer holding the
         key for the moment it took to commit.
+
+        A success is reported back to the policy. The allowance behind it is spent
+        by every refusal and paid back only by that report, and it is shared
+        across the process -- so without it a long-running writer stops retrying
+        after a handful of collisions and stays that way. Ten writers over
+        twenty-five shared keys let a 40001 through for want of this.
         """
         number = 0
         while True:
             try:
-                return attempt()
+                result = attempt()
+                self.retry_policy.succeeded()
+                return result
             except AgensQueryException as failure:
                 cause = failure.__cause__
                 number += 1
@@ -2074,13 +2262,16 @@ class AgensPropertyGraphStore(PropertyGraphStore):
     ) -> List[Dict[str, Any]]:
         """Async counterpart of :meth:`structured_query` (true async I/O)."""
         bound = _cypher_params(param_map if param_map is not None else params)
-        if self._read_only_depth:
+        check_no_copy(query)
+        if self._read_only_depth.get():
             check_single_statement(str(query))
 
         number = 0
         while True:
             try:
-                return await self._arun_once(query, bound)
+                result = await self._arun_once(query, bound)
+                self.retry_policy.succeeded()
+                return result
             except AgensQueryException as failure:
                 cause = failure.__cause__
                 number += 1
@@ -2097,9 +2288,9 @@ class AgensPropertyGraphStore(PropertyGraphStore):
     ) -> List[Dict[str, Any]]:
         """Async sibling of :meth:`_run_once`."""
         async with self._aacquire() as conn:
-            if self._read_only_depth:
+            if self._read_only_depth.get():
                 async with conn.read_only_transaction(
-                    allow_server_programs=self._allow_server_programs
+                    allow_server_programs=self._allow_server_programs.get()
                 ):
                     return await self._arows(conn, query, bound)
             return await self._arows(conn, query, bound)
@@ -2114,10 +2305,10 @@ class AgensPropertyGraphStore(PropertyGraphStore):
         async with conn.cursor(row_factory=psycopg.rows.namedtuple_row) as curs:
             try:
                 await curs.execute(query, bound)
-                if not self._read_only_depth:
+                if not self._read_only_depth.get():
                     await conn.commit()
             except psycopg.Error as e:
-                if not self._read_only_depth:
+                if not self._read_only_depth.get():
                     try:
                         await conn.rollback()
                     except psycopg.Error:

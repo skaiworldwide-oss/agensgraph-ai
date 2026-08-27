@@ -103,3 +103,50 @@ def test_many_writers_build_the_store_and_write_shared_keys():
     # One element per key, not one per writer: a label carries its own uniqueness
     # on id, and a constraint on the parent does not reach a child.
     assert count == KEYS
+
+
+def test_no_advisory_lock_is_held_between_calls():
+    """Declaring a label takes the graph's advisory lock, which lasts as long as
+    the transaction holding it.
+
+    On a connection that is not in autocommit a transaction is already open, so
+    ``with conn.transaction():`` opens a *savepoint* -- and releasing a savepoint
+    ends neither the transaction nor the lock. The store kept it, and the next one
+    to touch that graph waited for this one to be garbage collected: the suite
+    stopped dead rather than failing.
+
+    This asserts the invariant -- nothing still holds it once the calls that took
+    it have returned. It is a guard, not a reproduction: the failure was found by
+    the suite stopping dead rather than failing, and most call sequences commit
+    soon enough afterwards to release the lock by accident, which is exactly why
+    it was invisible until two stores wanted the same graph.
+    """
+    from llama_index.core.graph_stores.types import EntityNode
+
+    from llama_index_agensgraph.graph_stores.agensgraph import AgensPropertyGraphStore
+
+    conn = agensgraph.Connection.connect(autocommit=True, **_conf())
+    conn.execute("DROP GRAPH IF EXISTS test_lock_release CASCADE")
+    conn.close()
+
+    store = AgensPropertyGraphStore("test_lock_release", conf=_conf(), create=True)
+    store.upsert_nodes([EntityNode(name="a", label="Held")])
+    # Nothing between this and the check: a later statement on the same
+    # connection would commit and end the lock by accident, which is what makes
+    # this hard to see in ordinary use and catastrophic when it happens.
+    store._ensure_element_labels(["Fresh"])
+
+    watcher = agensgraph.Connection.connect(autocommit=True, **_conf())
+    try:
+        held = watcher.execute(
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'"
+            " AND objid = (SELECT oid FROM ag_graph WHERE graphname = %s)",
+            ("test_lock_release",),
+        ).fetchone()[0]
+    finally:
+        watcher.close()
+    store.close()
+    assert held == 0, (
+        f"{held} advisory lock(s) on the graph are still held after the calls "
+        "that took them returned"
+    )

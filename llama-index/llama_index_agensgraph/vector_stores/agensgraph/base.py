@@ -9,19 +9,15 @@ from typing import (
     Tuple,
 )
 import asyncio
+import time
 import logging
 import re
 
 from contextlib import asynccontextmanager, contextmanager
 
 import agensgraph
-from agensgraph import Edge, Vertex
-from agensgraph.vector import (
-    Distance,
-    Vector,
-    generated_column,
-    search_option_statements,
-)
+from agensgraph import RetryPolicy, Edge, Vertex
+from agensgraph.vector import Distance, Vector, generated_column
 from agensgraph.errors import safe_message
 from agensgraph.introspect import DesiredIndex
 import psycopg
@@ -30,7 +26,17 @@ from psycopg.types.json import Jsonb
 
 from llama_index_agensgraph.engine import AgensEngine
 from llama_index_agensgraph.filters import metadata_filters_to_cypher
-from llama_index_agensgraph.graph_stores.agensgraph.utils import AgensQueryException
+from llama_index_agensgraph.graph_stores.agensgraph.utils import (
+    COMPLETE_FILTERED_SEARCH,
+    AgensQueryException,
+    aapply_search_options,
+    apply_search_options,
+    bounded_name,
+    check_no_copy,
+    known_search_options,
+    lost_the_creation_race,
+    query_failed,
+)
 
 from llama_index.core.bridge.pydantic import PrivateAttr
 from llama_index.core.schema import BaseNode, MetadataMode
@@ -63,6 +69,17 @@ VECTOR_INDEX_EXPR = re.compile(
         ::vector\( (?P<dimensions>\d+) \)""",
     re.VERBOSE,
 )
+# An index over a promoted column has no cast to read: the column is already a
+# vector, so the definition is `USING hnsw (embedding vector_cosine_ops)` and the
+# dimension is in the column's type instead. Without this spelling an existing
+# index went unrecognised, so the dimension it was built for was never compared
+# with the one asked for -- the store opened, and every query after it failed.
+PROMOTED_INDEX_EXPR = re.compile(
+    r"""USING \s+ \w+ \s* \(\s*
+        "?(?P<property>[A-Za-z_][A-Za-z0-9_]*)"? \s+ \w*vector\w* """,
+    re.VERBOSE,
+)
+VECTOR_TYPE_EXPR = re.compile(r"vector\(\s*(?P<dimensions>\d+)\s*\)")
 TEXT_INDEX_EXPR = re.compile(
     r"""to_tsvector\( \s* '[^']*' \s* , \s*
         "?(?P<property>[A-Za-z_][A-Za-z0-9_]*)"? \s* \)""",
@@ -191,6 +208,7 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
     _url: str = PrivateAttr()
     _vectors_registered: bool = PrivateAttr(default=False)
     _promoted: bool = PrivateAttr(default=False)
+    _retry_policy: RetryPolicy = PrivateAttr()
     _apool_pool: Optional[Any] = PrivateAttr(default=None)
     _apool_loop: Optional[Any] = PrivateAttr(default=None)
     _apool_lock: Any = PrivateAttr(default=None)
@@ -211,6 +229,7 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         promote_embedding: bool = True,
         index_options: Optional[Dict[str, Any]] = None,
         search_options: Optional[Dict[str, Any]] = None,
+        retry_attempts: int = 6,
         engine: Optional[AgensEngine] = None,
         **kwargs: Any,
     ) -> None:
@@ -276,7 +295,9 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
             [index_name, node_label, embedding_node_property, text_node_property],
         )
 
-        self.database_query(sql.SQL("CREATE GRAPH IF NOT EXISTS {}").format(
+        self._retry_policy = RetryPolicy(attempts=retry_attempts)
+
+        self._create_if_absent(sql.SQL("CREATE GRAPH IF NOT EXISTS {}").format(
             sql.Identifier(self._graph_name)
         ))
         self.database_query(sql.SQL("SET graph_path = {}").format(
@@ -284,6 +305,15 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         ))
 
         self.verify_vector_support()
+        # A filtered search visits about hnsw.ef_search candidates and filters
+        # those, so without this it answers with however many happened to pass.
+        # Whatever the caller asked for wins.
+        self.search_options = known_search_options(
+            self._connection,
+            {**COMPLETE_FILTERED_SEARCH, **dict(self.search_options)},
+        )
+        self._connection.commit()
+        apply_search_options(self._connection, self.search_options)
 
         # The `add` path MERGEs nodes by `id`; without a btree index on that
         # property every MERGE falls back to a sequential scan, making ingest
@@ -310,7 +340,7 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
 
     def verify_label_existence(self) -> None:
         """Create label if it does not exist."""
-        self.database_query(
+        self._create_if_absent(
             sql.SQL("CREATE VLABEL IF NOT EXISTS {}").format(
                 sql.Identifier(self.node_label)
             )
@@ -345,7 +375,7 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
             target_label,
             (property_name,),
             unique,
-            f"{target_label}_{property_name}_idx",
+            bounded_name(target_label, property_name, "idx"),
             "btree",
             None,
         )
@@ -353,6 +383,13 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
             try:
                 with conn.transaction():
                     conn.ensure_indexes([desired], graph=self._graph_name)
+            except (
+                psycopg.errors.DuplicateTable,
+                psycopg.errors.DuplicateObject,
+            ):
+                # Another construction built the same index a moment ago, which is
+                # what this asked for.
+                pass
             except psycopg.errors.UniqueViolation:
                 if not unique:
                     raise
@@ -475,7 +512,7 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
                 sql.SQL("{} = {}").format(sql.SQL(name), sql.Literal(value))
                 for name, value in sorted(self.index_options.items())
             ) + sql.SQL(")")
-        self.database_query(
+        self._create_if_absent(
             sql.SQL(
                 "CREATE PROPERTY INDEX IF NOT EXISTS {index_name} "
                 "ON {node_label} USING hnsw "
@@ -498,6 +535,33 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
                 except psycopg.Error:
                     pass
 
+    def _promoted_dimensions(
+        self, label: str, prop: str, cache: Dict[str, int]
+    ) -> Optional[int]:
+        """The width of ``prop`` where it is a column of its own on ``label``.
+
+        An index over a promoted column names the column and nothing else, so the
+        width has to come from the column's declared type.
+        """
+        key = f"{label}.{prop}"
+        if key in cache:
+            return cache[key]
+        with self._acquire() as conn:
+            try:
+                declared = conn.declared_properties(label, graph=self._graph_name)
+            except psycopg.Error:
+                return None
+            finally:
+                conn.rollback()
+        for column in declared:
+            if column.name != prop:
+                continue
+            width = VECTOR_TYPE_EXPR.search(column.type or "")
+            if width is not None:
+                cache[key] = int(width.group("dimensions"))
+                return cache[key]
+        return None
+
     def retrieve_existing_index(self) -> bool:
         """Adopt the vector index already on this label, if there is one.
 
@@ -506,10 +570,20 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         rather than trying to build a second one beside it.
         """
         found = []
+        promoted_dimensions: Dict[str, int] = {}
         for index in self._graph_indexes():
             match = VECTOR_INDEX_EXPR.search(index.definition)
-            if match is None:
-                continue
+            if match is not None:
+                dimensions = int(match.group("dimensions"))
+            else:
+                match = PROMOTED_INDEX_EXPR.search(index.definition)
+                if match is None:
+                    continue
+                dimensions = self._promoted_dimensions(
+                    index.label, match.group("property"), promoted_dimensions
+                )
+                if dimensions is None:
+                    continue
             if index.name != self.index_name and (
                 match.group("property") != self.embedding_node_property
             ):
@@ -519,13 +593,28 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
                     "name": index.name,
                     "labelortype": index.label,
                     "property": match.group("property"),
-                    "dimensions": int(match.group("dimensions")),
+                    "dimensions": dimensions,
                 }
             )
         if not found:
             return False
         # The one named is the one meant; any other is a fallback.
         chosen = sort_by_index_name(found, self.index_name)[0]
+        if (
+            self.embedding_dimension
+            and chosen["dimensions"] != self.embedding_dimension
+        ):
+            # Taking the width from the index instead would open the store and
+            # refuse every embedding written to it afterwards, one at a time, with
+            # nothing pointing back here. The index cannot be rebuilt to the asked
+            # width either -- what is already stored is the other one.
+            raise ValueError(
+                f"index {chosen['name']!r} on {chosen['labelortype']!r} holds "
+                f"{chosen['dimensions']}-dimensional embeddings and this store was "
+                f"asked for {self.embedding_dimension}. Pass "
+                f"embedding_dimension={chosen['dimensions']}, or use another "
+                f"index_name or node_label."
+            )
         self.index_name = chosen["name"]
         self.node_label = chosen["labelortype"]
         self.embedding_node_property = chosen["property"]
@@ -570,7 +659,7 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         fts_index_query = """CREATE PROPERTY INDEX IF NOT EXISTS {index_name}
                              ON {node_label} USING gin ({expr})"""
 
-        self.database_query(
+        self._create_if_absent(
             sql.SQL(fts_index_query).format(
                 index_name=sql.Identifier(self.keyword_index_name),
                 node_label=sql.Identifier(self.node_label),
@@ -1229,54 +1318,71 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
 
         return d
 
-    def _apply_search_options(self, cursor: Any) -> None:
-        """Set what a vector search may be tuned with, for this statement.
-
-        ``hnsw.ef_search`` says how much of the index a search walks before it
-        settles: more of it finds more of the true nearest at more cost.
-        ``set local`` lasts as long as the transaction, so it cannot leak onto a
-        connection somebody else borrows next.
-        """
-        if not self.search_options:
-            return
-        for statement in search_option_statements(self.search_options):
-            cursor.execute(statement)
-
-    async def _aapply_search_options(self, cursor: Any) -> None:
-        """Async sibling of :meth:`_apply_search_options`."""
-        if not self.search_options:
-            return
-        for statement in search_option_statements(self.search_options):
-            await cursor.execute(statement)
-
     def database_query(self, query: str, params: dict = {}) -> List[Dict[str, Any]]:
-        """
-        Query the graph by taking a cypher query, executing it and
-        converting the result
+        """Run ``query``, repeating it while the driver says the refusal was timing.
 
         Args:
             query (str): a cypher query to be executed
-            params (dict): parameters for the query (not used in this implementation)
+            params (dict): parameters bound into the query
 
         Returns:
             List[Dict[str, Any]]: a list of dictionaries containing the result set
-        """
 
-        # execute the query, rolling back on an error
+        Eight concurrent writers against one label refused 30% of their statements
+        with a deadlock or a serialization failure, and nothing here tried again --
+        each was a collision that would have succeeded a moment later. The driver
+        owns which refusals are worth repeating and the wait between attempts, and a
+        success is reported back to it because the allowance is spent by every
+        refusal and paid back only by that report.
+        """
+        check_no_copy(query)
+        number = 0
+        while True:
+            try:
+                result = self._query_once(query, params)
+                self._retry_policy.succeeded()
+                return result
+            except AgensQueryException as failure:
+                cause = failure.__cause__
+                number += 1
+                if cause is None:
+                    raise
+                decision = self._retry_policy.decide(
+                    cause, number=number, wrote=True, merging=True
+                )
+                if not decision.retry:
+                    raise
+                logger.debug("attempt %d: %s", number, decision.reason)
+                time.sleep(decision.delay)
+
+    def _create_if_absent(self, query: Any, params: dict = {}) -> None:
+        """Create something if it is missing, allowing for another process racing us.
+
+        ``IF NOT EXISTS`` checks and then creates, so two stores opening on the same
+        graph both see it missing and the slower one fails -- on the graph, the
+        label and each index in turn. Of eight opened at once, two survived.
+        """
+        try:
+            self.database_query(query, params)
+        except AgensQueryException as failure:
+            if not lost_the_creation_race(failure):
+                raise
+
+    def _query_once(self, query: str, params: dict = {}) -> List[Dict[str, Any]]:
+        """One attempt at ``query``, rolling back on a refusal."""
         with self._acquire() as conn:
             with conn.cursor(row_factory=psycopg.rows.namedtuple_row) as curs:
                 try:
-                    self._apply_search_options(curs)
                     curs.execute(query, params)
                     conn.commit()
                 except psycopg.Error as e:
                     conn.rollback()
-                    raise AgensQueryException(
-                        {
-                            "message": "Error executing graph query: {}".format(query),
-                            "detail": str(e),
-                        }
-                    )
+                    # Every vector-store query failure comes through here, and it
+                    # used to arrive with the key the reader does not look at, the
+                    # server's DETAIL line spliced in by str(e), and no cause -- so
+                    # it read back as "unknown" and nothing downstream could ask
+                    # the driver whether another attempt was worth making.
+                    raise query_failed(query, e) from e
                 try:
                     data = curs.fetchall()
                 except psycopg.ProgrammingError:
@@ -1299,8 +1405,10 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         """
         if self._engine is not None:
             with self._engine.connection(graph_path=self._graph_name) as conn:
+                apply_search_options(conn, self.search_options)
                 yield conn
         else:
+            apply_search_options(self._connection, self.search_options)
             yield self._connection
 
     async def _apool(self) -> "agensgraph.AsyncNullConnectionPool":
@@ -1347,11 +1455,34 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         """Async sibling of :meth:`_acquire`."""
         if self._engine is not None:
             async with self._engine.aconnection(graph_path=self._graph_name) as conn:
+                await aapply_search_options(conn, self.search_options)
                 yield conn
         else:
             pool = await self._apool()
             async with pool.connection() as conn:
+                await aapply_search_options(conn, self.search_options)
                 yield conn
+
+    async def __aenter__(self) -> "AgensgraphVectorStore":
+        return self
+
+    async def __aexit__(self, *exc: Any) -> None:
+        await self.aclose()
+
+    def close(self) -> None:
+        """Close the connection this store opened for itself.
+
+        The async side has to be closed from the loop it was used on, so
+        :meth:`aclose` is separate.
+        """
+        if self._connection is not None and not self._connection.closed:
+            self._connection.close()
+
+    def __enter__(self) -> "AgensgraphVectorStore":
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self.close()
 
     async def aclose(self) -> None:
         """Give back the connections the async methods borrowed."""
@@ -1367,20 +1498,38 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         self, query: str, params: dict = {}
     ) -> List[Dict[str, Any]]:
         """Async counterpart of :meth:`database_query` (true async I/O)."""
+        check_no_copy(query)
+        number = 0
+        while True:
+            try:
+                result = await self._aquery_once(query, params)
+                self._retry_policy.succeeded()
+                return result
+            except AgensQueryException as failure:
+                cause = failure.__cause__
+                number += 1
+                if cause is None:
+                    raise
+                decision = self._retry_policy.decide(
+                    cause, number=number, wrote=True, merging=True
+                )
+                if not decision.retry:
+                    raise
+                logger.debug("attempt %d: %s", number, decision.reason)
+                await asyncio.sleep(decision.delay)
+
+    async def _aquery_once(
+        self, query: str, params: dict = {}
+    ) -> List[Dict[str, Any]]:
+        """One attempt at ``query``, rolling back on a refusal."""
         async with self._aacquire() as conn:
             async with conn.cursor(row_factory=psycopg.rows.namedtuple_row) as curs:
                 try:
-                    await self._aapply_search_options(curs)
                     await curs.execute(query, params)
                     await conn.commit()
                 except psycopg.Error as e:
                     await conn.rollback()
-                    raise AgensQueryException(
-                        {
-                            "message": "Error executing graph query: {}".format(query),
-                            "detail": str(e),
-                        }
-                    )
+                    raise query_failed(query, e) from e
                 try:
                     data = await curs.fetchall()
                 except psycopg.ProgrammingError:

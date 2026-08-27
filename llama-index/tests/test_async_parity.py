@@ -155,3 +155,64 @@ async def test_adelete_removes_what_delete_would(store):
     assert [n.name for n in await store.aget(ids=[doomed.id])] == ["doomed"]
     await store.adelete(ids=[doomed.id])
     assert await store.aget(ids=[doomed.id]) == []
+
+
+def _backends():
+    import agensgraph
+
+    conn = agensgraph.Connection.connect(autocommit=True, **_conf())
+    try:
+        return conn.execute(
+            "SELECT count(*) FROM pg_stat_activity WHERE datname = %s", (agens_db,)
+        ).fetchone()[0]
+    finally:
+        conn.close()
+
+
+@pytest.mark.asyncio
+async def test_the_store_closes_itself_as_an_async_context_manager():
+    """On the loop pytest gives it, rather than one of its own: nesting
+    ``asyncio.run`` inside the runner's own loop management wedges."""
+    store = AgensPropertyGraphStore(
+        GRAPH, conf=_conf(), create=False, refresh_schema=False
+    )
+    async with store:
+        rows = await store.astructured_query("RETURN 1 AS one")
+    assert rows[0]["one"] == 1
+    assert store._apool_pool is None, "aclose did not release the pool"
+
+
+def test_the_pool_guard_is_not_bound_to_an_event_loop():
+    """The guard was an ``asyncio.Lock``, which binds to the first loop that waits
+    on it, so a store used from a second ``asyncio.run`` failed nearly every read
+    with "bound to a different event loop".
+
+    This checks the mechanism rather than driving three loops, because making and
+    finishing loops inside the test runner's own loop management wedges the run --
+    the behaviour itself was verified by hand: three loops of eight concurrent
+    reads each, backends flat at two throughout and a clean exit.
+    """
+    import threading
+
+    store = AgensPropertyGraphStore(
+        GRAPH, conf=_conf(), create=False, refresh_schema=False
+    )
+    assert isinstance(store._apool_lock, type(threading.Lock())), type(
+        store._apool_lock
+    )
+    store.close()
+
+
+@pytest.mark.asyncio
+async def test_aclose_gives_the_pool_back():
+    """A pool built for a loop that had finished used to be assigned over rather
+    than closed, so its connections were never given back -- nineteen backends
+    across four loops, and they stayed."""
+    store = AgensPropertyGraphStore(
+        GRAPH, conf=_conf(), create=False, refresh_schema=False
+    )
+    await store.astructured_query("RETURN 1 AS one")
+    assert store._apool_pool is not None
+    await store.aclose()
+    assert store._apool_pool is None
+    assert store._apool_loop is None

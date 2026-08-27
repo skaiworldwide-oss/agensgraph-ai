@@ -190,3 +190,62 @@ def test_a_role_that_may_run_server_programs_is_refused():
         assert store.structured_query("RETURN 1 AS one")[0]["one"] == 1
         with pytest.raises(AgensQueryException):
             store.structured_query('CREATE (:"Person" {id: \'x\'})')
+
+
+def test_one_callers_read_only_block_does_not_refuse_anothers_write(reader_store):
+    """The depth was an attribute of the store, so it was shared by everyone
+    using it: while one thread was inside a read-only block, every other thread's
+    write came back 25006, and on a store with no engine both died on the
+    transaction nesting."""
+    import threading
+
+    owner = AgensPropertyGraphStore(GRAPH, conf=_conf(), create=False)
+    # Declared up front: the first write to a label is DDL, and that waits for
+    # the open transaction below whatever this test is measuring.
+    owner.upsert_nodes([EntityNode(name="warm", label="Person")])
+
+    outcome = {}
+    started = threading.Event()
+
+    def other_thread():
+        started.set()
+        try:
+            owner.upsert_nodes([EntityNode(name="fromB", label="Person")])
+            outcome["b"] = "wrote"
+        except Exception as exc:  # noqa: BLE001 -- recorded, not raised
+            outcome["b"] = f"{type(exc).__name__}"
+
+    writer = threading.Thread(target=other_thread)
+    with owner.read_only(allow_server_programs=True):
+        owner.structured_query("RETURN 1 AS one")
+        writer.start()
+        started.wait(5)
+        writer.join(30)
+    assert outcome.get("b") == "wrote", outcome
+    owner.delete(ids=["fromB", "warm"])
+
+
+def test_a_nested_block_asking_for_the_safe_default_gets_it(reader_store):
+    """The flag was recorded only on the outermost entry, so a caller asking for
+    the safe default inside somebody else's permissive block inherited the
+    permission -- skipping the refusal that is the whole boundary against
+    COPY ... TO PROGRAM."""
+    store = AgensPropertyGraphStore(
+        GRAPH, conf=_conf(), create=False, create_indexes=False, refresh_schema=False
+    )
+    with psycopg.connect(autocommit=True, **_conf()) as conn:
+        privileged = conn.execute(
+            "SELECT rolsuper OR pg_has_role(current_user,"
+            " 'pg_execute_server_program', 'member') FROM pg_roles"
+            " WHERE rolname = current_user"
+        ).fetchone()[0]
+    if not privileged:
+        pytest.skip("the test role may not run server programs")
+
+    with store.read_only(allow_server_programs=True):
+        store.structured_query("RETURN 1 AS one")
+        with pytest.raises(ConfigurationError):
+            with store.read_only():
+                store.structured_query("RETURN 1 AS one")
+        # and the outer block is still usable after the inner one was refused
+        assert store.structured_query("RETURN 2 AS two")[0]["two"] == 2

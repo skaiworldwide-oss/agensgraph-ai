@@ -5,4 +5,4 @@ import cognee_agensgraph  # noqa: F401  (registers the adapters)
 
 if __name__ == "__main__":
     asyncio.run(assert_metrics(provider="agensgraph", include_optional=False))
-    # asyncio.run(assert_metrics(provider="agensgraph", include_optional=True))
+    asyncio.run(assert_metrics(provider="agensgraph", include_optional=True))

@@ -334,7 +334,7 @@ graph_store.create_property_index("country")
 vector_store.create_property_index("topic")
 ```
 
-With the index present, the planner pre-selects matching rows via an index/bitmap
+With the index present, the planner preselects matching rows via an index/bitmap
 scan and then ranks them — instead of scanning every node.
 
 **Counting and type filters.** Prefer `count(*)` over `count(n)` in aggregations:

@@ -48,9 +48,8 @@ Issues = "https://github.com/skaiworldwide-oss/agensgraph-ai/issues"
 test = [
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
-    "fastembed>=0.3,<0.9",
 ]
-lint = ["ruff>=0.9"]
+lint = ["ruff>=0.9", "codespell>=2.3"]
 typing = ["mypy>=1.15", "types-PyYAML>=6"]
 dev = ["ipykernel>=6.29", "jupyter>=1"]
 
@@ -88,5 +87,8 @@ testpaths = ["tests"]
 
 [tool.codespell]
 check-filenames = true
+# NIN is LlamaIndex's "not in" filter operator, and RETRUN is the misspelling the
+# error-path tests send on purpose to get a syntax error back.
+ignore-words-list = "nin,retrun"
 check-hidden = true
 skip = "*.csv,*.html,*.json,*.jsonl,*.pdf,*.txt,*.ipynb,*.lock"

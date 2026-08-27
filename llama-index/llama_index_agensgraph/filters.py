@@ -1,4 +1,12 @@
-'''
+"""
+Shared translation of LlamaIndex ``MetadataFilters`` into parameterized
+AgensGraph Cypher, used by both the property graph store and the vector store.
+
+Every value is bound as a query parameter (psycopg ``Jsonb``); nothing is
+interpolated into the query text, so the translation is injection-safe. All
+14 ``FilterOperator`` values are supported, along with nested filter groups
+and the ``AND`` / ``OR`` / ``NOT`` conditions.
+
 Copyright (c) 2025, SKAI Worldwide Co., Ltd.
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,23 +20,10 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-'''
-
-"""
-Shared translation of LlamaIndex ``MetadataFilters`` into parameterized
-AgensGraph Cypher, used by both the property graph store and the vector store.
-
-Every value is bound as a query parameter (psycopg ``Jsonb``); nothing is
-interpolated into the query text, so the translation is injection-safe. All
-14 ``FilterOperator`` values are supported, along with nested filter groups
-and the ``AND`` / ``OR`` / ``NOT`` conditions.
 """
 
 import re
-from typing import Any, Dict, List, Tuple, Union
-
-from psycopg import sql
-from psycopg.types.json import Jsonb
+from typing import Any, Dict, List, Tuple
 
 from llama_index.core.vector_stores.types import (
     FilterCondition,
@@ -36,6 +31,8 @@ from llama_index.core.vector_stores.types import (
     MetadataFilter,
     MetadataFilters,
 )
+from psycopg import sql
+from psycopg.types.json import Jsonb
 
 # Binary operators that translate to ``<prop> <op> <param>``.
 _BINARY_OPERATORS: Dict[FilterOperator, str] = {
@@ -85,7 +82,9 @@ def _single_filter(
         p_str = alloc.alloc()
         params[p_list] = Jsonb([])
         params[p_str] = Jsonb("")
-        return sql.SQL("({prop} IS NULL OR {prop} = %({pl})s OR {prop} = %({ps})s)").format(
+        return sql.SQL(
+            "({prop} IS NULL OR {prop} = %({pl})s OR {prop} = %({ps})s)"
+        ).format(
             prop=prop,
             pl=sql.SQL(p_list),
             ps=sql.SQL(p_str),

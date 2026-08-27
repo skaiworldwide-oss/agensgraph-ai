@@ -15,16 +15,17 @@ limitations under the License.
 '''
 
 import hashlib
+import importlib.util
 import re
-from typing import Any, Dict, Union, List
+from functools import wraps
+from typing import Any, Dict, List, Union
 
 import psycopg
-from agensgraph.cypher import without_literals
-from agensgraph.introspect import MAX_IDENTIFIER
 from psycopg import sql
-from functools import wraps
 
+from agensgraph.cypher import without_literals
 from agensgraph.errors import safe_message
+from agensgraph.introspect import MAX_IDENTIFIER
 from agensgraph.vector import search_option_statements
 
 
@@ -281,9 +282,7 @@ def execute_query(curs, query, params={}, error_message = "Error executing query
 def require_psycopg(func):
     @wraps(func)
     def wrapper(*args, **kwargs):
-        try:
-            import psycopg
-        except ImportError:
+        if importlib.util.find_spec("psycopg") is None:
             raise ImportError(
                 "Could not import psycopg python package. "
                 "Please install it with `pip install psycopg`."

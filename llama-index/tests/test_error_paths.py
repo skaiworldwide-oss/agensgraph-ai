@@ -19,10 +19,10 @@ import os
 import agensgraph
 import psycopg
 import pytest
-from psycopg import sql
 from llama_index.core.graph_stores.types import EntityNode, Relation
 from llama_index.core.schema import TextNode
 from llama_index.core.vector_stores.types import VectorStoreQuery
+from psycopg import sql
 
 from llama_index_agensgraph.graph_stores.agensgraph import AgensPropertyGraphStore
 from llama_index_agensgraph.graph_stores.agensgraph.utils import AgensQueryException

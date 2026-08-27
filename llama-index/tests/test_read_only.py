@@ -19,9 +19,9 @@ import uuid
 
 import psycopg
 import pytest
-from psycopg import sql
 from agensgraph.errors import ConfigurationError
 from llama_index.core.graph_stores.types import EntityNode
+from psycopg import sql
 
 from llama_index_agensgraph.graph_stores.agensgraph import AgensPropertyGraphStore
 from llama_index_agensgraph.graph_stores.agensgraph.utils import AgensQueryException

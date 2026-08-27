@@ -15,13 +15,13 @@ limitations under the License.
 '''
 
 import os
+
 import pytest
+from llama_index.core.graph_stores.types import ChunkNode, EntityNode, Relation
+from llama_index.core.schema import TextNode
+from llama_index.core.vector_stores.types import VectorStoreQuery
 
 from llama_index_agensgraph.graph_stores.agensgraph import AgensPropertyGraphStore
-from llama_index.core.graph_stores.types import EntityNode, ChunkNode, Relation
-from llama_index.core.vector_stores.types import VectorStoreQuery
-from llama_index.core.schema import TextNode
-
 
 agens_db = os.environ.get("AGENS_DB")
 agens_user = os.environ.get("AGENS_USER")

@@ -17,7 +17,6 @@ limitations under the License.
 import os
 
 import pytest
-
 from llama_index.core.graph_stores.types import EntityNode
 from llama_index.core.schema import TextNode
 from llama_index.core.vector_stores.types import (

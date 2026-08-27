@@ -1,4 +1,15 @@
-'''
+"""What each statement reaches, and what it does not read.
+
+Named test_regression_perf before, which suggested timings: it held none, and no
+thresholds either. What it does hold is worth more -- the plan a statement gets.
+Almost everything this migration got wrong was an index that existed and was
+never used, and a timing on a small fixture cannot see that while the plan says
+it outright.
+
+Where a number is asserted it is a shape rather than a duration: that planning
+does not grow with the size of an id list, that a read makes one statement per
+label rather than one per row.
+
 Copyright (c) 2025, SKAI Worldwide Co., Ltd.
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,25 +23,11 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-'''
-
-"""What each statement reaches, and what it does not read.
-
-Named test_regression_perf before, which suggested timings: it held none, and no
-thresholds either. What it does hold is worth more -- the plan a statement gets.
-Almost everything this migration got wrong was an index that existed and was
-never used, and a timing on a small fixture cannot see that while the plan says
-it outright.
-
-Where a number is asserted it is a shape rather than a duration: that planning
-does not grow with the size of an id list, that a read makes one statement per
-label rather than one per row.
 """
 
 import os
 
 import pytest
-
 from llama_index.core.graph_stores.types import EntityNode, Relation
 from llama_index.core.vector_stores.types import (
     FilterOperator,

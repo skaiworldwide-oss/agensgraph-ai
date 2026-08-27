@@ -1,3 +1,8 @@
+import asyncio
+import logging
+import re
+import time
+from contextlib import asynccontextmanager, contextmanager
 from typing import (
     Any,
     AsyncIterator,
@@ -8,22 +13,30 @@ from typing import (
     Optional,
     Tuple,
 )
-import asyncio
-import time
-import logging
-import re
 
-from contextlib import asynccontextmanager, contextmanager
-
-import agensgraph
-from agensgraph import RetryPolicy, Edge, Vertex
-from agensgraph.vector import Distance, Vector, generated_column
-from agensgraph.errors import safe_message
-from agensgraph.introspect import DesiredIndex
 import psycopg
+from llama_index.core.bridge.pydantic import PrivateAttr
+from llama_index.core.indices.query.embedding_utils import get_top_k_mmr_embeddings
+from llama_index.core.schema import BaseNode, MetadataMode
+from llama_index.core.vector_stores.types import (
+    BasePydanticVectorStore,
+    MetadataFilters,
+    VectorStoreQuery,
+    VectorStoreQueryMode,
+    VectorStoreQueryResult,
+)
+from llama_index.core.vector_stores.utils import (
+    metadata_dict_to_node,
+    node_to_metadata_dict,
+)
 from psycopg import sql
 from psycopg.types.json import Jsonb
 
+import agensgraph
+from agensgraph import Edge, RetryPolicy, Vertex
+from agensgraph.errors import safe_message
+from agensgraph.introspect import DesiredIndex
+from agensgraph.vector import Distance, Vector, generated_column
 from llama_index_agensgraph.engine import AgensEngine
 from llama_index_agensgraph.filters import metadata_filters_to_cypher
 from llama_index_agensgraph.graph_stores.agensgraph.utils import (
@@ -36,21 +49,6 @@ from llama_index_agensgraph.graph_stores.agensgraph.utils import (
     known_search_options,
     lost_the_creation_race,
     query_failed,
-)
-
-from llama_index.core.bridge.pydantic import PrivateAttr
-from llama_index.core.schema import BaseNode, MetadataMode
-from llama_index.core.vector_stores.types import (
-    BasePydanticVectorStore,
-    VectorStoreQuery,
-    VectorStoreQueryMode,
-    VectorStoreQueryResult,
-    MetadataFilters,
-)
-from llama_index.core.indices.query.embedding_utils import get_top_k_mmr_embeddings
-from llama_index.core.vector_stores.utils import (
-    metadata_dict_to_node,
-    node_to_metadata_dict,
 )
 
 _logger = logging.getLogger(__name__)
@@ -175,7 +173,9 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
 
 
         ```python
-        from llama_index_agensgraph.vector_stores.agensgraph import AgensgraphVectorStore
+        from llama_index_agensgraph.vector_stores.agensgraph import (
+            AgensgraphVectorStore,
+        )
 
         url = "postgresql://username:password@localhost:5432/dbname"
         embed_dim = 1536
@@ -655,7 +655,10 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         self.verify_label_existence()
         node_props = text_node_properties or [self.text_node_property]
 
-        fts_parts = [sql.SQL('(to_tsvector(\'english\', {}))').format(sql.Identifier(el)) for el in node_props]
+        fts_parts = [
+            sql.SQL('(to_tsvector(\'english\', {}))').format(sql.Identifier(el))
+            for el in node_props
+        ]
         fts_index_query = """CREATE PROPERTY INDEX IF NOT EXISTS {index_name}
                              ON {node_label} USING gin ({expr})"""
 
@@ -830,7 +833,8 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         )
 
         base_cosine_query = """
-            WITH n, n.{embedding_property}::vector({embedding_dimension}) {distance} {bound_embedding} AS inv_score
+            WITH n, n.{embedding_property}::vector({embedding_dimension})
+                    {distance} {bound_embedding} AS inv_score
             ORDER BY inv_score
             LIMIT %(k)s
             WITH n, 1 - inv_score AS score 
@@ -925,17 +929,22 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         """
         if modality == "semantic":
             head = """
-                MATCH (n:{label}) WHERE n.{embedding_property} IS NOT NULL {filter_clause}
-                WITH n, n.{embedding_property}::vector({embedding_dimension}) {distance} {bound_embedding} AS d
+                MATCH (n:{label})
+                WHERE n.{embedding_property} IS NOT NULL {filter_clause}
+                WITH n, n.{embedding_property}::vector({embedding_dimension})
+                        {distance} {bound_embedding} AS d
                 ORDER BY d LIMIT %(semantic_k)s
             """
         else:  # keyword
             head = """
                 MATCH (n:{label})
                 WHERE n.{text_property} IS NOT NULL AND
-                      to_tsvector('english', n.{text_property}) @@ plainto_tsquery('english', %(query)s)
+                      to_tsvector('english', n.{text_property})
+                          @@ plainto_tsquery('english', %(query)s)
                       {filter_clause}
-                WITH n, ts_rank_cd(to_tsvector('english', n.{text_property}), plainto_tsquery('english', %(query)s)) AS s
+                WITH n, ts_rank_cd(
+                        to_tsvector('english', n.{text_property}),
+                        plainto_tsquery('english', %(query)s)) AS s
                 ORDER BY s DESC LIMIT %(keyword_k)s
             """
         return sql.SQL(head + tail).format(
@@ -1022,7 +1031,9 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
         filter_clause: sql.Composed = sql.SQL("")
         filter_params: Dict[str, Any] = {}
         if query.filters:
-            snippet, filter_params = metadata_filters_to_cypher(query.filters, alias="n")
+            snippet, filter_params = metadata_filters_to_cypher(
+                query.filters, alias="n"
+            )
             filter_clause = sql.SQL("AND (") + snippet + sql.SQL(")")
 
         keyword_k = query.sparse_top_k or query.similarity_top_k
@@ -1276,7 +1287,8 @@ class AgensgraphVectorStore(BasePydanticVectorStore):
             except psycopg.Error:
                 self._connection.rollback()
                 raise ValueError(
-                    """Vector extension not supported\nUnable to install pg_vector extension"""
+                    "Vector extension not supported\n"
+                    "Unable to install pg_vector extension"
                 )
 
     @staticmethod

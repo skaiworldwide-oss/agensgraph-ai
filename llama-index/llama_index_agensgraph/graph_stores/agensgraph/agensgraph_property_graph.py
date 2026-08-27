@@ -14,6 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 '''
 
+import asyncio
+import logging
+import threading
+import time
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from typing import (
     Any,
     AsyncIterator,
@@ -28,45 +34,28 @@ from typing import (
     Set,
     Tuple,
 )
-import re, json
-import asyncio
-import threading
-from contextvars import ContextVar
-import logging
-import time
-from contextlib import asynccontextmanager, contextmanager
 
+import psycopg
 from llama_index.core.graph_stores.types import (
     TRIPLET_SOURCE_KEY,
-    PropertyGraphStore,
-    Triplet,
-    LabelledNode,
-    Relation,
-    EntityNode,
     ChunkNode,
+    EntityNode,
+    LabelledNode,
+    PropertyGraphStore,
+    Relation,
+    Triplet,
 )
-from llama_index.core.schema import BaseNode
-from llama_index.core.vector_stores.utils import metadata_dict_to_node
 from llama_index.core.graph_stores.utils import value_sanitize
-from llama_index_agensgraph.engine import AgensEngine
-from llama_index_agensgraph.filters import metadata_filters_to_cypher
-from llama_index_agensgraph.graph_stores.agensgraph.utils import *
-from llama_index_agensgraph.graph_stores.agensgraph.utils import (
-    COMPLETE_FILTERED_SEARCH,
-    aapply_search_options,
-    apply_search_options,
-    bounded_name,
-    check_no_copy,
-    known_search_options,
-    lost_the_creation_race,
-    query_failed,
-)
 from llama_index.core.prompts import PromptTemplate
+from llama_index.core.schema import BaseNode
 from llama_index.core.vector_stores.types import VectorStoreQuery
-import agensgraph
+from llama_index.core.vector_stores.utils import metadata_dict_to_node
+from psycopg import sql
 from psycopg.conninfo import make_conninfo
+from psycopg.types.json import Jsonb
+
+import agensgraph
 from agensgraph import Edge, RetryPolicy, Vertex
-from agensgraph.vector import Vector, generated_column
 from agensgraph.cypher import check_single_statement
 from agensgraph.errors import safe_message
 from agensgraph.introspect import (
@@ -75,9 +64,25 @@ from agensgraph.introspect import (
     DesiredLabel,
     Unique,
 )
-import psycopg
-from psycopg import sql
-from psycopg.types.json import Jsonb
+from agensgraph.vector import Vector, generated_column
+from llama_index_agensgraph.engine import AgensEngine
+from llama_index_agensgraph.filters import metadata_filters_to_cypher
+from llama_index_agensgraph.graph_stores.agensgraph.utils import (
+    COMPLETE_FILTERED_SEARCH,
+    AgensQueryException,
+    aapply_search_options,
+    apply_search_options,
+    bounded_name,
+    check_no_copy,
+    create_graph,
+    format_triples,
+    get_graph_id,
+    known_search_options,
+    lost_the_creation_race,
+    query_failed,
+    require_psycopg,
+    set_graph_path,
+)
 
 BASE_ENTITY_LABEL = "__Entity__"
 BASE_NODE_LABEL = "__Node__"
@@ -647,7 +652,11 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                 apply_search_options(self.connection, self.search_options)
             except psycopg.Error:
                 self.connection.rollback()
-                logger.log(logging.WARNING, """Vector extension not supported\nUnable to install pg_vector extension""")
+                logger.log(
+                    logging.WARNING,
+                    "Vector extension not supported\n"
+                    "Unable to install pg_vector extension",
+                )
                 pass
 
     def _established_labels(self) -> Set[str]:
@@ -1246,8 +1255,10 @@ class AgensPropertyGraphStore(PropertyGraphStore):
                     sql.SQL("""
                     UNWIND %(chunked_params)s AS row
                     MERGE (e:{label} {{id: row.id}})
-                    SET e += CASE WHEN row.properties IS NOT NULL THEN row.properties ELSE properties(e) END
-                    SET e.name = CASE WHEN row.name IS NOT NULL THEN row.name ELSE e.name END
+                    SET e += CASE WHEN row.properties IS NOT NULL
+                                  THEN row.properties ELSE properties(e) END
+                    SET e.name = CASE WHEN row.name IS NOT NULL
+                                      THEN row.name ELSE e.name END
                     """).format(label=sql.Identifier(label)),
                     {"chunked_params": Jsonb(chunked_params)}
                 ))
@@ -1735,12 +1746,14 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             return None
         query = """SELECT t.source_id,
                             t.source_type,
-                            t.source_properties - 'embedding' - 'id' AS source_properties,
+                            t.source_properties - 'embedding' - 'id'
+                                AS source_properties,
                             t.type,
                             t.rel_properties,
                             t.target_id,
                             t.target_type,
-                            t.target_properties - 'embedding' - 'id' AS target_properties
+                            t.target_properties - 'embedding' - 'id'
+                                AS target_properties
                       FROM (
                 """
         # The seeds are bound as one list and compared against the unwound value,
@@ -2481,7 +2494,9 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             if count == 0:
                 continue
             # None => exhaustive (no LIMIT); else cap the scan to a sample.
-            sample = None if count <= EXHAUSTIVE_SEARCH_LIMIT else EXHAUSTIVE_SEARCH_LIMIT
+            sample = (
+                None if count <= EXHAUSTIVE_SEARCH_LIMIT else EXHAUSTIVE_SEARCH_LIMIT
+            )
 
             for prop in props:
                 name = prop["property"]
@@ -2513,7 +2528,8 @@ class AgensPropertyGraphStore(PropertyGraphStore):
             else sql.SQL("")
         )
         subquery = sql.SQL(
-            "MATCH (a:{base_label}) WHERE label(a) = %(label)s AND a.{prop} IS NOT NULL "
+            "MATCH (a:{base_label}) WHERE label(a) = %(label)s "
+            "AND a.{prop} IS NOT NULL "
             "RETURN a.{prop} AS v {limit}"
         ).format(
             base_label=sql.Identifier(BASE_NODE_LABEL),

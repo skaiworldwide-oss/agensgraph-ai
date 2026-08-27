@@ -1,50 +1,36 @@
-"""
-Copyright (c) 2025, SKAI Worldwide Co., Ltd.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
+# Copyright (c) 2025, SKAI Worldwide Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import inspect
 import os
 import re
-import sys
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, final
 
-from psycopg import sql
-from psycopg.types.json import Jsonb
-from tenacity import (
-    retry,
-    retry_if_exception_type,
-    stop_after_attempt,
-    wait_exponential,
-)
-
+from agensgraph import DesiredLabel, Jsonb, Unique
 from lightrag.base import BaseGraphStorage
+from lightrag.constants import GRAPH_FIELD_SEP
 from lightrag.types import KnowledgeGraph, KnowledgeGraphEdge, KnowledgeGraphNode
 from lightrag.utils import logger
+from psycopg import sql
 
-try:
-    from lightrag.constants import GRAPH_FIELD_SEP
-except ImportError:
-    from lightrag.prompt import GRAPH_FIELD_SEP
-
-from lightrag_agensgraph.kg._base import AgensgraphQueryException, _AgensStorageBase
-
-if sys.platform.startswith("win"):
-    import asyncio
-
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+from lightrag_agensgraph.kg._base import (
+    DEFAULT_GRAPH,
+    _AgensStorageBase,
+    graph_name_for,
+    resolve_workspace,
+)
 
 # Max rows per UNWIND / OR-of-equalities batch.
 CHUNK_SIZE = 1000
@@ -62,7 +48,7 @@ def _or_equalities(
     params: Dict[str, Any] = {}
     for i, value in enumerate(values):
         pname = f"{prefix}_{i}"
-        params[pname] = Jsonb(value)
+        params[pname] = value
         terms.append(f"{field} = %({pname})s")
     return "(" + " OR ".join(terms) + ")", params
 
@@ -70,52 +56,36 @@ def _or_equalities(
 @final
 @dataclass
 class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
-    @staticmethod
-    def load_nx_graph(file_name):
-        print("no preloading of graph with Agensgraph in production")
-
     def __post_init__(self):
-        # The graph name comes from the storage namespace, falling back to
-        # AGENSGRAPH_GRAPHNAME. LightRAG hardcodes the graph namespace
-        # (`chunk_entity_relation`), so to isolate tenants the way its other
-        # backends do (Neo4j uses a per-workspace node label, NetworkX a
-        # per-workspace subdirectory) we fold `workspace` into the graph name.
-        # An empty workspace is unchanged, so existing single-tenant graphs and
-        # the AGENSGRAPH_GRAPHNAME convention keep working.
-        base_name = self.namespace or os.environ.get("AGENSGRAPH_GRAPHNAME", "lightrag")
-        self.graph_name = self._graph_name_for(base_name, getattr(self, "workspace", "") or "")
-        self._graph_path = self.graph_name
+        # LightRAG names its graph namespace `chunk_entity_relation`; a workspace gets
+        # a graph of its own, so two tenants' knowledge graphs never mix.
+        self.workspace = resolve_workspace(self.workspace, self.global_config)
         self._engine = None
 
-    @staticmethod
-    def _graph_name_for(base_name: str, workspace: str) -> str:
-        """Per-workspace graph name (a valid AgensGraph schema identifier)."""
-        if not workspace:
-            return base_name
-        safe = "".join(c if c.isalnum() else "_" for c in workspace.lower()).strip("_")
-        if not safe or safe[0].isdigit() or safe.startswith("pg_"):
-            safe = "w_" + safe
-        return f"{safe}_{base_name}"[:63]  # Postgres identifier limit
+    def _graph_name(self) -> str:
+        base = os.environ.get("AGENSGRAPH_GRAPHNAME") or self.namespace or DEFAULT_GRAPH
+        return graph_name_for(base, self.workspace or "")
+
+    @property
+    def graph_name(self) -> str:
+        return self._graph_name()
 
     async def initialize(self):
-        """Acquire the shared engine and bootstrap the graph (once)."""
+        """Take the shared engine and declare the graph's labels once."""
         await self._acquire_engine()
 
-        async def _ddl(cur):
-            await cur.execute("CREATE VLABEL IF NOT EXISTS base")
-            await cur.execute('CREATE ELABEL IF NOT EXISTS "DIRECTED"')
-            await cur.execute(
-                "CREATE PROPERTY INDEX IF NOT EXISTS base_entity_idx ON base (entity_id)"
-            )
+        async def declare(conn):
+            # Every node is `base`, every edge `DIRECTED`, and a node is found by its
+            # entity_id: the constraint gives MERGE and every lookup a unique index and
+            # turns two writers racing on one name into an error the retry handles.
+            await conn.ensure_labels([DesiredLabel("base", "v"), DesiredLabel("DIRECTED", "e")])
+            await conn.ensure_constraints([Unique("base", "entity_id")])
 
-        await self._engine.ensure_graph(self.graph_name, _ddl)
-        logger.info(f"AgensGraph storage initialized for graph: {self.graph_name}")
+        await self._engine.setup_once(f"graph:{self.graph_name}", declare)
+        logger.info("AgensGraph storage initialized for graph: %s", self.graph_name)
 
     async def finalize(self):
         await self._release_engine()
-
-    async def __aexit__(self, exc_type, exc, tb):
-        await self.finalize()
 
     async def index_done_callback(self) -> None:
         # Agensgraph handles persistence automatically
@@ -138,7 +108,7 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
                 MATCH (n:base {entity_id: %(node_id)s})
                 RETURN true AS node_exists LIMIT 1
                 """
-        records = await self._query(query, {"node_id": Jsonb(node_id)})
+        records = await self._fetch(query, {"node_id": node_id})
         # No row is returned when the node does not exist.
         return bool(records and records[0]["node_exists"])
 
@@ -157,12 +127,13 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
             Exception: If there is an error executing the query
         """
         query = """
-                MATCH (a:base {entity_id: %(source_node_id)s})-[r]-(b:base {entity_id: %(target_node_id)s})
+                MATCH (a:base {entity_id: %(source_node_id)s})
+                      -[r]-(b:base {entity_id: %(target_node_id)s})
                 RETURN true AS "edgeExists" LIMIT 1
                 """
-        records = await self._query(query, {
-            "source_node_id": Jsonb(source_node_id),
-            "target_node_id": Jsonb(target_node_id),
+        records = await self._fetch(query, {
+            "source_node_id": source_node_id,
+            "target_node_id": target_node_id,
         })
         # No row is returned when the edge does not exist.
         return bool(records and records[0]["edgeExists"])
@@ -184,7 +155,7 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
                 MATCH (n:base {entity_id: %(node_id)s})
                 RETURN n
                 """
-        records = await self._query(query, {"node_id": Jsonb(node_id)})
+        records = await self._fetch(query, {"node_id": node_id})
         if records:
             # warn if there are multiple records returned
             if len(records) > 1:
@@ -219,7 +190,7 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
                 MATCH (n:base {entity_id: id})
                 RETURN n.entity_id AS entity_id, n
                 """
-        records = await self._query(query, {"node_ids": Jsonb(node_ids)})
+        records = await self._fetch(query, {"node_ids": Jsonb(node_ids)})
         nodes = {}
         if records:
             for record in records:
@@ -255,7 +226,7 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
                 OPTIONAL MATCH (n)-[r]-()
                 RETURN COUNT(r) AS degree
                 """
-        record = (await self._query(query, {"node_id": Jsonb(node_id)}))[0]
+        record = (await self._fetch(query, {"node_id": node_id}))[0]
         if record:
             edge_count = int(record["degree"])
             logger.debug(
@@ -286,7 +257,7 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
                 OPTIONAL MATCH (n)-[r]-()
                 RETURN n.entity_id AS entity_id, count(r) AS degree
                 """
-        records = (await self._query(query, {"node_ids": Jsonb(node_ids)}))
+        records = (await self._fetch(query, {"node_ids": Jsonb(node_ids)}))
 
         if records:
             degrees = {}
@@ -383,12 +354,13 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
             Exception: If there is an error executing the query
         """
         query = """
-                MATCH (start:base {entity_id: %(source_node_id)s})-[r]-("end":base {entity_id: %(target_node_id)s})
+                MATCH (start:base {entity_id: %(source_node_id)s})
+                      -[r]-("end":base {entity_id: %(target_node_id)s})
                 RETURN properties(r) as edge_properties
                 """
-        records = await self._query(query, {
-            "source_node_id": Jsonb(source_node_id),
-            "target_node_id": Jsonb(target_node_id),
+        records = await self._fetch(query, {
+            "source_node_id": source_node_id,
+            "target_node_id": target_node_id,
         })
 
         if records:
@@ -410,7 +382,7 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
                 if key not in edge_result:
                     edge_result[key] = default_value
                     logger.warning(
-                        f"Edge between {self.escape_str(source_node_id)} and {self.escape_str(target_node_id)} "
+                        f"Edge between {source_node_id} and {target_node_id} "
                         f"missing {key}, using default: {default_value}"
                     )
             logger.debug(
@@ -446,7 +418,7 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
                 MATCH (start:base {entity_id: pair.src})-[r:"DIRECTED"]-("end":base {entity_id: pair.tgt})
                 RETURN pair.src AS src_id, pair.tgt AS tgt_id, collect(properties(r)) AS edges
                 """
-        records = await self._query(query, {"pairs": Jsonb(pairs)})
+        records = await self._fetch(query, {"pairs": Jsonb(pairs)})
         edges_dict = {}
         if records:
             for record in records:
@@ -502,7 +474,7 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
                 WHERE connected.entity_id IS NOT NULL
                 RETURN n, r, connected
                 """
-        results = await self._query(query, {"source_node_id": Jsonb(source_node_id)})
+        results = await self._fetch(query, {"source_node_id": source_node_id})
         if results:
             edges = []
             for record in results:
@@ -563,7 +535,7 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
                         connected.entity_id AS connected_entity_id,
                         startNode(r).entity_id AS start_entity_id
                 """
-        records = await self._query(query, {"node_ids": Jsonb(node_ids)})
+        records = await self._fetch(query, {"node_ids": Jsonb(node_ids)})
 
         # Initialize the dictionary with empty lists for each node ID
         edges_dict = {node_id: [] for node_id in node_ids}
@@ -609,7 +581,7 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
                 RETURN DISTINCT n
                 """
 
-        results = await self._query(sql.SQL(query).format(
+        results = await self._fetch(sql.SQL(query).format(
             GRAPH_FIELD_SEP=sql.Literal(GRAPH_FIELD_SEP)
         ), {"chunk_ids": Jsonb(chunk_ids)})
         nodes = []
@@ -628,7 +600,7 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
                 RETURN DISTINCT a.entity_id AS source, b.entity_id AS target, properties(r) AS properties
                 """
 
-        results = await self._query(sql.SQL(query).format(
+        results = await self._fetch(sql.SQL(query).format(
             GRAPH_FIELD_SEP=sql.Literal(GRAPH_FIELD_SEP)
         ), {"chunk_ids": Jsonb(chunk_ids)})
         edges = []
@@ -639,11 +611,6 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
             edges.append(edge_properties)
         return edges
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
-        retry=retry_if_exception_type((AgensgraphQueryException,)),
-    )
     async def upsert_node(self, node_id: str, node_data: dict[str, str]) -> None:
         """
         Upsert a node in the Agensgraph database.
@@ -657,10 +624,7 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
                 SET n += %(node_data)s
                 """
         try:
-            await self._query(query, {
-                "node_id": Jsonb(node_id),
-                "node_data": Jsonb(node_data),
-            })
+            await self._fetch(query, {"node_id": node_id, "node_data": Jsonb(node_data)}, wrote=True)
             logger.debug(
                 "Upserted node with node_id '{%s}' and properties: {%s}",
                 node_id,
@@ -670,11 +634,6 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
             logger.error("Error during upsert: {%s}", e)
             raise
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
-        retry=retry_if_exception_type((AgensgraphQueryException,)),
-    )
     async def upsert_edge(
         self, source_node_id: str, target_node_id: str, edge_data: dict[str, str]
     ) -> None:
@@ -697,11 +656,15 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
                 RETURN r, source, target
                 """
         try:
-            await self._query(query, {
-                "source_node_id": Jsonb(source_node_id),
-                "target_node_id": Jsonb(target_node_id),
-                "edge_data": Jsonb(edge_data),
-            })
+            await self._fetch(
+                query,
+                {
+                    "source_node_id": source_node_id,
+                    "target_node_id": target_node_id,
+                    "edge_data": Jsonb(edge_data),
+                },
+                wrote=True,
+            )
             logger.debug(
                 "Upserted edge from '{%s}' to '{%s}' with properties: {%s}",
                 source_node_id,
@@ -759,11 +722,11 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
 
         if node_label == "*":
             total = (
-                await self._query(
+                await self._fetch(
                     "MATCH (n:base) WHERE n.entity_id IS NOT NULL RETURN count(n) AS c"
                 )
             )[0]["c"]
-            rows = await self._query(
+            rows = await self._fetch(
                 """
                 MATCH (n:base) WHERE n.entity_id IS NOT NULL
                 OPTIONAL MATCH (n)-[r]-()
@@ -778,7 +741,7 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
                 _add_node(r["n"])
             result.is_truncated = int(total) > max_nodes
             if nodes_by_id:
-                erows = await self._query(
+                erows = await self._fetch(
                     """
                     MATCH (a:base)-[r]-(b:base)
                     WHERE a.entity_id IS NOT NULL AND b.entity_id IS NOT NULL
@@ -789,7 +752,7 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
                 for er in erows:
                     _add_edge(er["eid"], er["rt"], er["s"], er["t"], er["props"])
         else:
-            seed = await self._query(
+            seed = await self._fetch(
                 "MATCH (n:base {entity_id: %(label)s}) RETURN n",
                 {"label": Jsonb(node_label)},
             )
@@ -799,7 +762,7 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
             depth = 0
             while frontier and depth < max_depth and len(nodes_by_id) < max_nodes:
                 frag, params = _or_equalities("a.entity_id", frontier, "kg")
-                rows = await self._query(
+                rows = await self._fetch(
                     f"""
                     MATCH (a:base)-[r]-(b:base)
                     WHERE {frag} AND b.entity_id IS NOT NULL
@@ -838,7 +801,7 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
                 ORDER BY label
                 RETURN collect(label) AS node_labels
                 """
-        results = await self._query(query)
+        results = await self._fetch(query)
 
         if not results:
             logger.warning("No labels found in the graph.")
@@ -864,17 +827,12 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
                 DETACH DELETE n
                 """
         try:
-            await self._query(query, {"node_id": Jsonb(node_id)})
+            await self._fetch(query, {"node_id": node_id}, wrote=True)
             logger.debug(f"Deleted node with label '{self.escape_str(node_id)}'")
         except Exception as e:
             logger.error(f"Error during node deletion: {str(e)}")
             raise
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
-        retry=retry_if_exception_type((AgensgraphQueryException,)),
-    )
     async def remove_nodes(self, nodes: list[str]):
         """Delete multiple nodes in chunked, index-backed batches.
 
@@ -886,15 +844,8 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
         for start in range(0, len(nodes), CHUNK_SIZE):
             chunk = nodes[start : start + CHUNK_SIZE]
             frag, params = _or_equalities("n.entity_id", chunk, "rm")
-            await self._query(
-                f"MATCH (n:base) WHERE {frag} DETACH DELETE n", params
-            )
+            await self._fetch(f"MATCH (n:base) WHERE {frag} DETACH DELETE n", params, wrote=True)
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
-        retry=retry_if_exception_type((AgensgraphQueryException,)),
-    )
     async def remove_edges(self, edges: list[tuple[str, str]]):
         """Delete multiple edges in chunked, index-backed batches.
 
@@ -908,13 +859,11 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
             terms = []
             params: Dict[str, Any] = {}
             for i, (source, target) in enumerate(chunk):
-                params[f"s_{i}"] = Jsonb(source)
-                params[f"t_{i}"] = Jsonb(target)
+                params[f"s_{i}"] = source
+                params[f"t_{i}"] = target
                 terms.append(f"(a.entity_id = %(s_{i})s AND b.entity_id = %(t_{i})s)")
             where = " OR ".join(terms)
-            await self._query(
-                f"MATCH (a:base)-[r]-(b:base) WHERE {where} DELETE r", params
-            )
+            await self._fetch(f"MATCH (a:base)-[r]-(b:base) WHERE {where} DELETE r", params, wrote=True)
 
     async def drop(self) -> dict[str, str]:
         """Drop the storage by removing all nodes and relationships in the graph.
@@ -927,7 +876,7 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
                     MATCH (n)
                     DETACH DELETE n
                     """
-            await self._query(query)
+            await self._fetch(query, wrote=True)
             logger.info(f"Successfully dropped all data from graph {self.graph_name}")
             return {"status": "success", "message": "graph data dropped"}
         except Exception as e:
@@ -940,14 +889,14 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
 
     async def get_all_nodes(self) -> list[dict]:
         """Return the property dict of every node."""
-        rows = await self._query(
+        rows = await self._fetch(
             "MATCH (n:base) WHERE n.entity_id IS NOT NULL RETURN n"
         )
         return [r["n"] for r in rows]
 
     async def get_all_edges(self) -> list[dict]:
         """Return every edge once as {source, target, **properties}."""
-        rows = await self._query(
+        rows = await self._fetch(
             """
             MATCH (a:base)-[r]-(b:base)
             WHERE a.entity_id IS NOT NULL AND b.entity_id IS NOT NULL
@@ -970,7 +919,7 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
 
     async def get_popular_labels(self, limit: int = 300) -> list[str]:
         """Return entity labels ordered by degree (most-connected first)."""
-        rows = await self._query(
+        rows = await self._fetch(
             """
             MATCH (n:base) WHERE n.entity_id IS NOT NULL
             OPTIONAL MATCH (n)-[r]-()
@@ -986,7 +935,7 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
     async def search_labels(self, query: str, limit: int = 50) -> list[str]:
         """Case-insensitive substring search over entity labels."""
         pattern = "(?i).*" + re.escape(query) + ".*"
-        rows = await self._query(
+        rows = await self._fetch(
             """
             MATCH (n:base) WHERE n.entity_id IS NOT NULL AND n.entity_id =~ %(pattern)s
             WITH n.entity_id AS label
@@ -994,7 +943,7 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
             LIMIT %(limit)s
             RETURN collect(label) AS labels
             """,
-            {"pattern": Jsonb(pattern), "limit": limit},
+            {"pattern": pattern, "limit": limit},
         )
         return rows[0]["labels"] if rows else []
 
@@ -1002,7 +951,7 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
         """Return the subset of node_ids that exist."""
         if not node_ids:
             return set()
-        rows = await self._query(
+        rows = await self._fetch(
             """
             UNWIND %(node_ids)s AS id
             MATCH (n:base {entity_id: id})
@@ -1012,11 +961,6 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
         )
         return {r["entity_id"] for r in rows}
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
-        retry=retry_if_exception_type((AgensgraphQueryException,)),
-    )
     async def upsert_nodes_batch(self, nodes: list[tuple[str, dict[str, str]]]) -> None:
         """Upsert many nodes in UNWIND-batched MERGEs (index-backed)."""
         rows = [{"id": node_id, "props": data} for node_id, data in nodes]
@@ -1026,13 +970,8 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
             SET n += row.props
             """
         for start in range(0, len(rows), CHUNK_SIZE):
-            await self._query(query, {"rows": Jsonb(rows[start : start + CHUNK_SIZE])})
+            await self._fetch(query, {"rows": Jsonb(rows[start : start + CHUNK_SIZE])}, wrote=True)
 
-    @retry(
-        stop=stop_after_attempt(3),
-        wait=wait_exponential(multiplier=1, min=4, max=10),
-        retry=retry_if_exception_type((AgensgraphQueryException,)),
-    )
     async def upsert_edges_batch(
         self, edges: list[tuple[str, str, dict[str, str]]]
     ) -> None:
@@ -1049,4 +988,4 @@ class AgensgraphStorage(_AgensStorageBase, BaseGraphStorage):
             SET r += row.props
             """
         for start in range(0, len(rows), CHUNK_SIZE):
-            await self._query(query, {"rows": Jsonb(rows[start : start + CHUNK_SIZE])})
+            await self._fetch(query, {"rows": Jsonb(rows[start : start + CHUNK_SIZE])}, wrote=True)

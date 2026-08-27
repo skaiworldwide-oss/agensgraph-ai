@@ -1,30 +1,26 @@
-"""
-Copyright (c) 2025, SKAI Worldwide Co., Ltd.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
+# Copyright (c) 2025, SKAI Worldwide Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import numpy as np
 import pytest
 import pytest_asyncio
-
+from conftest import EMBED_DIM, embed_one
 from lightrag import LightRAG
 from lightrag.kg.shared_storage import initialize_pipeline_status
 from lightrag.utils import EmbeddingFunc
 
-from conftest import EMBED_DIM, requires_agens, _embed_one
-
-pytestmark = [requires_agens, pytest.mark.asyncio]
+pytestmark = pytest.mark.asyncio
 
 CUSTOM_KG = {
     "entities": [
@@ -54,7 +50,7 @@ async def _llm(prompt, system_prompt=None, history_messages=None, **kwargs) -> s
 
 
 async def _embed(texts, **kwargs):
-    return np.array([_embed_one(t) for t in texts], dtype=float)
+    return np.array([embed_one(t) for t in texts], dtype=float)
 
 
 @pytest_asyncio.fixture

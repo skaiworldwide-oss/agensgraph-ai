@@ -1,30 +1,26 @@
-"""
-Copyright (c) 2025, SKAI Worldwide Co., Ltd.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
+# Copyright (c) 2025, SKAI Worldwide Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import dataclasses
-import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple, final
 
-from psycopg.types.json import Jsonb
-
+from agensgraph import Jsonb
 from lightrag.base import DocProcessingStatus, DocStatus, DocStatusStorage
 from lightrag.utils import logger
 
-from lightrag_agensgraph.kg._base import _AgensStorageBase
+from lightrag_agensgraph.kg._base import _AgensStorageBase, resolve_workspace
 from lightrag_agensgraph.kg._sql_templates import (
     DOC_STATUS_INDEX_DDL,
     DOC_STATUS_TABLE_DDL,
@@ -45,19 +41,18 @@ class AgensgraphDocStatusStorage(_AgensStorageBase, DocStatusStorage):
     """
 
     def __post_init__(self):
-        self.workspace = os.environ.get("AGENSGRAPH_WORKSPACE") or self.workspace or ""
-        self._graph_path = None
+        self.workspace = resolve_workspace(self.workspace, self.global_config)
         self._engine = None
 
     async def initialize(self):
         await self._acquire_engine()
 
-        async def _ddl(cur):
-            await cur.execute(DOC_STATUS_TABLE_DDL)
-            for ix in DOC_STATUS_INDEX_DDL:
-                await cur.execute(ix)
+        async def ddl(conn):
+            await conn.execute(DOC_STATUS_TABLE_DDL)
+            for statement in DOC_STATUS_INDEX_DDL:
+                await conn.execute(statement)
 
-        await self._engine.ensure_relational("doc_status", _ddl)
+        await self._engine.setup_once("doc_status", ddl)
 
     async def finalize(self):
         await self._release_engine()
@@ -81,7 +76,7 @@ class AgensgraphDocStatusStorage(_AgensStorageBase, DocStatusStorage):
     # ---- KV-style accessors ----
 
     async def get_by_id(self, id: str) -> Optional[Dict[str, Any]]:
-        rows = await self._execute(
+        rows = await self._fetch(
             "SELECT value FROM LIGHTRAG_DOC_STATUS WHERE workspace = %(ws)s AND id = %(id)s",
             {**self._scope(), "id": id},
         )
@@ -90,7 +85,7 @@ class AgensgraphDocStatusStorage(_AgensStorageBase, DocStatusStorage):
     async def get_by_ids(self, ids: List[str]) -> List[Dict[str, Any]]:
         if not ids:
             return []
-        rows = await self._execute(
+        rows = await self._fetch(
             "SELECT id, value FROM LIGHTRAG_DOC_STATUS "
             "WHERE workspace = %(ws)s AND id = ANY(%(ids)s)",
             {**self._scope(), "ids": list(ids)},
@@ -102,7 +97,7 @@ class AgensgraphDocStatusStorage(_AgensStorageBase, DocStatusStorage):
         keys = set(keys)
         if not keys:
             return set()
-        rows = await self._execute(
+        rows = await self._fetch(
             "SELECT id FROM LIGHTRAG_DOC_STATUS "
             "WHERE workspace = %(ws)s AND id = ANY(%(ids)s)",
             {**self._scope(), "ids": list(keys)},
@@ -129,7 +124,7 @@ class AgensgraphDocStatusStorage(_AgensStorageBase, DocStatusStorage):
                     Jsonb(p),
                 )
             )
-        await self._executemany(
+        await self._run_many(
             """
             INSERT INTO LIGHTRAG_DOC_STATUS
                 (workspace, id, status, file_path, content_hash, track_id, value)
@@ -148,15 +143,14 @@ class AgensgraphDocStatusStorage(_AgensStorageBase, DocStatusStorage):
     async def delete(self, ids: List[str]) -> None:
         if not ids:
             return
-        await self._execute(
+        await self._run(
             "DELETE FROM LIGHTRAG_DOC_STATUS "
             "WHERE workspace = %(ws)s AND id = ANY(%(ids)s)",
             {**self._scope(), "ids": list(ids)},
-            fetch=False,
         )
 
     async def is_empty(self) -> bool:
-        rows = await self._execute(
+        rows = await self._fetch(
             "SELECT 1 FROM LIGHTRAG_DOC_STATUS WHERE workspace = %(ws)s LIMIT 1",
             self._scope(),
         )
@@ -164,10 +158,9 @@ class AgensgraphDocStatusStorage(_AgensStorageBase, DocStatusStorage):
 
     async def drop(self) -> Dict[str, str]:
         try:
-            await self._execute(
+            await self._run(
                 "DELETE FROM LIGHTRAG_DOC_STATUS WHERE workspace = %(ws)s",
                 self._scope(),
-                fetch=False,
             )
             return {"status": "success", "message": "data dropped"}
         except Exception as e:  # pragma: no cover - defensive
@@ -178,7 +171,7 @@ class AgensgraphDocStatusStorage(_AgensStorageBase, DocStatusStorage):
 
     async def get_status_counts(self) -> Dict[str, int]:
         counts = {s.value: 0 for s in DocStatus}
-        rows = await self._execute(
+        rows = await self._fetch(
             "SELECT status, count(*) AS c FROM LIGHTRAG_DOC_STATUS "
             "WHERE workspace = %(ws)s GROUP BY status",
             self._scope(),
@@ -197,7 +190,7 @@ class AgensgraphDocStatusStorage(_AgensStorageBase, DocStatusStorage):
         self, statuses: List[DocStatus]
     ) -> Dict[str, DocProcessingStatus]:
         values = [s.value if isinstance(s, DocStatus) else s for s in statuses]
-        rows = await self._execute(
+        rows = await self._fetch(
             "SELECT id, value FROM LIGHTRAG_DOC_STATUS "
             "WHERE workspace = %(ws)s AND status = ANY(%(st)s)",
             {**self._scope(), "st": values},
@@ -212,7 +205,7 @@ class AgensgraphDocStatusStorage(_AgensStorageBase, DocStatusStorage):
     async def get_docs_by_track_id(
         self, track_id: str
     ) -> Dict[str, DocProcessingStatus]:
-        rows = await self._execute(
+        rows = await self._fetch(
             "SELECT id, value FROM LIGHTRAG_DOC_STATUS "
             "WHERE workspace = %(ws)s AND track_id = %(tid)s",
             {**self._scope(), "tid": track_id},
@@ -253,7 +246,7 @@ class AgensgraphDocStatusStorage(_AgensStorageBase, DocStatusStorage):
             params["st"] = list(statuses)
 
         total = (
-            await self._execute(
+            await self._fetch(
                 f"SELECT count(*) AS c FROM LIGHTRAG_DOC_STATUS {where}", params
             )
         )[0]["c"]
@@ -267,7 +260,7 @@ class AgensgraphDocStatusStorage(_AgensStorageBase, DocStatusStorage):
 
         params["lim"] = page_size
         params["off"] = (page - 1) * page_size
-        rows = await self._execute(
+        rows = await self._fetch(
             f"""
             SELECT id, value FROM LIGHTRAG_DOC_STATUS {where}
             ORDER BY {order_expr} {direction} NULLS LAST, id ASC
@@ -286,7 +279,7 @@ class AgensgraphDocStatusStorage(_AgensStorageBase, DocStatusStorage):
     # ---- single-document lookups ----
 
     async def get_doc_by_file_path(self, file_path: str) -> Optional[Dict[str, Any]]:
-        rows = await self._execute(
+        rows = await self._fetch(
             "SELECT value FROM LIGHTRAG_DOC_STATUS "
             "WHERE workspace = %(ws)s AND file_path = %(fp)s ORDER BY id ASC LIMIT 1",
             {**self._scope(), "fp": file_path},
@@ -296,7 +289,7 @@ class AgensgraphDocStatusStorage(_AgensStorageBase, DocStatusStorage):
     async def get_doc_by_file_basename(
         self, basename: str
     ) -> Optional[Tuple[str, Dict[str, Any]]]:
-        rows = await self._execute(
+        rows = await self._fetch(
             """
             SELECT id, value FROM LIGHTRAG_DOC_STATUS
             WHERE workspace = %(ws)s
@@ -310,7 +303,7 @@ class AgensgraphDocStatusStorage(_AgensStorageBase, DocStatusStorage):
     async def get_doc_by_content_hash(
         self, content_hash: str
     ) -> Optional[Tuple[str, Dict[str, Any]]]:
-        rows = await self._execute(
+        rows = await self._fetch(
             "SELECT id, value FROM LIGHTRAG_DOC_STATUS "
             "WHERE workspace = %(ws)s AND content_hash = %(h)s ORDER BY id ASC LIMIT 1",
             {**self._scope(), "h": content_hash},

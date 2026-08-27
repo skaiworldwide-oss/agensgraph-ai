@@ -20,11 +20,12 @@ Use it for everything, or mix and match (e.g. AgensGraph for the graph only).
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.11+
 - A running **AgensGraph** with the `vector` extension enabled
   (`CREATE EXTENSION vector;`). The `meta` extension is used for schema
   introspection when present.
-- `lightrag-hku>=1.5.3,<1.6`
+- `lightrag-hku>=1.5.6,<1.6`
+- [`agensgraph-python`](https://github.com/skaiworldwide-oss/agensgraph-python) 2.0, the driver every statement goes through
 
 ## Install
 

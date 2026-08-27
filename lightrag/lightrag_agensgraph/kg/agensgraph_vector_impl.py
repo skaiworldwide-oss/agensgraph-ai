@@ -1,20 +1,17 @@
-"""
-Copyright (c) 2025, SKAI Worldwide Co., Ltd.
+# Copyright (c) 2025, SKAI Worldwide Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
-
-import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, final
 
@@ -27,7 +24,7 @@ try:
 except ImportError:  # pragma: no cover
     from lightrag.prompt import GRAPH_FIELD_SEP
 
-from lightrag_agensgraph.kg._base import _AgensStorageBase
+from lightrag_agensgraph.kg._base import _AgensStorageBase, resolve_workspace
 from lightrag_agensgraph.kg._sql_templates import (
     VECTOR_CHUNK_TABLE,
     VECTOR_ENTITY_TABLE,
@@ -110,8 +107,7 @@ class AgensgraphVectorStorage(_AgensStorageBase, BaseVectorStorage):
     """Vector storage backed by pgvector tables (HNSW cosine) in AgensGraph."""
 
     def __post_init__(self):
-        self.workspace = os.environ.get("AGENSGRAPH_WORKSPACE") or self.workspace or ""
-        self._graph_path = None
+        self.workspace = resolve_workspace(self.workspace, self.global_config)
         self._engine = None
         if is_namespace(self.namespace, NameSpace.VECTOR_STORE_ENTITIES):
             self._kind, self.table = "entities", VECTOR_ENTITY_TABLE
@@ -129,15 +125,16 @@ class AgensgraphVectorStorage(_AgensStorageBase, BaseVectorStorage):
 
     async def initialize(self):
         await self._acquire_engine()
+        await self._engine.enable_vectors()
         dim = int(self.embedding_func.embedding_dim)
 
-        async def _ddl(cur):
-            for ddl in VECTOR_TABLE_DDL:
-                await cur.execute(ddl.format(dim=dim))
-            for ix in VECTOR_INDEX_DDL:
-                await cur.execute(ix)
+        async def ddl(conn):
+            for statement in VECTOR_TABLE_DDL:
+                await conn.execute(statement.format(dim=dim))
+            for statement in VECTOR_INDEX_DDL:
+                await conn.execute(statement)
 
-        await self._engine.ensure_relational("vector", _ddl)
+        await self._engine.setup_once("vector", ddl)
 
     async def finalize(self):
         await self._release_engine()
@@ -185,7 +182,7 @@ class AgensgraphVectorStorage(_AgensStorageBase, BaseVectorStorage):
                     item.get("chunk_order_index"), item.get("full_doc_id"),
                     item["content"], vec, item.get("file_path"),
                 ))
-        await self._executemany(
+        await self._run_many(
             _UPSERT_SQL[self._kind].format(table=self.table), params
         )
 
@@ -196,7 +193,7 @@ class AgensgraphVectorStorage(_AgensStorageBase, BaseVectorStorage):
             embedding = query_embedding
         else:
             embedding = (await self.embedding_func([query]))[0]
-        return await self._execute(
+        return await self._fetch(
             _QUERY_SQL[self._kind].format(table=self.table),
             {
                 "ws": self.workspace,
@@ -207,7 +204,7 @@ class AgensgraphVectorStorage(_AgensStorageBase, BaseVectorStorage):
         )
 
     async def get_by_id(self, id: str) -> Optional[Dict[str, Any]]:
-        rows = await self._execute(
+        rows = await self._fetch(
             f"SELECT *, EXTRACT(EPOCH FROM create_time)::BIGINT AS created_at "
             f"FROM {self.table} WHERE workspace = %(ws)s AND id = %(id)s",
             {"ws": self.workspace, "id": id},
@@ -221,7 +218,7 @@ class AgensgraphVectorStorage(_AgensStorageBase, BaseVectorStorage):
     async def get_by_ids(self, ids: List[str]) -> List[Dict[str, Any]]:
         if not ids:
             return []
-        rows = await self._execute(
+        rows = await self._fetch(
             f"SELECT *, EXTRACT(EPOCH FROM create_time)::BIGINT AS created_at "
             f"FROM {self.table} WHERE workspace = %(ws)s AND id = ANY(%(ids)s)",
             {"ws": self.workspace, "ids": list(ids)},
@@ -236,7 +233,7 @@ class AgensgraphVectorStorage(_AgensStorageBase, BaseVectorStorage):
     async def get_vectors_by_ids(self, ids: List[str]) -> Dict[str, List[float]]:
         if not ids:
             return {}
-        rows = await self._execute(
+        rows = await self._fetch(
             f"SELECT id, content_vector::text AS vec FROM {self.table} "
             f"WHERE workspace = %(ws)s AND id = ANY(%(ids)s)",
             {"ws": self.workspace, "ids": list(ids)},
@@ -251,35 +248,31 @@ class AgensgraphVectorStorage(_AgensStorageBase, BaseVectorStorage):
     async def delete(self, ids: List[str]) -> None:
         if not ids:
             return
-        await self._execute(
+        await self._run(
             f"DELETE FROM {self.table} WHERE workspace = %(ws)s AND id = ANY(%(ids)s)",
             {"ws": self.workspace, "ids": list(ids)},
-            fetch=False,
         )
 
     async def delete_entity(self, entity_name: str) -> None:
         entity_id = compute_mdhash_id(entity_name, prefix="ent-")
-        await self._execute(
+        await self._run(
             f"DELETE FROM {VECTOR_ENTITY_TABLE} "
             f"WHERE workspace = %(ws)s AND (id = %(id)s OR entity_name = %(name)s)",
             {"ws": self.workspace, "id": entity_id, "name": entity_name},
-            fetch=False,
         )
 
     async def delete_entity_relation(self, entity_name: str) -> None:
-        await self._execute(
+        await self._run(
             f"DELETE FROM {VECTOR_RELATION_TABLE} "
             f"WHERE workspace = %(ws)s AND (source_id = %(name)s OR target_id = %(name)s)",
             {"ws": self.workspace, "name": entity_name},
-            fetch=False,
         )
 
     async def drop(self) -> Dict[str, str]:
         try:
-            await self._execute(
+            await self._run(
                 f"DELETE FROM {self.table} WHERE workspace = %(ws)s",
                 {"ws": self.workspace},
-                fetch=False,
             )
             return {"status": "success", "message": "data dropped"}
         except Exception as e:  # pragma: no cover - defensive

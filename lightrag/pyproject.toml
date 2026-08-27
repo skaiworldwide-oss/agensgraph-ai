@@ -9,7 +9,7 @@ description = "Complete LightRAG storage backend for AgensGraph (graph + vector 
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-requires-python = ">=3.10,<3.14"
+requires-python = ">=3.11,<3.14"
 authors = [
     { name = "Muhammad Taha Naveed", email = "skaisw@skaiworldwide.com" },
 ]
@@ -25,7 +25,6 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -33,11 +32,9 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "lightrag-hku>=1.5.3,<1.6",
-    "psycopg[binary,pool]>=3.1.0",
-    "pgvector>=0.2.5",
-    "tenacity>=8.0",
-    "numpy>=1.24",
+    "lightrag-hku>=1.5.6,<1.6",
+    "agensgraph-python>=2.0.0",
+    "psycopg[binary]>=3.3.4",
 ]
 
 [project.urls]
@@ -50,6 +47,7 @@ test = [
     "pytest>=8.3",
     "pytest-asyncio>=0.25",
     "python-dotenv>=1.0",
+    "numpy>=1.24",
 ]
 lint = ["ruff>=0.9"]
 
@@ -58,6 +56,9 @@ packages = ["lightrag_agensgraph"]
 
 [tool.hatch.build.targets.sdist]
 include = ["/lightrag_agensgraph", "/tests", "/README.md", "/LICENSE"]
+
+[tool.ruff]
+line-length = 110
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]

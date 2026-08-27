@@ -1,27 +1,24 @@
-"""
-Copyright (c) 2025, SKAI Worldwide Co., Ltd.
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
-"""
+# Copyright (c) 2025, SKAI Worldwide Co., Ltd.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 import pytest
 import pytest_asyncio
+from conftest import EMBED_DIM
 
 from lightrag_agensgraph.kg.agensgraph_vector_impl import AgensgraphVectorStorage
 
-from conftest import requires_agens
-
-pytestmark = [requires_agens, pytest.mark.asyncio]
+pytestmark = pytest.mark.asyncio
 
 
 def _vec(namespace, embedding_func):
@@ -64,7 +61,7 @@ async def test_get_by_id_strips_vector_and_splits_chunks(entities):
     assert "content_vector" not in rec
     assert rec["chunk_ids"] == ["c1", "c2"]
     vecs = await entities.get_vectors_by_ids(["ent-1"])
-    assert len(vecs["ent-1"]) == 8
+    assert len(vecs["ent-1"]) == EMBED_DIM
 
 
 async def test_delete_and_delete_entity(entities):
@@ -112,15 +109,16 @@ async def test_query_uses_hnsw_index(entities, embedding_func):
             for i in range(20)
         }
     )
-    async with entities._engine.aconnection(graph_path=None) as conn:
-        async with conn.cursor() as cur:
-            await cur.execute("SET LOCAL enable_seqscan = off")
-            await cur.execute(
-                "EXPLAIN SELECT id FROM LIGHTRAG_VDB_ENTITY "
-                "ORDER BY content_vector <=> '[0,0,0,0,0,0,0,1]'::vector LIMIT 5"
+    probe = "[" + ",".join(["0"] * (EMBED_DIM - 1) + ["1"]) + "]"
+    async with entities._engine.connection() as conn:
+        async with conn.transaction(force_rollback=True):
+            await conn.execute("SET LOCAL enable_seqscan = off")
+            await conn.execute("SET LOCAL enable_bitmapscan = off")
+            cur = await conn.execute(
+                "EXPLAIN SELECT id FROM LIGHTRAG_VDB_ENTITY ORDER BY content_vector <=> %s::vector LIMIT 5",
+                (probe,),
             )
             plan = "\n".join(r[0] for r in await cur.fetchall())
-        await conn.rollback()
     assert "hnsw" in plan.lower() and "Seq Scan" not in plan
 
 
@@ -140,15 +138,14 @@ async def test_delete_entity_relation_uses_index(embedding_func):
                 for i in range(20)
             }
         )
-        async with rel._engine.aconnection(graph_path=None) as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("SET LOCAL enable_seqscan = off")
-                await cur.execute(
+        async with rel._engine.connection() as conn:
+            async with conn.transaction(force_rollback=True):
+                await conn.execute("SET LOCAL enable_seqscan = off")
+                cur = await conn.execute(
                     "EXPLAIN DELETE FROM LIGHTRAG_VDB_RELATION "
                     "WHERE workspace = '' AND (source_id = 'e1' OR target_id = 'e1')"
                 )
                 plan = "\n".join(r[0] for r in await cur.fetchall())
-            await conn.rollback()
         assert "Index" in plan and "Seq Scan" not in plan
     finally:
         await rel.drop()

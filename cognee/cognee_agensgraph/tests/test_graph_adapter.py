@@ -23,7 +23,10 @@ from cognee_agensgraph.infrastructure.databases.graph.agensgraph.adapter import 
     AgensgraphAdapter,
 )
 
-from conftest import requires_agens
+from psycopg import sql
+from psycopg.types.json import Jsonb
+
+from conftest import explain, requires_agens, scanned_tables
 
 pytestmark = [requires_agens, pytest.mark.asyncio]
 
@@ -104,26 +107,80 @@ async def test_nodeset_subgraph(adapter):
     assert "Alice" in names and "Bob" in names  # Alice + its neighbors
 
 
-async def test_name_lookup_uses_index(adapter):
-    await adapter.add_nodes([Ent(name=f"e{i}") for i in range(30)])
+async def _analyzed(adapter, labels):
     async with adapter._engine.connection() as conn:
-        async with conn.transaction(), conn.cursor() as cur:
-            await cur.execute("SET LOCAL enable_seqscan = off")
-            await cur.execute(
-                'EXPLAIN MATCH (n:"__Node__" {name: \'"e5"\'}) RETURN n'
+        for label in labels:
+            await conn.execute(
+                sql.SQL("ANALYZE {}.{}").format(
+                    sql.Identifier(adapter.graph_name), sql.Identifier(label)
+                )
             )
-            plan = "\n".join(r[0] for r in await cur.fetchall())
-    assert "base_name_idx" in plan and "Seq Scan" not in plan
 
 
-async def test_ingest_and_lookup_use_id_index(adapter):
-    # The MERGE-by-id ingest and id lookups must use base_id_idx, not seq-scan.
-    await adapter.add_nodes([Ent(name=f"n{i}") for i in range(30)])
+async def _plan(adapter, statement, params=None, *, by_index=False):
     async with adapter._engine.connection() as conn:
-        async with conn.transaction(), conn.cursor() as cur:
-            await cur.execute("SET LOCAL enable_seqscan = off")
-            await cur.execute(
-                'EXPLAIN MATCH (n:"__Node__" {id: \'x\'}) RETURN n'
-            )
-            plan = "\n".join(r[0] for r in await cur.fetchall())
-    assert "base_id_idx" in plan and "Seq Scan" not in plan
+        return await explain(conn, statement, params, by_index=by_index)
+
+
+async def test_id_lookups_use_an_index(adapter):
+    # Plans are read with the planner's default settings, on enough rows that a
+    # sequential scan would be a real choice, and after ANALYZE so the choice is made
+    # on real statistics.
+    await adapter.add_nodes([Ent(name=f"n{i}") for i in range(2000)])
+    await _analyzed(adapter, ["ent", "__node__"])
+    for statement in (
+        'MATCH (n:"ent" {id: %(id)s}) RETURN n',
+        'MATCH (n:"__node__" {id: %(id)s}) RETURN n',
+        'MERGE (n:"ent" {id: %(id)s}) SET n += %(props)s',
+    ):
+        plan = await _plan(adapter, statement, {"id": Jsonb("x"), "props": Jsonb({"a": 1})})
+        assert scanned_tables(plan) == [], plan
+
+
+async def test_name_lookup_uses_an_index(adapter):
+    await adapter.add_nodes([Ent(name=f"e{i}") for i in range(2000)])
+    await _analyzed(adapter, ["ent", "__node__"])
+    plan = await _plan(adapter, 'MATCH (n:"ent" {name: %(name)s}) RETURN n', {"name": Jsonb("e5")})
+    assert scanned_tables(plan) == [], plan
+    plan = await _plan(
+        adapter,
+        'MATCH (n:"ent") WHERE n.name = %(a)s OR n.name = %(b)s RETURN n',
+        {"a": Jsonb("e5"), "b": Jsonb("e6")},
+    )
+    assert scanned_tables(plan) == [], plan
+
+
+async def test_edge_reads_from_a_bound_list_use_an_index(adapter):
+    ents = [Ent(name=f"e{i}") for i in range(2000)]
+    await adapter.add_nodes(ents)
+    await adapter.add_edges(
+        [(str(ents[i].id), str(ents[i + 1].id), "knows", {}) for i in range(1999)]
+    )
+    await _analyzed(adapter, ["ent", "__node__", "knows"])
+    ids = [str(e.id) for e in ents[:50]]
+    # the statement get_nodeset_subgraph runs for the edges among a node set
+    plan = await _plan(
+        adapter,
+        'UNWIND %(ids)s AS wanted MATCH (a:"__node__" {id: wanted})-[r]->(b:"__node__") '
+        "RETURN label(r), properties(r)",
+        {"ids": Jsonb(ids)},
+        by_index=True,
+    )
+    assert scanned_tables(plan) == [], plan
+    # the statement has_edges runs
+    plan = await _plan(
+        adapter,
+        'UNWIND %(edges)s AS e MATCH (a:"__node__" {id: e.from_node})-[r]->(b:"__node__" {id: e.to_node}) '
+        "WHERE label(r) = e.relationship_name RETURN e.from_node",
+        {"edges": Jsonb([{"from_node": ids[0], "to_node": ids[1], "relationship_name": "knows"}])},
+        by_index=True,
+    )
+    assert scanned_tables(plan) == [], plan
+    # the merge add_nodes runs
+    plan = await _plan(
+        adapter,
+        'UNWIND %(rows)s AS row MERGE (n:"ent" {id: row.id}) SET n += row.props',
+        {"rows": Jsonb([{"id": i, "props": {"name": "x"}} for i in ids])},
+        by_index=True,
+    )
+    assert scanned_tables(plan) == [], plan

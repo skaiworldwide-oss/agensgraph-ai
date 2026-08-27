@@ -81,7 +81,7 @@ def test_the_adapter_works_from_a_second_event_loop(conn_url):
 
     async def use():
         await a.initialize()
-        return await a.query('MATCH (n:"__Node__") RETURN count(n) AS c')
+        return await a.query('MATCH (n:"__node__") RETURN count(n) AS c')
 
     for _ in range(3):
         rows = asyncio.run(asyncio.wait_for(use(), 30))
@@ -92,20 +92,20 @@ def test_the_adapter_works_from_a_second_event_loop(conn_url):
 
 async def test_query_refuses_a_write(adapter):
     with pytest.raises(ReadOnlyGraphWrite):
-        await adapter.query("CREATE (n:\"__Node__\" {id: 'x'})")
+        await adapter.query("CREATE (n:\"__node__\" {id: 'x'})")
     assert await adapter.has_node("x") is False
 
 
 async def test_query_refuses_a_second_statement(adapter):
     with pytest.raises(ValueError):
-        await adapter.query("MATCH (n) RETURN count(n); CREATE (m:\"__Node__\" {id: 'y'})")
+        await adapter.query("MATCH (n) RETURN count(n); CREATE (m:\"__node__\" {id: 'y'})")
 
 
 async def test_query_writes_when_asked_to(conn_url):
     a = AgensgraphAdapter(conn_url, query_read_only=False)
     await a.initialize()
     try:
-        await a.query("CREATE (n:\"__Node__\" {id: 'written-through-query'})")
+        await a.query("CREATE (n:\"__node__\" {id: 'written-through-query'})")
         assert await a.has_node("written-through-query") is True
     finally:
         await a.delete_graph()
@@ -115,7 +115,7 @@ async def test_query_writes_when_asked_to(conn_url):
 async def test_query_returns_plain_values(adapter):
     alice = Ent(name="Alice")
     await adapter.add_nodes([alice])
-    rows = await adapter.query('MATCH (n:"__Node__") RETURN n, n.name AS name, id(n) AS gid')
+    rows = await adapter.query('MATCH (n:"__node__") RETURN n, n.name AS name, id(n) AS gid')
     assert rows[0]["n"]["name"] == "Alice"
     assert rows[0]["name"] == "Alice"
     assert isinstance(rows[0]["gid"], str)
@@ -156,3 +156,13 @@ def test_edge_shorthand_is_spelled_out_outside_literals():
     assert spell_out_edges("MATCH (a)-[r]->(b) RETURN r") == "MATCH (a)-[r]->(b) RETURN r"
     assert spell_out_edges("MATCH (a) RETURN a -- trailing comment") == "MATCH (a) RETURN a -- trailing comment"
     assert spell_out_edges("MATCH (a {name: ')--('}) RETURN a") == "MATCH (a {name: ')--('}) RETURN a"
+
+
+async def test_query_accepts_the_neo4j_edge_shorthand(adapter):
+    alice, bob = Ent(name="Alice"), Ent(name="Bob")
+    await adapter.add_nodes([alice, bob])
+    await adapter.add_edges([(alice.id, bob.id, "knows", {})])
+    rows = await adapter.query("MATCH (a:Ent {name: 'Alice'})--(b) RETURN b.name AS name")
+    assert [r["name"] for r in rows] == ["Bob"]
+    rows = await adapter.query("MATCH (a:Ent)-->(b:Ent) RETURN a.name AS a, b.name AS b")
+    assert rows == [{"a": "Alice", "b": "Bob"}]

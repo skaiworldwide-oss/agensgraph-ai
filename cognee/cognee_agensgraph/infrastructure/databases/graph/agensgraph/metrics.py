@@ -34,7 +34,7 @@ async def get_edge_density(adapter: AgensgraphAdapter):
         ELSE num_edges * 1.0 / (num_nodes * (num_nodes - 1))
     END AS edge_density;
     """
-    result = await adapter.query(query)
+    result = await adapter._read(query)
     return result[0]["edge_density"] if result else 0
 
 
@@ -61,7 +61,7 @@ async def count_self_loops(adapter: AgensgraphAdapter):
     MATCH (n)-[r]->(n)
     RETURN count(r) AS adapter_loop_count;
     """
-    result = await adapter.query(query)
+    result = await adapter._read(query)
     return result[0]["adapter_loop_count"] if result else 0
 
 

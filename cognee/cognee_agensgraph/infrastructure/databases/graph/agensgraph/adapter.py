@@ -1,14 +1,27 @@
 """AgensGraph graph adapter for cognee."""
 
 import asyncio
+import hashlib
 import re
-from typing import Any, Dict, List, Optional, Tuple, Type
+from collections import OrderedDict
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Type
 from uuid import UUID
 
 import psycopg
-from agensgraph import Edge, GraphId, Path, RetryPolicy, Vertex, to_builtins
+from agensgraph import (
+    DesiredIndex,
+    DesiredLabel,
+    Edge,
+    GraphId,
+    Path,
+    RetryPolicy,
+    Unique,
+    Vertex,
+    to_builtins,
+)
 from agensgraph.cypher import check_single_statement
 from agensgraph.errors import safe_message
+from agensgraph.introspect import MAX_IDENTIFIER
 from cognee.infrastructure.databases.graph.graph_db_interface import (
     GraphDBInterface,
     record_graph_changes,
@@ -17,126 +30,49 @@ from cognee.infrastructure.engine import DataPoint
 from cognee.shared.logging_utils import ERROR, get_logger
 from psycopg import errors, sql
 from psycopg.conninfo import make_conninfo
-from psycopg.rows import dict_row
+from psycopg.rows import dict_row, tuple_row
 from psycopg.types.json import Jsonb
 
 from ._engine import AgensEngine
 from .metrics import count_self_loops, get_edge_density
 
 logger = get_logger("AgensgraphAdapter", level=ERROR)
-BASE_LABEL = "__Node__"
-# Max rows per UNWIND / OR-of-equalities batch.
+
+# Every node is on a label named after its DataPoint class, and every such label is a
+# child of this one, so a match on it reads every node.
+#
+# Label names are lower case. Cypher folds an unquoted identifier to lower case, so
+# MATCH (e:Entity) looks for a label named entity; a language model writing Cypher for
+# cognee's natural-language search, and most people, write labels unquoted. A class
+# name is kept as written in the type property, which is what cognee reads.
+BASE_LABEL = "__node__"
+
+# The classes cognee's own queries name. Declared up front so those queries never meet
+# a label that does not exist yet.
+KNOWN_CLASSES = (
+    "TextDocument",
+    "PdfDocument",
+    "DocumentChunk",
+    "Entity",
+    "EntityType",
+    "TextSummary",
+    "NodeSet",
+)
+
+# Rows per statement for UNWIND-bound lists.
 CHUNK_SIZE = 1000
 
-# Since we do not support multiple labels, we will maintain the extra labels as a list
-# This function will be used in queries to append new labels to the existing list
-# and ensure that the labels are unique
-append_label_function = """
-    CREATE OR REPLACE FUNCTION append_label(labels jsonb, new_label text) 
-    RETURNS jsonb AS $$
-    BEGIN
-        IF labels IS NULL OR jsonb_typeof(labels) <> 'array' THEN
-            labels := '[]'::jsonb;
-        END IF;
+# How many recently written node ids are remembered with their label. An edge whose
+# endpoints were written recently is matched on their labels directly, one index probe
+# per endpoint, instead of through the parent label, which probes every child label.
+REMEMBERED_IDS = 200_000
 
-        IF NOT labels @> to_jsonb(new_label) THEN
-            RETURN labels || jsonb_build_array(new_label);
-        ELSE
-            RETURN labels;
-        END IF;
-    END;
-    $$ LANGUAGE plpgsql;
+# Up to this many values are written out as an OR of equalities. From here on one bound
+# list is used. Writing values out is faster for a few (15.1 ms against 22.8 ms for one)
+# and grows by about 14 ms per value; a bound list stays flat.
+OR_CHAIN_LIMIT = 20
 
-"""
-
-get_labels_function = """
-    CREATE OR REPLACE FUNCTION get_labels(entity vertex)
-    RETURNS jsonb AS $$
-    DECLARE
-        existing_labels jsonb;
-        entity_label text;
-    BEGIN
-        existing_labels := entity.properties -> 'labels';
-        IF existing_labels IS NULL OR jsonb_typeof(existing_labels) <> 'array' THEN
-            existing_labels := '[]'::jsonb;
-        END IF;
-
-        entity_label := trim(both '"' from label(entity)::text);
-
-        IF entity_label <> 'ag_vertex' AND NOT existing_labels @> to_jsonb(entity_label) THEN
-            existing_labels := existing_labels || to_jsonb(entity_label);
-        END IF;
-
-        RETURN existing_labels;
-    END;
-    $$ LANGUAGE plpgsql;
-
-"""
-
-label_catalog = """
-    CREATE TABLE IF NOT EXISTS label_catalog (
-        graph_id oid PRIMARY KEY,
-        labels jsonb DEFAULT '[]'::jsonb
-    );
-
-"""
-
-track_labels = """
-    CREATE OR REPLACE FUNCTION track_labels()
-    RETURNS TRIGGER AS $$
-    DECLARE
-        graphid OID := {}::oid;
-        new_labels JSONB;
-    BEGIN
-        INSERT INTO label_catalog (graph_id, labels)
-        VALUES (graphid, '[]'::jsonb)
-        ON CONFLICT (graph_id) DO NOTHING;
-
-        IF NEW.properties ? 'labels' THEN
-            new_labels := NEW.properties->'labels';
-            new_labels := (
-                SELECT jsonb_agg(elems)
-                FROM jsonb_array_elements_text(new_labels) AS elems
-                WHERE elems NOT IN ('__Node__')
-            );
-        ELSE
-            new_labels := '[]'::jsonb;
-        END IF;
-
-        UPDATE label_catalog
-        SET labels = (
-            SELECT jsonb_agg(DISTINCT elems)
-            FROM jsonb_array_elements(COALESCE(labels, '[]'::jsonb) || COALESCE(new_labels, '[]'::jsonb)) AS elems
-        )
-        WHERE graph_id = graphid;
-
-        RETURN NEW;
-    END;
-    $$ LANGUAGE plpgsql;
-
-"""
-
-label_trigger = """
-    CREATE OR REPLACE TRIGGER trigger_track_labels
-    AFTER INSERT OR UPDATE ON "{}"."{}"
-    FOR EACH ROW
-    EXECUTE FUNCTION track_labels();
-
-"""
-
-get_label_name_function = """
-    CREATE OR REPLACE FUNCTION get_label_name(gid graphid)
-    RETURNS text
-    LANGUAGE SQL
-    AS $$
-        SELECT l.labname
-        FROM ag_label l
-        JOIN ag_graph g ON g.oid = l.graphid
-        WHERE l.labid = graphid_labid(gid) AND
-              g.graphname = current_setting('graph_path');
-    $$;
-
-"""
+_PROPERTY_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 # Neo4j's edge shorthand between two pattern nodes: (a)--(b), (a)-->(b), (a)<--(b), where
 # what follows looks like a node: (b, (b:Label, (:Label, ({...} or ().
@@ -165,41 +101,47 @@ def spell_out_edges(statement: str) -> str:
     return "".join(out)
 
 
+def bounded_name(*parts: str) -> str:
+    """A name that fits in an identifier and stays distinct after truncation.
+
+    An identifier is 63 bytes. A DataPoint class name can be longer, and the server
+    truncates a longer label name instead of refusing it, so two names that agree for
+    63 bytes would become one label. A name that fits is used as it is; a longer one
+    keeps what fits plus a hash of the whole.
+    """
+    name = "_".join(parts)
+    encoded = name.encode()
+    if len(encoded) <= MAX_IDENTIFIER:
+        return name
+    digest = hashlib.blake2b(encoded, digest_size=8).hexdigest()
+    head = encoded[: MAX_IDENTIFIER - len(digest) - 1].decode("utf-8", "ignore")
+    return f"{head}_{digest}"
+
+
+def label_for(name: str) -> str:
+    """The label a DataPoint class, or a relationship, is stored on."""
+    return bounded_name(name).lower()
+
+
+KNOWN_LABELS = tuple(label_for(c) for c in KNOWN_CLASSES)
+
+
+def _unique_id_name(label: str) -> str:
+    return bounded_name(label, "unique_id")
+
+
+def _name_index_name(label: str) -> str:
+    return bounded_name(label, "name_idx")
+
+
 class AgensgraphAdapter(GraphDBInterface):
     """
-    Handles interaction with a Agensgraph database through various graph operations.
+    Cognee's graph store on AgensGraph.
 
-    Public methods include:
-    - get_session
-    - query
-    - has_node
-    - add_node
-    - add_nodes
-    - extract_node
-    - extract_nodes
-    - delete_node
-    - delete_nodes
-    - has_edge
-    - has_edges
-    - add_edge
-    - add_edges
-    - get_edges
-    - get_disconnected_nodes
-    - get_predecessors
-    - get_successors
-    - get_neighbours
-    - get_connections
-    - remove_connection_to_predecessors_of
-    - remove_connection_to_successors_of
-    - delete_graph
-    - serialize_properties
-    - get_model_independent_graph_data
-    - get_graph_data
-    - get_nodeset_subgraph
-    - get_filtered_graph_data
-    - get_node_labels_string
-    - get_relationship_labels_string
-    - get_graph_metrics
+    Each DataPoint class is a label under ``__Node__``. Every label carries a uniqueness
+    constraint on ``id`` and an index on ``name``, which is what cognee looks nodes up by.
+    Edges are on a label named after the relationship and carry ``source_node_id``,
+    ``target_node_id`` and ``relationship_name`` as properties.
     """
 
     def __init__(
@@ -233,6 +175,19 @@ class AgensgraphAdapter(GraphDBInterface):
         # Development setups run as a superuser, so the default is to go ahead.
         self.query_allow_server_programs = query_allow_server_programs
         self.retry_policy = RetryPolicy(attempts=retry_attempts)
+        # id -> label of nodes this process wrote recently, oldest first.
+        self._recent: "OrderedDict[str, str]" = OrderedDict()
+        self._edge_labels: Set[str] = set()
+
+    def _remember(self, node_id: str, label: str) -> None:
+        recent = self._recent
+        if node_id in recent:
+            recent.move_to_end(node_id)
+        recent[node_id] = label
+        while len(recent) > REMEMBERED_IDS:
+            recent.popitem(last=False)
+
+    # ---- lifecycle ----
 
     async def initialize(self):
         """Connect once and create what the graph needs. Cheap when called again."""
@@ -241,25 +196,66 @@ class AgensgraphAdapter(GraphDBInterface):
         self.graph_id = self._engine.graph_id
 
     async def _bootstrap(self, conn) -> None:
-        await conn.execute(f'CREATE VLABEL IF NOT EXISTS "{BASE_LABEL}"')
-        await conn.execute('CREATE ELABEL IF NOT EXISTS "DIRECTED"')
-        await conn.execute(
-            f'CREATE PROPERTY INDEX IF NOT EXISTS base_id_idx ON "{BASE_LABEL}" (id)'
-        )
-        # name is the lookup key for nodeset / document subgraph queries.
-        await conn.execute(
-            f'CREATE PROPERTY INDEX IF NOT EXISTS base_name_idx ON "{BASE_LABEL}" (name)'
-        )
-        await conn.execute(append_label_function)
-        await conn.execute(get_labels_function)
-        await conn.execute(track_labels.format(self._engine.graph_id))
-        await conn.execute(label_catalog)
-        await conn.execute(get_label_name_function)
+        await self._declare_on(conn, [BASE_LABEL, *KNOWN_LABELS])
+        self._engine.labels = await self._established_labels(conn)
 
     async def finalize(self):
         """Close this event loop's pool. The next call opens a new one."""
         if self._engine is not None:
             await self._engine.aclose()
+
+    # ---- labels ----
+
+    async def _established_labels(self, conn) -> Set[str]:
+        """The node labels that exist and carry their own uniqueness on id."""
+        labels = await conn.labels(graph=self.graph_name)
+        constraints = await conn.constraints(graph=self.graph_name)
+        unique = {c.label for c in constraints if c.unique}
+        return {
+            label.name
+            for label in labels
+            if label.kind == "v" and label.parent == BASE_LABEL and label.name in unique
+        }
+
+    async def _declare_on(self, conn, labels: List[str]) -> None:
+        """Create the labels, their constraints and their indexes, one writer at a time.
+
+        Reconciling reads what exists and then creates what is missing, which is two
+        steps; the lock makes concurrent writers take them one after another. It lasts
+        as long as the transaction.
+        """
+        children = [label for label in labels if label != BASE_LABEL]
+        async with conn.transaction():
+            await conn.execute("SELECT pg_advisory_xact_lock(%s)", (int(self._engine.graph_id),))
+            desired = []
+            if BASE_LABEL in labels:
+                desired.append(DesiredLabel(BASE_LABEL, "v"))
+            desired.extend(DesiredLabel(label, "v", BASE_LABEL) for label in children)
+            await conn.ensure_labels(desired, graph=self.graph_name)
+            # A constraint on the parent does not reach a child, so every label has one.
+            await conn.ensure_constraints(
+                [Unique(label, "id", _unique_id_name(label)) for label in labels],
+                graph=self.graph_name,
+            )
+            await conn.ensure_indexes(
+                [DesiredIndex(label, ("name",), name=_name_index_name(label)) for label in labels],
+                graph=self.graph_name,
+            )
+
+    async def _ensure_labels(self, labels: Iterable[str]) -> None:
+        wanted = sorted(set(labels) - self._engine.labels)
+        if not wanted:
+            return
+        async with self._engine.connection() as conn:
+            await self._declare_on(conn, wanted)
+            self._engine.labels = await self._established_labels(conn)
+
+    async def _label_exists(self, label: str) -> bool:
+        if label in self._engine.labels:
+            return True
+        async with self._engine.connection() as conn:
+            self._engine.labels = await self._established_labels(conn)
+        return label in self._engine.labels
 
     # ---- statements ----
 
@@ -290,17 +286,69 @@ class AgensgraphAdapter(GraphDBInterface):
 
         return await self._run_with_retry(attempt, wrote=False)
 
-    async def _read(self, query, params=None) -> List[Dict[str, Any]]:
+    async def _read(self, query, params=None, *, by_index: bool = False) -> List[Dict[str, Any]]:
         async def attempt():
             async with self._engine.connection() as conn:
-                return await self._execute(conn, query, params)
+                return await self._execute(conn, query, params, by_index=by_index)
 
         return await self._run_with_retry(attempt, wrote=False)
 
-    async def _write(self, query, params=None) -> List[Dict[str, Any]]:
+    async def _read_raw(self, query, params=None) -> List[tuple]:
+        """Rows as tuples, with no conversion of graph values.
+
+        For the reads that return only property maps and ids. Converting each row
+        costs about 4 µs, which is 400 ms over the 100,000 rows of a whole-graph read.
+        """
+
         async def attempt():
             async with self._engine.connection() as conn:
-                return await self._execute(conn, query, params)
+                async with conn.cursor(row_factory=tuple_row) as cur:
+                    await cur.execute(query, params)
+                    return await cur.fetchall() if cur.description is not None else []
+
+        return await self._run_with_retry(attempt, wrote=False)
+
+    @staticmethod
+    def _one_per_id(nodes: Iterable[Tuple[str, dict]]) -> List[Tuple[str, dict]]:
+        """Keep the first node for each id; cognee's in-memory graph refuses a second."""
+        seen: Dict[str, dict] = {}
+        dropped = 0
+        for node_id, props in nodes:
+            if node_id in seen:
+                dropped += 1
+            else:
+                seen[node_id] = props
+        if dropped:
+            logger.warning("%d nodes shared an id with another node and were left out", dropped)
+        return list(seen.items())
+
+    @staticmethod
+    def _graphid(value: Any) -> GraphId:
+        if isinstance(value, GraphId):
+            return value
+        labid, locid = str(value).split(".")
+        return GraphId(labid=int(labid), locid=int(locid))
+
+    async def _read_raw_by_index(self, query, params=None) -> List[tuple]:
+        """Tuple rows for a statement that matches nodes from a bound list."""
+
+        async def attempt():
+            async with self._engine.connection() as conn:
+                async with conn.transaction():
+                    async with conn.pipeline():
+                        await conn.execute("SET LOCAL enable_seqscan = off")
+                        cur = conn.cursor(row_factory=tuple_row)
+                        await cur.execute(query, params)
+                    rows = await cur.fetchall() if cur.description is not None else []
+                    await cur.close()
+                    return rows
+
+        return await self._run_with_retry(attempt, wrote=False)
+
+    async def _write(self, query, params=None, *, by_index: bool = False) -> List[Dict[str, Any]]:
+        async def attempt():
+            async with self._engine.connection() as conn:
+                return await self._execute(conn, query, params, by_index=by_index)
 
         return await self._run_with_retry(attempt, wrote=True)
 
@@ -334,12 +382,29 @@ class AgensgraphAdapter(GraphDBInterface):
                 return result
 
     @staticmethod
-    async def _execute(conn, query, params) -> List[Dict[str, Any]]:
-        async with conn.cursor(row_factory=dict_row) as cur:
-            await cur.execute(query, params)
-            if cur.description is None:
-                return []
-            rows = await cur.fetchall()
+    async def _execute(conn, query, params, *, by_index: bool = False) -> List[Dict[str, Any]]:
+        """Run one statement and convert its rows.
+
+        ``by_index`` is for a statement that matches nodes from a bound list. The
+        planner sizes the list at 100 rows and, past a few thousand nodes, joins it by
+        hashing every node's property map instead of probing the unique index once per
+        value; that read is what the index exists to avoid. The setting is local to the
+        transaction and the four statements go out in one flush.
+        """
+        if not by_index:
+            async with conn.cursor(row_factory=dict_row) as cur:
+                await cur.execute(query, params)
+                if cur.description is None:
+                    return []
+                rows = await cur.fetchall()
+            return [AgensgraphAdapter._convert_row(row) for row in rows]
+        async with conn.transaction():
+            async with conn.pipeline():
+                await conn.execute("SET LOCAL enable_seqscan = off")
+                cur = conn.cursor(row_factory=dict_row)
+                await cur.execute(query, params)
+            rows = await cur.fetchall() if cur.description is not None else []
+            await cur.close()
         return [AgensgraphAdapter._convert_row(row) for row in rows]
 
     @staticmethod
@@ -374,993 +439,529 @@ class AgensgraphAdapter(GraphDBInterface):
             return [AgensgraphAdapter._convert(item, vertices) for item in value]
         return value
 
-    async def has_node(self, node_id: str) -> bool:
+    @staticmethod
+    def _equalities(field: str, values: List[Any], key: str) -> Tuple[str, str, Dict[str, Any]]:
+        """A predicate ``field = one of values`` and the parameters it binds.
+
+        Returns ``(prelude, predicate, params)``. A few values are written out as an OR
+        of equalities; more become one UNWIND-bound list in the prelude. ``IN`` against a
+        bound list is not used: it is jsonb containment and never uses an index.
         """
-        Check if a node with the specified ID exists in the database.
-
-        Parameters:
-        -----------
-
-            - node_id (str): The ID of the node to check for existence.
-
-        Returns:
-        --------
-
-            - bool: True if the node exists, otherwise False.
-        """
-        results = await self._read(sql.SQL(
-            """
-                MATCH (n:{BASE_LABEL})
-                WHERE n.id = %(node_id)s
-                WITH COUNT(n) AS nodes
-                RETURN nodes > 0 AS node_exists
-            """).format(BASE_LABEL=sql.Identifier(BASE_LABEL)),
-            {"node_id": Jsonb(node_id)}
+        if len(values) <= OR_CHAIN_LIMIT:
+            params = {f"{key}_{i}": Jsonb(v) for i, v in enumerate(values)}
+            predicate = " OR ".join(f"{field} = %({name})s" for name in params)
+            return "", f"({predicate})", params
+        return (
+            f"UNWIND %({key})s AS {key}_value ",
+            f"{field} = {key}_value",
+            {key: Jsonb(list(values))},
         )
-        return results[0]["node_exists"] if len(results) > 0 else False
+
+    @staticmethod
+    def _sql_table(graph: str, table: str) -> sql.Composed:
+        return sql.SQL("{}.{}").format(sql.Identifier(graph), sql.Identifier(table))
+
+    # ---- nodes ----
+
+    async def has_node(self, node_id: str) -> bool:
+        results = await self._read(
+            sql.SQL(
+                "MATCH (n:{base} {{id: %(node_id)s}}) RETURN count(n) > 0 AS node_exists"
+            ).format(base=sql.Identifier(BASE_LABEL)),
+            {"node_id": Jsonb(str(node_id))},
+        )
+        return bool(results[0]["node_exists"]) if results else False
 
     async def add_node(self, node: DataPoint):
-        """
-        Add a new node to the database based on the provided DataPoint object.
-
-        Parameters:
-        -----------
-
-            - node (DataPoint): An instance of DataPoint representing the node to add.
-
-        Returns:
-        --------
-
-            The result of the query execution, typically the ID of the added node.
-        """
-        # Delegate to the batched path: it Jsonb-wraps the row (so the id and
-        # label bind as agtype) and MERGEs on the indexed id. The previous
-        # single-node query bound node_id as a bare string (invalid agtype) and
-        # referenced an undefined `node_label` Cypher variable — both broken.
         return await self.add_nodes([node])
 
     @record_graph_changes
     async def add_nodes(self, nodes: list[DataPoint]) -> None:
+        """Write nodes, each on the label of its class, merging on id.
+
+        One node per id. cognee derives an id from a name, so an Entity and an EntityType
+        with the same name share an id; cognee's own adapters keep one node for it and
+        take the class from the last write. So a node whose id already exists on another
+        label is updated where it is, and its type property records the class written.
         """
-        Add multiple nodes to the database in a single query.
+        rows_by_id: Dict[str, Tuple[str, Dict[str, Any]]] = {}
+        for node in nodes:
+            node_id = str(node.id)
+            rows_by_id[node_id] = (
+                label_for(type(node).__name__),
+                self.serialize_properties(node.model_dump()),
+            )
+        if not rows_by_id:
+            return
+        # Where do these ids live already? Remembered ids cost nothing; the rest are
+        # looked up in one statement per 1,000 through the labels' unique indexes.
+        placed: Dict[str, str] = {}
+        unknown = []
+        for node_id in rows_by_id:
+            label = self._recent.get(node_id)
+            if label is None:
+                unknown.append(node_id)
+            else:
+                placed[node_id] = label
+        if unknown:
+            statement = sql.SQL(
+                "UNWIND %(ids)s AS wanted MATCH (n:{base} {{id: wanted}}) RETURN wanted, label(n)"
+            ).format(base=sql.Identifier(BASE_LABEL))
+            for start in range(0, len(unknown), CHUNK_SIZE):
+                rows = await self._read_raw_by_index(
+                    statement, {"ids": Jsonb(unknown[start : start + CHUNK_SIZE])}
+                )
+                for node_id, label in rows:
+                    placed[node_id] = label
 
-        Parameters:
-        -----------
-
-            - nodes (list[DataPoint]): A list of DataPoint instances representing the nodes to
-              add.
-
-        Returns:
-        --------
-
-            - None: None
-        """
-        nodes = [
-            {
-                "node_id": str(node.id),
-                "label": type(node).__name__,
-                "properties": self.serialize_properties(node.model_dump()),
-            }
-            for node in nodes
-        ]
-
-        query = """
-        UNWIND %(nodes)s AS node
-        MERGE (n: {label} {{id: node.node_id}})
-        ON CREATE SET n += node.properties, n.updated_at = now(), n.labels = append_label(n.labels, node.label)
-        ON MATCH SET n += node.properties, n.updated_at = now(), n.labels = append_label(n.labels, node.label)
-        RETURN ID(n) AS internal_id, n.id AS nodeId
-        """
-
-        results = await self._write(
-            sql.SQL(query).format(label=sql.Identifier(BASE_LABEL)),
-            {"nodes": Jsonb(nodes)},
-        )
-        return results
+        by_label: Dict[str, List[Dict[str, Any]]] = {}
+        for node_id, (label, props) in rows_by_id.items():
+            target = placed.get(node_id, label)
+            by_label.setdefault(target, []).append({"id": node_id, "props": props})
+            self._remember(node_id, target)
+        await self._ensure_labels(by_label)
+        for label, rows in by_label.items():
+            statement = sql.SQL(
+                "UNWIND %(rows)s AS row "
+                "MERGE (n:{label} {{id: row.id}}) "
+                "SET n += row.props"
+            ).format(label=sql.Identifier(label))
+            for start in range(0, len(rows), CHUNK_SIZE):
+                await self._write(
+                    statement, {"rows": Jsonb(rows[start : start + CHUNK_SIZE])}, by_index=True
+                )
 
     async def extract_node(self, node_id: str):
-        """
-        Retrieve a single node from the database by its ID.
-
-        Parameters:
-        -----------
-
-            - node_id (str): The ID of the node to retrieve.
-
-        Returns:
-        --------
-
-            The node represented as a dictionary, or None if it does not exist.
-        """
         results = await self.extract_nodes([node_id])
-
-        return results[0] if len(results) > 0 else None
+        return results[0] if results else None
 
     async def extract_nodes(self, node_ids: List[str]):
-        """
-        Retrieve multiple nodes from the database by their IDs.
+        return await self.get_nodes(node_ids)
 
-        Parameters:
-        -----------
-
-            - node_ids (List[str]): A list of IDs for the nodes to retrieve.
-
-        Returns:
-        --------
-
-            A list of nodes represented as dictionaries.
-        """
-        query = """
-        UNWIND %(node_ids)s AS id
-        MATCH (node:{label} {{id: id}})
-        RETURN node"""
-
-        params = {"node_ids": Jsonb(node_ids)}
-
+    async def get_node(self, node_id: str) -> Optional[Dict[str, Any]]:
         results = await self._read(
-            sql.SQL(query).format(label=sql.Identifier(BASE_LABEL)),
-            params,
+            sql.SQL("MATCH (node:{base} {{id: %(node_id)s}}) RETURN node").format(
+                base=sql.Identifier(BASE_LABEL)
+            ),
+            {"node_id": Jsonb(str(node_id))},
         )
+        return results[0]["node"] if results else None
 
+    async def get_nodes(self, node_ids: List[str]) -> List[Dict[str, Any]]:
+        if not node_ids:
+            return []
+        results = await self._read(
+            sql.SQL(
+                "UNWIND %(node_ids)s AS wanted MATCH (node:{base} {{id: wanted}}) RETURN node"
+            ).format(base=sql.Identifier(BASE_LABEL)),
+            {"node_ids": Jsonb([str(i) for i in node_ids])},
+            by_index=True,
+        )
         return [result["node"] for result in results]
 
     async def delete_node(self, node_id: str):
-        """
-        Remove a node from the database identified by its ID.
-
-        Parameters:
-        -----------
-
-            - node_id (str): The ID of the node to delete.
-
-        Returns:
-        --------
-
-            The result of the query execution, typically indicating success or failure.
-        """
-        query = """
-        MATCH (node: {label} {{id: %(node_id)s}})
-        DETACH DELETE node
-        """
-        params = {"node_id": Jsonb(node_id)}
-
-        return await self._write(
-            sql.SQL(query).format(label=sql.Identifier(BASE_LABEL)),
-            params
-        )
+        return await self.delete_nodes([node_id])
 
     async def delete_nodes(self, node_ids: list[str]) -> None:
+        if not node_ids:
+            return
+        ids = [str(i) for i in node_ids]
+        statement = sql.SQL(
+            "UNWIND %(node_ids)s AS wanted MATCH (node:{base} {{id: wanted}}) DETACH DELETE node"
+        ).format(base=sql.Identifier(BASE_LABEL))
+        for start in range(0, len(ids), CHUNK_SIZE):
+            await self._write(
+                statement, {"node_ids": Jsonb(ids[start : start + CHUNK_SIZE])}, by_index=True
+            )
+
+    # ---- reads around one node ----
+    #
+    # A pattern with two nodes matched through the parent label joins two sets of child
+    # labels; the planner estimates tens of thousands of rows for a ten-row answer and
+    # runs it in parallel workers, about 10 ms. Anchoring the node in Cypher and reading
+    # its edges in SQL by graphid takes under 1 ms: a graphid names its table, and the
+    # edge tables carry indexes on both endpoints.
+
+    ANCHOR = 'SELECT gid FROM (MATCH (n:"' + BASE_LABEL + '" {{id: {param}}}) RETURN id(n) AS gid) t'
+
+    def _around(self, node_param: str, relationship: Optional[str], select: str) -> sql.Composed:
+        """SQL for the edges at one node in both directions, joined to both endpoints.
+
+        ``select`` sees ``e`` (the edge), ``s`` and ``t`` (start and end vertex) and
+        ``a.gid`` (the anchor's graphid).
         """
-        Delete multiple nodes from the database using their IDs.
-
-        Parameters:
-        -----------
-
-            - node_ids (list[str]): A list of IDs of the nodes to delete.
-
-        Returns:
-        --------
-
-            - None: None
-        """
-        query = """
-        UNWIND %(node_ids)s AS id
-        MATCH (node:{label} {{id: id}})
-        DETACH DELETE node"""
-
-        params = {"node_ids": Jsonb(node_ids)}
-
-        return await self._write(
-            sql.SQL(query).format(label=sql.Identifier(BASE_LABEL)),
-            params,
+        anchor = sql.SQL(self.ANCHOR.format(param=f"%({node_param})s"))
+        edges = self._sql_table(
+            self.graph_name, relationship if relationship is not None else "ag_edge"
         )
+        vertices = self._sql_table(self.graph_name, "ag_vertex")
+        return sql.SQL(
+            "WITH a AS ({anchor}) "
+            "SELECT {select} FROM a, {edges} e "
+            "JOIN {vertices} s ON s.id = e.start JOIN {vertices} t ON t.id = e.\"end\" "
+            "WHERE e.start = a.gid "
+            "UNION ALL "
+            "SELECT {select} FROM a, {edges} e "
+            "JOIN {vertices} s ON s.id = e.start JOIN {vertices} t ON t.id = e.\"end\" "
+            "WHERE e.\"end\" = a.gid AND e.start <> a.gid"
+        ).format(anchor=anchor, select=sql.SQL(select), edges=edges, vertices=vertices)
+
+    @staticmethod
+    def _relationship_of(row_label: str, properties: Dict[str, Any]) -> str:
+        return properties.get("relationship_name") or row_label.split(".")[-1].strip('"')
+
+    # ---- edges ----
 
     async def has_edge(self, from_node: UUID, to_node: UUID, edge_label: str) -> bool:
-        """
-        Check if an edge exists between two nodes with the specified IDs and edge label.
-
-        Parameters:
-        -----------
-
-            - from_node (UUID): The ID of the node from which the edge originates.
-            - to_node (UUID): The ID of the node to which the edge points.
-            - edge_label (str): The label of the edge to check for existence.
-
-        Returns:
-        --------
-
-            - bool: True if the edge exists, otherwise False.
-        """
-        query = """
-            MATCH (from_node: {BASE_LABEL})-[r:{edge_label}]->(to_node: {BASE_LABEL})
-            WHERE from_node.id = %(from_node)s AND to_node.id = %(to_node)s
-            WITH COUNT(r) AS relationships
-            RETURN relationships > 0 AS edge_exists
-        """
-
-        params = {
-            "from_node": Jsonb(str(from_node)),
-            "to_node": Jsonb(str(to_node)),
-        }
-
-        results = await self._read(
-            sql.SQL(query).format(
-                BASE_LABEL=sql.Identifier(BASE_LABEL),
-                edge_label=sql.Identifier(edge_label)
-            ), params
+        if not await self._label_exists_any(label_for(edge_label)):
+            return False
+        rows = await self._read_raw(
+            sql.SQL(
+                "SELECT EXISTS (SELECT 1 FROM {edges} e WHERE e.start = ({a}) AND e.\"end\" = ({b}))"
+            ).format(
+                edges=self._sql_table(self.graph_name, label_for(edge_label)),
+                a=sql.SQL(self.ANCHOR.format(param="%(from_node)s")),
+                b=sql.SQL(self.ANCHOR.format(param="%(to_node)s")),
+            ),
+            {"from_node": Jsonb(str(from_node)), "to_node": Jsonb(str(to_node))},
         )
-        return results[0]["edge_exists"] if results else False
+        return bool(rows[0][0]) if rows else False
 
-    async def has_edges(self, edges):
-        """
-        Check if multiple edges exist based on provided edge criteria.
-
-        Parameters:
-        -----------
-
-            - edges: A list of edge specifications to check for existence.
-
-        Returns:
-        --------
-
-            A list of boolean values indicating the existence of each edge.
-        """
-        edges = [
-            {
-                "from_node": str(edge[0]),
-                "to_node": str(edge[1]),
-                "relationship_name": edge[2],
+    async def _label_exists_any(self, label: str) -> bool:
+        """Whether a label of either kind exists; an edge label appears when first written."""
+        if label in self._engine.labels or label in self._edge_labels:
+            return True
+        async with self._engine.connection() as conn:
+            self._edge_labels = {
+                lab.name for lab in await conn.labels(graph=self.graph_name) if lab.kind == "e"
             }
-            for edge in edges
-        ]
-        query = """
-            UNWIND %(edges)s AS edge
-            MATCH (a)-[r]->(b)
-            WHERE id(a)::jsonb = edge.from_node AND id(b)::jsonb = edge.to_node AND type(r) = edge.relationship_name
-            RETURN edge.from_node AS from_node, edge.to_node AS to_node, edge.relationship_name AS relationship_name
+        return label in self._edge_labels
+
+    async def has_edges(self, edges) -> List[Tuple[str, str, str]]:
+        """The edges in ``edges`` that exist, as ``(from_id, to_id, relationship_name)``.
+
+        The ids are resolved to graphids in one statement, then the edge tables are read
+        by endpoint pairs through their indexes.
         """
-
-        params = {"edges": Jsonb(edges)}
-
-        results = await self._read(query, params)
-        return results
+        if not edges:
+            return []
+        wanted = [(str(e[0]), str(e[1]), e[2]) for e in edges]
+        ids = sorted({i for pair in wanted for i in pair[:2]})
+        gid_of: Dict[str, GraphId] = {}
+        statement = sql.SQL(
+            "UNWIND %(ids)s AS wanted MATCH (n:{base} {{id: wanted}}) RETURN wanted, id(n) AS gid"
+        ).format(base=sql.Identifier(BASE_LABEL))
+        for start in range(0, len(ids), CHUNK_SIZE):
+            rows = await self._read_raw_by_index(statement, {"ids": Jsonb(ids[start : start + CHUNK_SIZE])})
+            for wanted_id, gid in rows:
+                gid_of[wanted_id] = self._graphid(gid)
+        pairs = [(gid_of[f], gid_of[t], rel) for f, t, rel in wanted if f in gid_of and t in gid_of]
+        if not pairs:
+            return []
+        rows = await self._read_raw(
+            sql.SQL(
+                "SELECT w.f, w.t, w.rel FROM unnest(%(f)s, %(t)s, %(rel)s::text[]) AS w(f, t, rel) "
+                "WHERE EXISTS (SELECT 1 FROM {edges} e WHERE e.start = w.f AND e.\"end\" = w.t "
+                "AND (e.properties->>'relationship_name' = w.rel OR e.tableoid::regclass::text = "
+                "quote_ident(%(graph)s) || '.' || quote_ident(lower(w.rel))))"
+            ).format(edges=self._sql_table(self.graph_name, "ag_edge")),
+            {"f": [p[0] for p in pairs], "t": [p[1] for p in pairs], "rel": [p[2] for p in pairs],
+             "graph": self.graph_name},
+        )
+        id_of = {gid: node_id for node_id, gid in gid_of.items()}
+        return [(id_of[self._graphid(f)], id_of[self._graphid(t)], rel) for f, t, rel in rows]
 
     async def add_edge(
         self,
         from_node: UUID,
         to_node: UUID,
         relationship_name: str,
-        edge_properties: Optional[Dict[str, Any]] = {},
+        edge_properties: Optional[Dict[str, Any]] = None,
     ):
-        """
-        Create a new edge between two nodes with specified properties.
-
-        Parameters:
-        -----------
-
-            - from_node (UUID): The ID of the source node of the edge.
-            - to_node (UUID): The ID of the target node of the edge.
-            - relationship_name (str): The type/label of the edge to create.
-            - edge_properties (Optional[Dict[str, Any]]): A dictionary of properties to assign
-              to the edge. (default {})
-
-        Returns:
-        --------
-
-            The result of the query execution, typically indicating the created edge.
-        """
-        query = """
-            MATCH (from_node :{BASE_LABEL} {{id: %(from_node)s}}),
-                  (to_node :{BASE_LABEL} {{id: %(to_node)s}})
-            MERGE (from_node)-[r:{relationship_name}]->(to_node)
-            ON CREATE SET r += %(properties)s, r.updated_at = now()
-            ON MATCH SET r += %(properties)s, r.updated_at = now()
-            RETURN r
-            """
-
-        params = {
-            "from_node": Jsonb(str(from_node)),
-            "to_node": Jsonb(str(to_node)),
-            "properties": Jsonb(self.serialize_properties(edge_properties)),
-        }
-
-        return await self._write(
-            sql.SQL(query).format(
-                BASE_LABEL=sql.Identifier(BASE_LABEL),
-                relationship_name=sql.Identifier(relationship_name),
-            ), params
-        )
+        return await self.add_edges([(from_node, to_node, relationship_name, edge_properties or {})])
 
     @record_graph_changes
     async def add_edges(self, edges: list[tuple[str, str, str, dict[str, Any]]]) -> None:
-        """
-        Add multiple edges between nodes in a single query.
+        """Write edges, merging on the endpoints and the relationship.
 
-        Parameters:
-        -----------
-
-            - edges (list[tuple[str, str, str, dict[str, Any]]]): A list of tuples where each
-              tuple contains edge details to add.
-
-        Returns:
-        --------
-
-            - None: None
+        Every edge carries ``source_node_id``, ``target_node_id`` and ``relationship_name``
+        as properties; the whole-graph read relies on that.
         """
         if not edges:
             return
-        # The relationship type must be a literal in MERGE, so batch per type;
-        # each batch is one UNWIND query (endpoints matched via the indexed id).
-        by_rel: dict[str, list[dict]] = {}
+        # Grouped by relationship and by the labels of the endpoints when both were
+        # written by this process recently; otherwise the endpoints are found through
+        # the parent label.
+        groups: Dict[Tuple[str, str, str], List[Dict[str, Any]]] = {}
+        recent = self._recent
         for source, target, relationship_name, props in edges:
-            by_rel.setdefault(relationship_name, []).append(
+            from_node, to_node = str(source), str(target)
+            a_label = recent.get(from_node, BASE_LABEL)
+            b_label = recent.get(to_node, BASE_LABEL)
+            groups.setdefault((relationship_name, a_label, b_label), []).append(
                 {
-                    "from_node": str(source),
-                    "to_node": str(target),
+                    "from_node": from_node,
+                    "to_node": to_node,
                     "properties": self.serialize_properties(
                         {
-                            **(props if props else {}),
-                            "source_node_id": str(source),
-                            "target_node_id": str(target),
+                            **(props or {}),
+                            "source_node_id": from_node,
+                            "target_node_id": to_node,
+                            "relationship_name": relationship_name,
                         }
                     ),
                 }
             )
-
-        query = """
-            UNWIND %(rows)s AS row
-            MATCH (from_node :{BASE_LABEL} {{id: row.from_node}}),
-                  (to_node :{BASE_LABEL} {{id: row.to_node}})
-            MERGE (from_node)-[r:{relationship_name}]->(to_node)
-            ON CREATE SET r += row.properties, r.updated_at = now()
-            ON MATCH SET r += row.properties, r.updated_at = now()
-            """
-        for relationship_name, rows in by_rel.items():
-            formatted = sql.SQL(query).format(
-                BASE_LABEL=sql.Identifier(BASE_LABEL),
-                relationship_name=sql.Identifier(relationship_name),
+        for (relationship_name, a_label, b_label), rows in groups.items():
+            self._edge_labels.add(label_for(relationship_name))
+            statement = sql.SQL(
+                "UNWIND %(rows)s AS row "
+                "MATCH (a:{a_label} {{id: row.from_node}}), (b:{b_label} {{id: row.to_node}}) "
+                "MERGE (a)-[r:{rel}]->(b) "
+                "SET r += row.properties"
+            ).format(
+                a_label=sql.Identifier(a_label),
+                b_label=sql.Identifier(b_label),
+                rel=sql.Identifier(label_for(relationship_name)),
             )
             for start in range(0, len(rows), CHUNK_SIZE):
                 await self._write(
-                    formatted, {"rows": Jsonb(rows[start : start + CHUNK_SIZE])}
+                    statement, {"rows": Jsonb(rows[start : start + CHUNK_SIZE])}, by_index=True
                 )
 
     async def get_edges(self, node_id: str):
-        """
-        Retrieve all edges connected to a specified node.
-
-        Parameters:
-        -----------
-
-            - node_id (str): The ID of the node for which edges are retrieved.
-
-        Returns:
-        --------
-
-            A list of edges connecting to the specified node, represented as tuples of details.
-        """
-        query = """
-        MATCH (n: {BASE_LABEL} {{id: %(node_id)s}})-[r]-(m)
-        RETURN n, r, m
-        """
-
-        results = await self._read(
-            sql.SQL(query).format(BASE_LABEL=sql.Identifier(BASE_LABEL)),
-            {"node_id": Jsonb(node_id)}
+        rows = await self._read_raw(
+            self._around("node_id", None, "s.properties->>'id', t.properties->>'id', "
+                         "e.tableoid::regclass::text, e.properties"),
+            {"node_id": Jsonb(str(node_id))},
         )
-
         return [
-            (result["n"]["id"], result["m"]["id"], {"relationship_name": result["r"][1]})
-            for result in results
+            (s_id, t_id, {"relationship_name": self._relationship_of(label, props)})
+            for s_id, t_id, label, props in rows
         ]
 
-    async def get_disconnected_nodes(self) -> list[str]:
-        """
-        Find and return nodes that are not connected to any other nodes in the graph.
-
-        Returns:
-        --------
-
-            - list[str]: A list of IDs of disconnected nodes.
-        """
-        # AgensGraph's Cypher rejects `//` comments and is pathologically slow on
-        # unbounded variable-length `[*]` traversals, so we don't compute connected
-        # components here. Per the docstring, "disconnected" = isolated nodes (no
-        # incident edges) — a cheap single-hop degree check returning the cognee
-        # `id` property (not the internal vertex id).
-        query = (
-            'MATCH (n:"__Node__") '
-            "OPTIONAL MATCH (n)-[r]-() "
-            "WITH n, count(r) AS deg "
-            "WHERE deg = 0 "
-            "RETURN COLLECT(n.id) AS ids"
-        )
-        results = await self._read(query)
-        return results[0]["ids"] if results else []
-
-    async def get_predecessors(self, node_id: str, edge_label: str = None) -> list[str]:
-        """
-        Retrieve the predecessor nodes of a specified node based on an optional edge label.
-
-        Parameters:
-        -----------
-
-            - node_id (str): The ID of the node whose predecessors are to be retrieved.
-            - edge_label (str): Optional edge label to filter predecessors. (default None)
-
-        Returns:
-        --------
-
-            - list[str]: A list of predecessor node IDs.
-        """
-        if edge_label is not None:
-            query = """
-            MATCH (node: {BASE_LABEL})<-[r:{edge_label}]-(predecessor)
-            WHERE node.id = %(node_id)s
-            RETURN predecessor
-            """
-
-            results = await self._read(
-                sql.SQL(query).format(
-                    BASE_LABEL=sql.Identifier(BASE_LABEL),
-                    edge_label=sql.Identifier(edge_label),
-                ),
-                {"node_id": Jsonb(node_id)}
-            )
-
-            return [result["predecessor"] for result in results]
-        else:
-            query = """
-            MATCH (node: {BASE_LABEL})<-[r]-(predecessor)
-            WHERE node.id = %(node_id)s
-            RETURN predecessor
-            """
-
-            results = await self._read(
-                sql.SQL(query).format(BASE_LABEL=sql.Identifier(BASE_LABEL)),
-                {"node_id": Jsonb(node_id)}
-            )
-
-            return [result["predecessor"] for result in results]
-
-    async def get_successors(self, node_id: str, edge_label: str = None) -> list[str]:
-        """
-        Retrieve the successor nodes of a specified node based on an optional edge label.
-
-        Parameters:
-        -----------
-
-            - node_id (str): The ID of the node whose successors are to be retrieved.
-            - edge_label (str): Optional edge label to filter successors. (default None)
-
-        Returns:
-        --------
-
-            - list[str]: A list of successor node IDs.
-        """
-        if edge_label is not None:
-            query = """
-            MATCH (node: {BASE_LABEL})-[r:{edge_label}]->(successor)
-            WHERE node.id = %(node_id)s
-            RETURN successor
-            """
-
-            results = await self._read(
-                sql.SQL(query).format(
-                    BASE_LABEL=sql.Identifier(BASE_LABEL),
-                    edge_label=sql.Identifier(edge_label),
-                ),
-                {"node_id": Jsonb(node_id)}
-            )
-
-            return [result["successor"] for result in results]
-        else:
-            query = """
-            MATCH (node: {BASE_LABEL})-[r]->(successor)
-            WHERE node.id = %(node_id)s
-            RETURN successor
-            """
-
-            results = await self._read(
-                sql.SQL(query).format(BASE_LABEL=sql.Identifier(BASE_LABEL)),
-                {"node_id": Jsonb(node_id)}
-            )
-
-            return [result["successor"] for result in results]
-
     async def get_neighbors(self, node_id: str) -> List[Dict[str, Any]]:
-        """
-        Get all neighbors of a specified node, including all directly connected nodes.
-
-        Parameters:
-        -----------
-
-            - node_id (str): The ID of the node for which neighbors are retrieved.
-
-        Returns:
-        --------
-
-            - List[Dict[str, Any]]: A list of neighboring nodes represented as dictionaries.
-        """
-        query = """
-            MATCH (n: {BASE_LABEL} {{id: %(node_id)s}})-[r]-(m: {BASE_LABEL})
-            RETURN DISTINCT m
-        """
-        results = await self._read(
-            sql.SQL(query).format(BASE_LABEL=sql.Identifier(BASE_LABEL)),
-            {"node_id": Jsonb(node_id)},
+        rows = await self._read_raw(
+            self._around("node_id", None,
+                         "CASE WHEN e.start = a.gid THEN t.id ELSE s.id END, "
+                         "CASE WHEN e.start = a.gid THEN t.properties ELSE s.properties END"),
+            {"node_id": Jsonb(str(node_id))},
         )
-        return [result["m"] for result in results]
+        seen: Dict[Any, Dict[str, Any]] = {}
+        for gid, props in rows:
+            seen.setdefault(gid, props)
+        return list(seen.values())
 
-    async def get_node(self, node_id: str) -> Optional[Dict[str, Any]]:
-        """
-        Retrieve a single node based on its ID.
-
-        Parameters:
-        -----------
-
-            - node_id (str): The ID of the node to retrieve.
-
-        Returns:
-        --------
-
-            - Optional[Dict[str, Any]]: The requested node as a dictionary, or None if it does
-              not exist.
-        """
-        query = """
-        MATCH (node: {BASE_LABEL} {{id: %(node_id)s}})
-        RETURN node
-        """
-        results = await self._read(
-            sql.SQL(query).format(BASE_LABEL=sql.Identifier(BASE_LABEL)),
-            {"node_id": Jsonb(node_id)}
+    async def _one_direction(self, node_id: str, edge_label: Optional[str], incoming: bool) -> list:
+        anchor = sql.SQL(self.ANCHOR.format(param="%(node_id)s"))
+        edges = self._sql_table(
+            self.graph_name, label_for(edge_label) if edge_label is not None else "ag_edge"
         )
-        return results[0]["node"] if results else None
+        vertices = self._sql_table(self.graph_name, "ag_vertex")
+        here, there = ('e."end"', "e.start") if incoming else ("e.start", 'e."end"')
+        statement = sql.SQL(
+            "WITH a AS ({anchor}) SELECT v.properties FROM a, {edges} e "
+            "JOIN {vertices} v ON v.id = " + there + " WHERE " + here + " = a.gid"
+        ).format(anchor=anchor, edges=edges, vertices=vertices)
+        rows = await self._read_raw(statement, {"node_id": Jsonb(str(node_id))})
+        return [p for (p,) in rows]
 
-    async def get_nodes(self, node_ids: List[str]) -> List[Dict[str, Any]]:
-        """
-        Retrieve multiple nodes based on their IDs.
+    async def get_predecessors(self, node_id: str, edge_label: str = None) -> list:
+        return await self._one_direction(node_id, edge_label, incoming=True)
 
-        Parameters:
-        -----------
-
-            - node_ids (List[str]): A list of node IDs to retrieve.
-
-        Returns:
-        --------
-
-            - List[Dict[str, Any]]: A list of nodes represented as dictionaries.
-        """
-        query = """
-        UNWIND %(node_ids)s AS id
-        MATCH (node:{label} {{id: id}})
-        RETURN node
-        """
-        results = await self._read(
-            sql.SQL(query).format(label=sql.Identifier(BASE_LABEL)),
-            {"node_ids": Jsonb(node_ids)},
-        )
-        return [result["node"] for result in results]
+    async def get_successors(self, node_id: str, edge_label: str = None) -> list:
+        return await self._one_direction(node_id, edge_label, incoming=False)
 
     async def get_connections(self, node_id: UUID) -> list:
-        """
-        Retrieve all connections (predecessors and successors) for a specified node.
-
-        Parameters:
-        -----------
-
-            - node_id (UUID): The ID of the node for which connections are retrieved.
-
-        Returns:
-        --------
-
-            - list: A list of connections represented as tuples of details.
-        """
-        predecessors_query = """
-        MATCH (node:{BASE_LABEL})<-[relation]-(neighbour)
-        WHERE node.id = %(node_id)s
-        RETURN neighbour, relation, node
-        """
-        successors_query = """
-        MATCH (node:{BASE_LABEL})-[relation]->(neighbour)
-        WHERE node.id = %(node_id)s
-        RETURN node, relation, neighbour
-        """
-
-        predecessors, successors = await asyncio.gather(
-            self._read(
-                sql.SQL(predecessors_query).format(
-                    BASE_LABEL=sql.Identifier(BASE_LABEL)
-                ), {"node_id": Jsonb(str(node_id))}
-            ),
-            self._read(
-                sql.SQL(successors_query).format(
-                    BASE_LABEL=sql.Identifier(BASE_LABEL)
-                ), {"node_id": Jsonb(str(node_id))}
-            )
+        """Every edge at the node, as ``(start properties, {relationship_name}, end properties)``."""
+        rows = await self._read_raw(
+            self._around("node_id", None, "s.properties, e.tableoid::regclass::text, e.properties, t.properties"),
+            {"node_id": Jsonb(str(node_id))},
         )
-
-        connections = []
-
-        for neighbour in predecessors:
-            neighbour = neighbour["relation"]
-            connections.append((neighbour[0], {"relationship_name": neighbour[1]}, neighbour[2]))
-
-        for neighbour in successors:
-            neighbour = neighbour["relation"]
-            connections.append((neighbour[0], {"relationship_name": neighbour[1]}, neighbour[2]))
-
-        return connections
+        return [
+            (s_props, {"relationship_name": self._relationship_of(label, e_props)}, t_props)
+            for s_props, label, e_props, t_props in rows
+        ]
 
     async def remove_connection_to_predecessors_of(
         self, node_ids: list[str], edge_label: str
     ) -> None:
-        """
-        Remove connections (edges) to all predecessors of specified nodes based on edge label.
-
-        Parameters:
-        -----------
-
-            - node_ids (list[str]): A list of IDs of nodes from which connections are to be
-              removed.
-            - edge_label (str): The label of the edges to remove.
-
-        Returns:
-        --------
-
-            - None: None
-        """
-        query = """
-        UNWIND %(node_ids)s AS id
-        MATCH (node:{label1} {{id:id}})-[r:{label2}]->(predecessor:{label3})
-        DELETE r;
-        """
-
-        params = {"node_ids": Jsonb(node_ids)}
-
-        return await self._write(
-            sql.SQL(query).format(
-                label1=sql.Identifier(BASE_LABEL),
-                label2=sql.Identifier(edge_label),
-                label3=sql.Identifier(BASE_LABEL)
-            ), params
+        await self._write(
+            sql.SQL(
+                "UNWIND %(node_ids)s AS wanted "
+                "MATCH (node:{base} {{id: wanted}})-[r:{rel}]->(:{base}) DELETE r"
+            ).format(base=sql.Identifier(BASE_LABEL), rel=sql.Identifier(label_for(edge_label))),
+            {"node_ids": Jsonb([str(i) for i in node_ids])},
+            by_index=True,
         )
 
     async def remove_connection_to_successors_of(
         self, node_ids: list[str], edge_label: str
     ) -> None:
-        """
-        Remove connections (edges) to all successors of specified nodes based on edge label.
-
-        Parameters:
-        -----------
-
-            - node_ids (list[str]): A list of IDs of nodes from which connections are to be
-              removed.
-            - edge_label (str): The label of the edges to remove.
-
-        Returns:
-        --------
-
-            - None: None
-        """
-        query = """
-        UNWIND %(node_ids)s AS id
-        MATCH (node:{label1} {{id:id}})<-[r:{label2}]-(successor:{label3})
-        DELETE r;
-        """
-
-        params = {"node_ids": Jsonb(node_ids)}
-
-        return await self._write(
-            sql.SQL(query).format(
-                label1=sql.Identifier(BASE_LABEL),
-                label2=sql.Identifier(edge_label),
-                label3=sql.Identifier(BASE_LABEL)
-            ), params
+        await self._write(
+            sql.SQL(
+                "UNWIND %(node_ids)s AS wanted "
+                "MATCH (node:{base} {{id: wanted}})<-[r:{rel}]-(:{base}) DELETE r"
+            ).format(base=sql.Identifier(BASE_LABEL), rel=sql.Identifier(label_for(edge_label))),
+            {"node_ids": Jsonb([str(i) for i in node_ids])},
+            by_index=True,
         )
+
+    # ---- the graph as a whole ----
 
     async def delete_graph(self):
-        """
-        Delete all nodes and edges from the graph database.
-
-        Returns:
-        --------
-
-            The result of the query execution, typically indicating success or failure.
-        """
-        query = """MATCH (node:{label})
-                DETACH DELETE node;"""
-
-        return await self._write(
-            sql.SQL(query).format(label=sql.Identifier(BASE_LABEL))
+        """Delete every node and edge. The labels stay."""
+        await self._write(
+            sql.SQL("MATCH (node:{base}) DETACH DELETE node").format(base=sql.Identifier(BASE_LABEL))
         )
 
-    def serialize_properties(self, properties=dict()):
-        """
-        Convert properties of a node or edge into a serializable format suitable for storage.
-
-        Parameters:
-        -----------
-
-            - properties: A dictionary of properties to serialize, defaults to an empty
-              dictionary. (default dict())
-
-        Returns:
-        --------
-
-            A dictionary with serialized property values.
-        """
-        serialized_properties = {}
-
-        for property_key, property_value in properties.items():
-            if isinstance(property_value, UUID):
-                serialized_properties[property_key] = str(property_value)
-                continue
-
-            serialized_properties[property_key] = property_value
-
-        return serialized_properties
+    def serialize_properties(self, properties=None):
+        serialized = {}
+        for key, value in (properties or {}).items():
+            serialized[key] = str(value) if isinstance(value, UUID) else value
+        return serialized
 
     async def get_model_independent_graph_data(self):
-        """
-        Retrieve the basic graph data without considering the model specifics, returning nodes
-        and edges.
-
-        Returns:
-        --------
-
-            A tuple of nodes and edges data.
-        """
-        query_nodes = "MATCH (n) RETURN collect(properties(n)) AS nodes"
-        nodes = await self._read(query_nodes)
-
-        query_edges = "MATCH (n)-[r]->(m) RETURN collect([properties(n), properties(r), properties(m)]) AS edges"
-        edges = await self._read(query_edges)
-
-        return (nodes, edges)
-    
-    async def project_entire_graph(self, graph_name="cognee"):
-        logger.warning(
-            "Agensgraph does not support in-memory graph projection. "
+        nodes = await self._read(
+            sql.SQL("MATCH (n:{base}) RETURN collect(properties(n)) AS nodes").format(
+                base=sql.Identifier(BASE_LABEL)
+            )
         )
+        edges = await self._read(
+            sql.SQL(
+                "MATCH (n:{base})-[r]->(m:{base}) "
+                "RETURN collect([properties(n), properties(r), properties(m)]) AS edges"
+            ).format(base=sql.Identifier(BASE_LABEL))
+        )
+        return (nodes, edges)
+
+    async def project_entire_graph(self, graph_name="cognee"):
+        logger.warning("Agensgraph does not support in-memory graph projection.")
 
     async def get_graph_data(self):
-        """
-        Retrieve comprehensive data about nodes and relationships within the graph.
-
-        Returns:
-        --------
-
-            A tuple containing two lists: nodes and edges with their properties.
-        """
-        query = "MATCH (n) RETURN ID(n) AS id, get_labels(n) AS labels, properties(n) AS properties"
-
-        result = await self._read(query)
-        nodes = [
-            (
-                record["properties"]["id"],
-                record["properties"],
+        """Every node as ``(id, properties)`` and every edge as
+        ``(source_id, target_id, relationship_name, properties)``."""
+        node_rows = await self._read(
+            sql.SQL("MATCH (n:{base}) RETURN properties(n) AS properties").format(
+                base=sql.Identifier(BASE_LABEL)
             )
-            for record in result
-        ]
+        )
+        nodes = self._one_per_id((p["id"], p) for p in (row["properties"] for row in node_rows) if "id" in p)
 
-        query = """
-        MATCH (n)-[r]->(m)
-        RETURN ID(n) AS source, ID(m) AS target, TYPE(r) AS type, properties(r) AS properties
-        """
-        result = await self._read(query)
-        edges = [
-            (
-                record["properties"]["source_node_id"],
-                record["properties"]["target_node_id"],
-                record["type"],
-                record["properties"],
-            )
-            for record in result
-        ]
-
+        edge_rows = await self._read(
+            "MATCH ()-[r]->() RETURN label(r) AS type, properties(r) AS properties"
+        )
+        edges = []
+        skipped = 0
+        for row in edge_rows:
+            p = row["properties"]
+            if "source_node_id" in p and "target_node_id" in p:
+                edges.append((p["source_node_id"], p["target_node_id"], row["type"], p))
+            else:
+                skipped += 1
+        if skipped:
+            logger.warning("%d edges without endpoint ids in their properties were left out", skipped)
         return (nodes, edges)
 
     async def get_nodeset_subgraph(
         self, node_type: Type[Any], node_name: List[str]
     ) -> Tuple[List[Tuple[int, dict]], List[Tuple[int, int, str, dict]]]:
-        """
-        Retrieve a subgraph based on specified node names and type, including their
-        relationships.
-
-        Parameters:
-        -----------
-
-            - node_type (Type[Any]): The type of nodes to include in the subgraph.
-            - node_name (List[str]): A list of names for nodes to filter the subgraph.
-
-        Returns:
-        --------
-
-            - Tuple[List[Tuple[int, dict]], List[Tuple[int, int, str, dict]]}: A tuple
-              containing nodes and edges in the requested subgraph.
-        """
-        # Run the node and edge selection as two queries (like `get_graph_data`).
-        # A single combined query — collect the node set, then `MATCH (a)-[r]-(b)`
-        # among it — plans on AgensGraph as a scan over every edge in the graph and
-        # hangs at scale (and AgensGraph won't let an UNWIND-bound vertex anchor a
-        # later MATCH). Split apart, each part is index-backed: the node match is
-        # anchored on the indexed `name`, and the edge match uses the `id` index on
-        # both endpoints.
-
-        # 1) the named nodes of the requested type plus their 1-hop neighbours.
-        nodes_query = """
-        UNWIND %(names)s AS wantedName
-        MATCH (n:"__Node__" {name: wantedName})
-        WHERE n.labels @> %(label)s
-        OPTIONAL MATCH (n)-[]-(nbr)
-        RETURN collect(DISTINCT properties(n)) AS centers,
-               collect(DISTINCT properties(nbr)) AS nbrs
-        """
-        result = await self._read(
-            nodes_query, {"names": Jsonb(node_name), "label": Jsonb(node_type.__name__)}
-        )
-        if not result:
+        """The named nodes of one class, their neighbours, and the edges among them."""
+        label = label_for(node_type.__name__)
+        if not node_name or not await self._label_exists(label):
             return [], []
 
-        by_id = {}
-        for prop in (result[0]["centers"] or []) + (result[0]["nbrs"] or []):
-            if prop:
+        prelude, predicate, params = self._equalities("n.name", node_name, "name")
+        result = await self._read(
+            sql.SQL(
+                prelude + "MATCH (n:{label}) WHERE " + predicate + " "
+                "OPTIONAL MATCH (n)-[]-(nbr) "
+                "RETURN collect(DISTINCT properties(n)) AS centers, "
+                "collect(DISTINCT properties(nbr)) AS nbrs"
+            ).format(label=sql.Identifier(label)),
+            params,
+        )
+        by_id: Dict[str, dict] = {}
+        for prop in (result[0]["centers"] or []) + (result[0]["nbrs"] or []) if result else []:
+            if prop and "id" in prop:
                 by_id[prop["id"]] = prop
         if not by_id:
             return [], []
-        node_ids = list(by_id)
 
-        # 2) the edges among that node set (index lookup on both endpoint ids).
-        edges_query = """
-        MATCH (a:"__Node__")-[r]->(b:"__Node__")
-        WHERE a.id IN %(ids)s AND b.id IN %(ids)s
-        RETURN TYPE(r) AS type, properties(r) AS properties
-        """
-        edge_result = await self._read(edges_query, {"ids": Jsonb(node_ids)})
-
-        nodes = [(prop["id"], prop) for prop in by_id.values()]
-        edges = [
-            (
-                record["properties"]["source_node_id"],
-                record["properties"]["target_node_id"],
-                record["type"],
-                record["properties"],
+        # Every edge among the set starts at a member, so the out-edges of the members
+        # cover them all; the target is checked here rather than in a second list
+        # predicate, which would be jsonb containment and read every edge.
+        ids = list(by_id)
+        edges = []
+        statement = sql.SQL(
+            "UNWIND %(ids)s AS wanted "
+            "MATCH (a:{base} {{id: wanted}})-[r]->(b:{base}) "
+            "RETURN label(r) AS type, properties(r) AS properties"
+        ).format(base=sql.Identifier(BASE_LABEL))
+        for start in range(0, len(ids), CHUNK_SIZE):
+            rows = await self._read(
+                statement, {"ids": Jsonb(ids[start : start + CHUNK_SIZE])}, by_index=True
             )
-            for record in edge_result
-        ]
-
+            for row in rows:
+                p = row["properties"]
+                if p.get("target_node_id") in by_id:
+                    edges.append((p["source_node_id"], p["target_node_id"], row["type"], p))
+        nodes = [(prop["id"], prop) for prop in by_id.values()]
         return nodes, edges
 
     async def get_filtered_graph_data(self, attribute_filters):
-        """
-        Fetch nodes and edges filtered by specific attribute criteria.
+        """Nodes whose attributes take one of the given values, and the edges among them."""
+        predicates = []
+        params: Dict[str, Any] = {}
+        preludes = []
+        for i, (attribute, values) in enumerate(attribute_filters[0].items()):
+            if not _PROPERTY_NAME.match(attribute):
+                raise ValueError(f"not a property name: {attribute!r}")
+            for alias in ("n", "m"):
+                prelude, predicate, bound = self._equalities(
+                    f"{alias}.{attribute}", list(values), f"{alias}_f{i}"
+                )
+                if alias == "n":
+                    preludes.append(prelude)
+                    n_pred = predicate
+                else:
+                    preludes.append(prelude)
+                    m_pred = predicate
+                params.update(bound)
+            predicates.append((n_pred, m_pred))
+        n_where = " AND ".join(p[0] for p in predicates)
+        m_where = " AND ".join(p[1] for p in predicates)
+        n_prelude = "".join(p for p in preludes[0::2])
+        m_prelude = "".join(p for p in preludes[1::2])
 
-        Parameters:
-        -----------
+        node_rows = await self._read(
+            sql.SQL(
+                n_prelude + "MATCH (n:{base}) WHERE " + n_where + " RETURN properties(n) AS properties"
+            ).format(base=sql.Identifier(BASE_LABEL)),
+            {k: v for k, v in params.items() if k.startswith("n_")},
+        )
+        nodes = [(row["properties"]["id"], row["properties"]) for row in node_rows]
 
-            - attribute_filters: A list of dictionaries representing attributes and associated
-              values for filtering.
-
-        Returns:
-        --------
-
-            A tuple containing filtered nodes and edges based on the specified criteria.
-        """
-        where_clauses = []
-        for attribute, values in attribute_filters[0].items():
-            values_str = ", ".join(
-                f"'{value}'" if isinstance(value, str) else str(value) for value in values
-            )
-            where_clauses.append(f"n.{attribute} IN [{values_str}]")
-
-        where_clause = " AND ".join(where_clauses)
-
-        query_nodes = f"""
-        MATCH (n)
-        WHERE {where_clause}
-        RETURN ID(n) AS id, get_labels(n) AS labels, properties(n) AS properties
-        """
-        result_nodes = await self._read(query_nodes)
-
-        nodes = [
-            (
-                record["id"],
-                record["properties"],
-            )
-            for record in result_nodes
-        ]
-
-        query_edges = f"""
-        MATCH (n)-[r]->(m)
-        WHERE {where_clause} AND {where_clause.replace("n.", "m.")}
-        RETURN ID(n) AS source, ID(m) AS target, TYPE(r) AS type, properties(r) AS properties
-        """
-        result_edges = await self._read(query_edges)
-
+        edge_rows = await self._read(
+            sql.SQL(
+                n_prelude + m_prelude + "MATCH (n:{base})-[r]->(m:{base}) "
+                "WHERE " + n_where + " AND " + m_where + " "
+                "RETURN label(r) AS type, properties(r) AS properties"
+            ).format(base=sql.Identifier(BASE_LABEL)),
+            params,
+        )
         edges = [
-            (
-                record["source"],
-                record["target"],
-                record["type"],
-                record["properties"],
-            )
-            for record in result_edges
+            (p["source_node_id"], p["target_node_id"], row["type"], p)
+            for row in edge_rows
+            for p in (row["properties"],)
         ]
-
         return (nodes, edges)
 
     async def graph_exists(self, graph_name="cognee"):
-        """
-        Check if a graph with a given name exists in the database.
-
-        Parameters:
-        -----------
-
-            - graph_name: The name of the graph to check for existence, defaults to 'cognee'.
-              (default 'cognee')
-
-        Returns:
-        --------
-
-            True if the graph exists, otherwise False.
-        """
-        query = "SELECT 1 FROM ag_graph WHERE graphname = %(graph_name)s"
-        result = await self._read(query, {"graph_name": graph_name})
-        if (len(result) > 0):
-            return True
-        
-        return False
-
-    async def get_node_labels_string(self):
-        """
-        Fetch all node labels from the database and return them as a formatted string.
-
-        Returns:
-        --------
-
-            A formatted string of node labels.
-        """
-        node_labels_query = "SELECT labels FROM label_catalog WHERE graph_id = {self.graph_id}::oid"
-        node_labels_result = await self._read(node_labels_query)
-        node_labels = node_labels_result[0]["labels"] if node_labels_result else []
-
-        if not node_labels:
-            raise ValueError("No node labels found in the database")
-
-        node_labels_str = "[" + ", ".join(f"'{label}'" for label in node_labels) + "]"
-        return node_labels_str
-
-    async def get_relationship_labels_string(self):
-        """
-        Fetch all relationship types from the database and return them as a formatted string.
-
-        Returns:
-        --------
-
-            A formatted string of relationship types.
-        """
-        relationship_types_query = f"""
-        SELECT collect(labname) FROM ag_label
-        WHERE graphid = {self.graph_id}::oid AND
-              labkind = 'e' AND
-              labname <> 'ag_edge'
-        """
-        relationship_types_result = await self._read(relationship_types_query)
-        relationship_types = (
-            relationship_types_result[0]["relationships"] if relationship_types_result else []
+        result = await self._read(
+            "SELECT 1 FROM ag_graph WHERE graphname = %(graph_name)s", {"graph_name": graph_name}
         )
-
-        if not relationship_types:
-            raise ValueError("No relationship types found in the database.")
-
-        relationship_types_undirected_str = (
-            "{"
-            + ", ".join(f"{rel}" + ": {orientation: 'UNDIRECTED'}" for rel in relationship_types)
-            + "}"
-        )
-        return relationship_types_undirected_str
+        return len(result) > 0
 
     async def drop_graph(self, graph_name="cognee"):
         """Drop the graph and everything in it."""
@@ -1371,22 +972,6 @@ class AgensgraphAdapter(GraphDBInterface):
             self._engine.forget_graph()
 
     async def get_graph_metrics(self, include_optional=False):
-        """
-        Retrieve metrics related to the graph such as number of nodes, edges, and connected
-        components.
-
-        Parameters:
-        -----------
-
-            - include_optional: Specify whether to include optional metrics; defaults to False.
-              (default False)
-
-        Returns:
-        --------
-
-            A dictionary containing graph metrics, both mandatory and optional based on the
-            input flag.
-        """
         nodes, edges = await self.get_model_independent_graph_data()
         num_nodes = len(nodes[0]["nodes"])
         num_edges = len(edges[0]["edges"])
@@ -1400,96 +985,80 @@ class AgensgraphAdapter(GraphDBInterface):
         }
 
         if include_optional:
-            logger.error(
-                "Optional metrics are not implemented in AgensgraphAdapter yet."
-            )
+            logger.error("Optional metrics are not implemented in AgensgraphAdapter yet.")
 
         return mandatory_metrics
 
+    # ---- what cognee's delete reads ----
+
     async def get_document_subgraph(self, content_hash: str):
+        """A document, its chunks, and what only this document brought in.
+
+        Entities, summaries and types that another document also uses stay out of the
+        result, so deleting this document does not take them away.
         """
-        Retrieve a subgraph related to a document identified by its content hash, including
-        related entities and chunks.
-
-        Parameters:
-        -----------
-
-            - content_hash (str): The hash identifying the document whose subgraph should be
-              retrieved.
-
-        Returns:
-        --------
-
-            The subgraph data as a dictionary, or None if not found.
-        """
-        query = """
-        MATCH (doc)
-        WHERE (get_labels(doc) @> 'TextDocument'::jsonb OR
-               get_labels(doc) @> 'PdfDocument'::jsonb) AND
-               doc.name = 'text_' + %(content_hash)s
-
-        OPTIONAL MATCH (doc)<-[:is_part_of]-(chunk)
-        WHERE get_labels(chunk) @> 'DocumentChunk'::jsonb
-        OPTIONAL MATCH (chunk)-[:contains]->(entity)
-        WHERE get_labels(entity) @> 'Entity'::jsonb
-        AND NOT (
-            SELECT EXISTS (
-                MATCH (entity)<-[:contains]-(otherChunk)-[:is_part_of]->(otherDoc)
-                WHERE get_labels(otherChunk) @> 'DocumentChunk'::jsonb AND
-                      ANY(label IN get_labels(doc) WHERE label IN ['TextDocument', 'PdfDocument'])
-                AND otherDoc.id <> doc.id
-                RETURN 1
-            )
+        statement = sql.SQL(
+            "MATCH (doc:{base} {{name: %(name)s}}) "
+            "WHERE label(doc) IN [{text_doc}, {pdf_doc}] "
+            "OPTIONAL MATCH (doc)<-[:is_part_of]-(chunk:{chunk}) "
+            "OPTIONAL MATCH (chunk)-[:contains]->(entity:{entity}) "
+            "WHERE NOT (SELECT EXISTS ("
+            "  MATCH (entity)<-[:contains]-(oc:{chunk})-[:is_part_of]->(od:{base}) "
+            "  WHERE label(od) IN [{text_doc}, {pdf_doc}] AND od.id <> doc.id "
+            "  RETURN 1)) "
+            "OPTIONAL MATCH (chunk)<-[:made_from]-(made_node:{summary}) "
+            "OPTIONAL MATCH (entity)-[:is_a]->(type:{etype}) "
+            "WHERE NOT (SELECT EXISTS ("
+            "  MATCH (type)<-[:is_a]-(oe:{entity})<-[:contains]-(oc2:{chunk})-[:is_part_of]->(od2:{base}) "
+            "  WHERE label(od2) IN [{text_doc}, {pdf_doc}] AND od2.id <> doc.id "
+            "  RETURN 1)) "
+            "RETURN collect(DISTINCT properties(doc)) AS document, "
+            "collect(DISTINCT properties(chunk)) AS chunks, "
+            "collect(DISTINCT properties(entity)) AS orphan_entities, "
+            "collect(DISTINCT properties(made_node)) AS made_from_nodes, "
+            "collect(DISTINCT properties(type)) AS orphan_types"
+        ).format(
+            base=sql.Identifier(BASE_LABEL),
+            chunk=sql.Identifier(label_for("DocumentChunk")),
+            entity=sql.Identifier(label_for("Entity")),
+            summary=sql.Identifier(label_for("TextSummary")),
+            etype=sql.Identifier(label_for("EntityType")),
+            text_doc=sql.Literal(label_for("TextDocument")),
+            pdf_doc=sql.Literal(label_for("PdfDocument")),
         )
-        OPTIONAL MATCH (chunk)<-[:made_from]-(made_node)
-        WHERE get_labels(made_node) @> 'TextSummary'::jsonb
-        OPTIONAL MATCH (entity)-[:is_a]->(type)
-        WHERE get_labels(type) @> 'EntityType'::jsonb
-        AND NOT (
-            SELECT EXISTS (
-                MATCH (type)<-[:is_a]-(otherEntity)<-[:contains]-(otherChunk)-[:is_part_of]->(otherDoc)
-                WHERE get_labels(otherEntity) @> 'Entity'::jsonb AND
-                      get_labels(otherChunk) @> 'DocumentChunk'::jsonb AND
-                      (get_labels(otherDoc) @> 'TextDocument'::jsonb OR
-                       get_labels(otherDoc) @> 'PdfDocument'::jsonb)
-                AND otherDoc.id <> doc.id
-                RETURN 1
-            )
-        )
-
-        RETURN
-            collect(DISTINCT properties(doc)) as document,
-            collect(DISTINCT properties(chunk)) as chunks,
-            collect(DISTINCT properties(entity)) as orphan_entities,
-            collect(DISTINCT properties(made_node)) as made_from_nodes,
-            collect(DISTINCT properties(type)) as orphan_types
-        """
-        result = await self._read(query, {"content_hash": Jsonb(content_hash)})
-        return result[0] if result else None
+        result = await self._read(statement, {"name": Jsonb(f"text_{content_hash}")})
+        if not result or not result[0]["document"]:
+            return None
+        return {key: [p for p in value if p] for key, value in result[0].items()}
 
     async def get_degree_one_nodes(self, node_type: str):
-        """
-        Fetch nodes of a specified type that have exactly one connection.
-
-        Parameters:
-        -----------
-
-            - node_type (str): The type of nodes to retrieve, must be 'Entity' or 'EntityType'.
-
-        Returns:
-        --------
-
-            A list of nodes with exactly one connection of the specified type.
-        """
-        if not node_type or node_type not in ["Entity", "EntityType"]:
+        """Nodes of ``node_type`` with exactly one edge."""
+        if node_type not in ("Entity", "EntityType"):
             raise ValueError("node_type must be either 'Entity' or 'EntityType'")
+        # Plain SQL over the label's table: the edge tables carry indexes on start and
+        # on end, so the two counts are two index probes per node.
+        rows = await self._read(
+            sql.SQL(
+                "SELECT v.properties FROM {label} v "
+                "WHERE (SELECT count(*) FROM {edges} e WHERE e.start = v.id) "
+                "    + (SELECT count(*) FROM {edges} e WHERE e.\"end\" = v.id) = 1"
+            ).format(
+                label=self._sql_table(self.graph_name, label_for(node_type)),
+                edges=self._sql_table(self.graph_name, "ag_edge"),
+            )
+        )
+        return [row["properties"] for row in rows]
 
-        query = f"""
-        MATCH (n)
-        WHERE get_labels(n) @> '{node_type}'::jsonb
-        WITH n, (SELECT count(1) FROM (MATCH (n)-[]-() return 1)t) as count
-        WHERE count=1
-        RETURN n
-        """
-        result = await self._read(query)
-        return [record["n"] for record in result] if result else []
+    async def get_disconnected_nodes(self) -> list[str]:
+        """The ids of nodes with no edge at all."""
+        rows = await self._read(
+            sql.SQL(
+                "SELECT v.properties->>'id' AS id FROM {vertices} v "
+                "WHERE NOT EXISTS (SELECT 1 FROM {edges} e WHERE e.start = v.id) "
+                "  AND NOT EXISTS (SELECT 1 FROM {edges} e WHERE e.\"end\" = v.id)"
+            ).format(
+                vertices=self._sql_table(self.graph_name, "ag_vertex"),
+                edges=self._sql_table(self.graph_name, "ag_edge"),
+            )
+        )
+        return [row["id"] for row in rows if row["id"] is not None]

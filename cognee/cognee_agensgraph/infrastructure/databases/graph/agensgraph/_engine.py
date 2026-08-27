@@ -73,6 +73,9 @@ class AgensEngine:
         self.graph_id: Optional[int] = None
         self.vectors = False
         self._done: Set[str] = set()
+        # Node labels known to exist with their own uniqueness on id. Shared by every
+        # adapter on this engine, so a label declared by one is known to the others.
+        self.labels: Set[str] = set()
 
     @classmethod
     def get(cls, conninfo: str, **kwargs: Any) -> "AgensEngine":
@@ -115,6 +118,12 @@ class AgensEngine:
 
     async def _configure(self, conn: agensgraph.AsyncConnection) -> None:
         """Prepare a new pooled connection. Runs once per connection, not per checkout."""
+        # A prepared statement is planned again for each of its first five runs before
+        # the server settles on a generic plan. Planning a statement that reads through
+        # the parent label takes about 3 ms against under 1 ms to run it, and every
+        # adapter statement is a fixed shape with bound parameters, so the generic plan
+        # is asked for from the first run.
+        await conn.execute("SET plan_cache_mode = force_generic_plan")
         if self.vectors:
             await conn.register_vectors()
 
@@ -129,13 +138,18 @@ class AgensEngine:
                         "its connections cannot be returned from another loop. Call "
                         "finalize() before leaving a loop."
                     )
+                # Statements are prepared on first use. The adapters run a few fixed
+                # statement shapes with bound parameters, and planning one that reads
+                # through the parent label costs about 3 ms against 0.8 ms to run it.
+                # psycopg's default prepares after five runs on each connection, and a
+                # pool rotates connections, so most runs paid for planning.
                 self._pool = agensgraph.AsyncConnectionPool(
                     self.conninfo,
                     graph=self.graph_name,
                     min_size=self._min_size,
                     max_size=self._max_size,
                     configure=self._configure,
-                    kwargs={"autocommit": True},
+                    kwargs={"autocommit": True, "prepare_threshold": 0},
                     check_connections=False,
                 )
                 self._pool_loop = running
@@ -211,6 +225,7 @@ class AgensEngine:
         self._graph_ready = False
         self.graph_id = None
         self._done.clear()
+        self.labels.clear()
 
 
 __all__ = ["AgensEngine"]

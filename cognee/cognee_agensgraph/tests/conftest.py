@@ -17,6 +17,7 @@ limitations under the License.
 import hashlib
 import math
 import os
+import re
 from typing import List
 
 import agensgraph
@@ -114,13 +115,29 @@ def statements():
         agensgraph.remove_query_logger(counter)
 
 
-async def explain(conn, statement: str, params=None) -> str:
-    """The plan the server picks with its default settings.
+_SEQ_SCAN = re.compile(r"Seq Scan on (\S+).*?\(actual rows=(\d+)")
 
-    Not ``enable_seqscan = off``: that only proves an index exists, not that the
-    planner chooses it.
+
+async def explain(conn, statement: str, params=None, *, by_index: bool = False) -> str:
+    """The plan the server picks and what each step really did.
+
+    Read with the planner's default settings, unless ``by_index`` asks for the form the
+    adapter uses for a statement that matches nodes from a bound list. Runs inside a
+    transaction that is rolled back, so a write can be explained too.
     """
-    async with conn.cursor() as cur:
-        await cur.execute("EXPLAIN " + statement, params)
-        rows = await cur.fetchall()
+    async with conn.transaction(force_rollback=True):
+        if by_index:
+            await conn.execute("SET LOCAL enable_seqscan = off")
+        async with conn.cursor() as cur:
+            await cur.execute("EXPLAIN (ANALYZE, TIMING OFF) " + statement, params)
+            rows = await cur.fetchall()
     return "\n".join(r[0] for r in rows)
+
+
+def scanned_tables(plan: str) -> List[str]:
+    """The relations a plan read sequentially and found rows in.
+
+    An empty label is scanned sequentially because it has no pages to speak of; that is
+    not the scan a test is looking for.
+    """
+    return [table for table, rows in _SEQ_SCAN.findall(plan) if int(rows) > 0]

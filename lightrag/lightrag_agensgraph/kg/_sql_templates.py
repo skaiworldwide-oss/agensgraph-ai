@@ -30,39 +30,74 @@ CREATE TABLE IF NOT EXISTS LIGHTRAG_KV (
 )
 """
 
-# Doc-status is queried/sorted by status, file_path, content_hash, track_id, so
-# those are promoted to indexed columns; the full DocProcessingStatus record is
-# kept in `value` JSONB for faithful round-tripping (created_at/updated_at are
-# ISO strings, so sorting on value->>field is chronological).
+# Document status. Every field LightRAG reads or filters on is a column of its
+# own: the pipeline sweeps documents in (created_at, id) order page by page,
+# looks them up by content hash and by source file, and counts them by status,
+# so those are real columns and real indexes rather than paths into a JSON value.
+# created_at is written once and never changed; it is the sort key a sweep in
+# progress depends on.
 DOC_STATUS_TABLE = "LIGHTRAG_DOC_STATUS"
 DOC_STATUS_TABLE_DDL = """
 CREATE TABLE IF NOT EXISTS LIGHTRAG_DOC_STATUS (
-    workspace    VARCHAR(255) NOT NULL DEFAULT '',
-    id           TEXT         NOT NULL,
-    status       VARCHAR(64),
-    file_path    TEXT,
-    content_hash TEXT,
-    track_id     VARCHAR(255),
-    value        JSONB        NOT NULL DEFAULT '{}'::jsonb,
-    create_time  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
-    update_time  TIMESTAMP    DEFAULT CURRENT_TIMESTAMP,
+    workspace       VARCHAR(255) NOT NULL DEFAULT '',
+    id              TEXT         NOT NULL,
+    status          VARCHAR(64)  NOT NULL,
+    content_summary TEXT,
+    content_length  INTEGER,
+    chunks_count    INTEGER,
+    chunks_list     JSONB        NOT NULL DEFAULT '[]'::jsonb,
+    file_path       TEXT,
+    track_id        VARCHAR(255),
+    content_hash    TEXT,
+    error_msg       TEXT,
+    metadata        JSONB        NOT NULL DEFAULT '{}'::jsonb,
+    created_at      TIMESTAMPTZ,
+    updated_at      TIMESTAMPTZ,
     CONSTRAINT LIGHTRAG_DOC_STATUS_PK PRIMARY KEY (workspace, id)
 )
 """
 DOC_STATUS_INDEX_DDL = [
-    "CREATE INDEX IF NOT EXISTS lightrag_doc_status_ws_status_idx ON LIGHTRAG_DOC_STATUS (workspace, status)",
+    # The scheduling sweep: one status at a time, in (created_at, id) order, with a
+    # row lacking created_at sorting first so it stays reachable.
+    "CREATE INDEX IF NOT EXISTS lightrag_doc_status_sweep_idx "
+    "ON LIGHTRAG_DOC_STATUS (workspace, status, created_at NULLS FIRST, id)",
+    "CREATE INDEX IF NOT EXISTS lightrag_doc_status_ws_hash_idx "
+    "ON LIGHTRAG_DOC_STATUS (workspace, content_hash) "
+    "WHERE content_hash IS NOT NULL AND content_hash <> ''",
     "CREATE INDEX IF NOT EXISTS lightrag_doc_status_ws_track_idx "
     "ON LIGHTRAG_DOC_STATUS (workspace, track_id)",
     "CREATE INDEX IF NOT EXISTS lightrag_doc_status_ws_path_idx "
     "ON LIGHTRAG_DOC_STATUS (workspace, file_path)",
-    "CREATE INDEX IF NOT EXISTS lightrag_doc_status_ws_hash_idx ON "
-    "LIGHTRAG_DOC_STATUS (workspace, content_hash)",
-    # Pagination sorts on created_at/updated_at, which live in the JSONB value;
-    # expression indexes let the sort be index-ordered instead of a full sort.
-    "CREATE INDEX IF NOT EXISTS lightrag_doc_status_ws_updated_idx ON "
-    "LIGHTRAG_DOC_STATUS (workspace, (value->>'updated_at'))",
-    "CREATE INDEX IF NOT EXISTS lightrag_doc_status_ws_created_idx ON "
-    "LIGHTRAG_DOC_STATUS (workspace, (value->>'created_at'))",
+    # The two orders the document list is paged in.
+    "CREATE INDEX IF NOT EXISTS lightrag_doc_status_ws_updated_idx "
+    "ON LIGHTRAG_DOC_STATUS (workspace, updated_at)",
+    "CREATE INDEX IF NOT EXISTS lightrag_doc_status_ws_created_idx "
+    "ON LIGHTRAG_DOC_STATUS (workspace, created_at)",
+]
+
+# The previous layout kept the whole record in one `value` JSONB column. A table
+# in that shape is brought to this one in place, keeping its rows.
+DOC_STATUS_UPGRADE_DDL = [
+    "ALTER TABLE LIGHTRAG_DOC_STATUS "
+    "ADD COLUMN IF NOT EXISTS content_summary TEXT, "
+    "ADD COLUMN IF NOT EXISTS content_length INTEGER, "
+    "ADD COLUMN IF NOT EXISTS chunks_count INTEGER, "
+    "ADD COLUMN IF NOT EXISTS chunks_list JSONB NOT NULL DEFAULT '[]'::jsonb, "
+    "ADD COLUMN IF NOT EXISTS error_msg TEXT, "
+    "ADD COLUMN IF NOT EXISTS metadata JSONB NOT NULL DEFAULT '{}'::jsonb, "
+    "ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ, "
+    "ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ",
+    "UPDATE LIGHTRAG_DOC_STATUS SET "
+    "content_summary = value->>'content_summary', "
+    "content_length = (value->>'content_length')::integer, "
+    "chunks_count = (value->>'chunks_count')::integer, "
+    "chunks_list = COALESCE(value->'chunks_list', '[]'::jsonb), "
+    "error_msg = value->>'error_msg', "
+    "metadata = COALESCE(value->'metadata', '{}'::jsonb), "
+    "created_at = (value->>'created_at')::timestamptz, "
+    "updated_at = (value->>'updated_at')::timestamptz",
+    "ALTER TABLE LIGHTRAG_DOC_STATUS DROP COLUMN value",
+    "DROP INDEX IF EXISTS lightrag_doc_status_ws_status_idx",
 ]
 
 # Vector tables (one per LightRAG vector namespace). ``content_vector`` is typed

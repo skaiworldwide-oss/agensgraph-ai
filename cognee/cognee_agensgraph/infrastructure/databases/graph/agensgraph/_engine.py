@@ -35,10 +35,42 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, Optional, Set
 
 import agensgraph
+import psycopg
+from agensgraph import RetryPolicy
+from agensgraph.errors import safe_message
 from psycopg import errors, sql
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
 logger = logging.getLogger(__name__)
+
+
+async def run_with_retry(policy: RetryPolicy, attempt: Callable[[], Awaitable[Any]], *, wrote: bool) -> Any:
+    """Run ``attempt`` again while the driver says the failure was timing.
+
+    Concurrent writers merging onto the same keys fail each other for the moment one of
+    them takes to commit. A merge that loses such a race under a uniqueness constraint
+    is reported as an exclusion violation (23P01), so it is judged as the unique
+    violation it is.
+    """
+    number = 0
+    while True:
+        try:
+            result = await attempt()
+        except psycopg.Error as exc:
+            number += 1
+            decision = policy.decide(exc, number=number, wrote=wrote, merging=wrote)
+            if not decision.retry and isinstance(exc, errors.ExclusionViolation):
+                decision = policy.decide(
+                    errors.UniqueViolation(), number=number, wrote=wrote, merging=True
+                )
+            if not decision.retry:
+                logger.error("AgensGraph statement failed: %s", safe_message(exc))
+                raise
+            await asyncio.sleep(decision.delay)
+        else:
+            policy.succeeded()
+            return result
+
 
 _ENGINES: Dict[str, "AgensEngine"] = {}
 _ENGINES_LOCK = threading.Lock()
@@ -228,4 +260,4 @@ class AgensEngine:
         self.labels.clear()
 
 
-__all__ = ["AgensEngine"]
+__all__ = ["AgensEngine", "run_with_retry"]

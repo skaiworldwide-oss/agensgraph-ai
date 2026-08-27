@@ -17,20 +17,34 @@ limitations under the License.
 """AgensGraph (pgvector) vector adapter for Cognee."""
 
 import asyncio
-from typing import List, Optional
+from contextlib import asynccontextmanager
+from typing import Any, Dict, List, Optional, Set
 from uuid import UUID
 
-from psycopg import sql
-from psycopg.rows import dict_row
-from psycopg.types.json import Jsonb
-
+from agensgraph import RetryPolicy, Vector
+from cognee.infrastructure.databases.vector.exceptions.exceptions import (
+    CollectionNotFoundError,
+)
 from cognee.infrastructure.databases.vector.models.ScoredResult import ScoredResult
 from cognee.infrastructure.databases.vector.vector_db_interface import VectorDBInterface
 from cognee.infrastructure.engine import DataPoint
+from psycopg import errors, sql
+from psycopg.rows import tuple_row
+from psycopg.types.json import Jsonb
 
-from ...graph.agensgraph._engine import AgensEngine
+from ...graph.agensgraph._engine import AgensEngine, run_with_retry
 
+# Rows per insert statement.
 CHUNK_SIZE = 1000
+
+# The HNSW index returns at most hnsw.ef_search candidates, and this is its default. A
+# search for more rows than that raises the setting for its transaction, or the index
+# would silently return fewer rows than asked for.
+DEFAULT_EF_SEARCH = 40
+
+# Memory for building an index in one go. Building the index for 13,264 rows of 1,536
+# dimensions took 70.8 s with the server default of 64 MB and 27.9 s with this.
+BUILD_WORK_MEM = "1GB"
 
 
 def _to_uuid(value):
@@ -40,11 +54,8 @@ def _to_uuid(value):
         return value
 
 
-def _vec_literal(vector) -> str:
-    """Render an embedding as a pgvector text literal ``[v0,v1,...]``."""
-    if hasattr(vector, "tolist"):
-        vector = vector.tolist()
-    return "[" + ",".join(str(float(x)) for x in vector) + "]"
+def _vector(values) -> Vector:
+    return Vector(values.tolist() if hasattr(values, "tolist") else values)
 
 
 class IndexSchema(DataPoint):
@@ -58,87 +69,213 @@ class AgensgraphVectorAdapter(VectorDBInterface):
     """
     Cognee vector storage backed by pgvector tables in AgensGraph.
 
-    Each collection is a relational table ``(id, payload, vector)`` with an HNSW
-    (``vector_cosine_ops``) index; ``vector`` is typed ``VECTOR(dim)`` so the
-    query's ``<=>`` cast matches the index expression and the index is used at
-    scale. Shares the same async engine/pool as the graph adapter.
+    Each collection is a table ``(id TEXT PRIMARY KEY, payload JSONB, vector VECTOR(dim))``
+    with an HNSW cosine index. Embeddings travel in binary. A search for the nearest
+    rows runs with sequential scans off for its transaction: the planner cannot see that
+    a 1536-dimension vector is stored out of line, so it prices the scan below the index.
+    A search for every row (``limit=0``) keeps the scan, which is right for it. Shares
+    the engine, and so the pool, with the graph adapter.
     """
 
-    def __init__(self, url: str, api_key: Optional[str] = None, embedding_engine=None):
+    def __init__(
+        self,
+        url: str,
+        api_key: Optional[str] = None,
+        embedding_engine=None,
+        *,
+        retry_attempts: int = 6,
+        hnsw_m: int = 16,
+        hnsw_ef_construction: int = 64,
+    ):
         self.conninfo = url
         self.embedding_engine = embedding_engine
         self._engine: Optional[AgensEngine] = None
+        # Collections known to exist. Only positive answers are kept: another process
+        # may create a collection at any time.
+        self._known: Set[str] = set()
+        self.retry_policy = RetryPolicy(attempts=retry_attempts)
+        # HNSW build parameters. Inserting into the index is the cost of a vector write:
+        # 7 ms per 1,536-dimension row against 0.07 ms without the index, and 4.9 ms with
+        # ef_construction = 32, which finds fewer of the true neighbours.
+        self.hnsw_m = int(hnsw_m)
+        self.hnsw_ef_construction = int(hnsw_ef_construction)
+        self._bulk = False
+        self._bulk_touched: Set[str] = set()
 
     async def _ensure_engine(self) -> AgensEngine:
         if self._engine is None:
             self._engine = AgensEngine.get(self.conninfo)
         return self._engine
 
+    async def _ensure_vectors(self) -> AgensEngine:
+        """The engine, with pgvector installed and registered on every connection."""
+        engine = await self._ensure_engine()
+        if not engine.vectors:
+            await engine.enable_vectors()
+        return engine
+
+    async def _run(self, work, *, wrote: bool = False):
+        engine = await self._ensure_vectors()
+
+        async def attempt():
+            async with engine.connection() as conn:
+                return await work(conn)
+
+        return await run_with_retry(self.retry_policy, attempt, wrote=wrote)
+
+    async def _on_collection(self, collection_name: str, work, *, wrote: bool = False):
+        """Run ``work``; a missing table is reported as a missing collection."""
+        try:
+            return await self._run(work, wrote=wrote)
+        except errors.UndefinedTable:
+            self._known.discard(collection_name)
+            raise CollectionNotFoundError(f"Collection '{collection_name}' not found") from None
+
+    @staticmethod
+    def _table(collection_name: str) -> sql.Identifier:
+        return sql.Identifier(collection_name)
+
+    # ---- collections ----
+
     async def embed_data(self, data: List[str]) -> List[List[float]]:
         return await self.embedding_engine.embed_text(data)
 
     async def has_collection(self, collection_name: str) -> bool:
-        engine = await self._ensure_engine()
-        async with engine.connection() as conn:
-            async with conn.cursor() as cur:
-                # Exact-case match: collection names are created as quoted
-                # (case-sensitive) identifiers, which to_regclass would fold.
-                await cur.execute(
-                    "SELECT 1 FROM information_schema.tables "
-                    "WHERE table_schema = 'public' AND table_name = %s LIMIT 1",
-                    (collection_name,),
-                )
-                return await cur.fetchone() is not None
+        if collection_name in self._known:
+            return True
+
+        async def work(conn):
+            cur = await conn.execute(
+                "SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace "
+                "WHERE n.nspname = 'public' AND c.relname = %s AND c.relkind = 'r'",
+                (collection_name,),
+            )
+            return await cur.fetchone() is not None
+
+        found = await self._run(work)
+        if found:
+            self._known.add(collection_name)
+        return found
 
     async def create_collection(self, collection_name: str, payload_schema=None):
-        engine = await self._ensure_engine()
         dim = int(self.embedding_engine.get_vector_size())
-        async with engine.connection() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
+        table = self._table(collection_name)
+
+        async def work(conn):
+            try:
+                await conn.execute(
                     sql.SQL(
                         "CREATE TABLE IF NOT EXISTS {t} "
                         "(id TEXT PRIMARY KEY, payload JSONB, vector VECTOR({d}))"
-                    ).format(t=sql.Identifier(collection_name), d=sql.SQL(str(dim)))
+                    ).format(t=table, d=sql.SQL(str(dim)))
                 )
-                await cur.execute(
-                    sql.SQL(
-                        "CREATE INDEX IF NOT EXISTS {ix} ON {t} "
-                        "USING hnsw (vector vector_cosine_ops)"
-                    ).format(
-                        ix=sql.Identifier(f"{collection_name}_hnsw"),
-                        t=sql.Identifier(collection_name),
-                    )
-                )
+            except (errors.DuplicateTable, errors.DuplicateObject, errors.UniqueViolation):
+                pass  # another process created it first
+            if not self._bulk:
+                await self._create_index(conn, collection_name)
 
-    async def create_data_points(
-        self, collection_name: str, data_points: List[DataPoint]
-    ):
+        await self._run(work, wrote=True)
+        self._known.add(collection_name)
+        if self._bulk:
+            self._bulk_touched.add(collection_name)
+
+    async def _create_index(self, conn, collection_name: str, *, build_work_mem: Optional[str] = None) -> None:
+        statement = sql.SQL(
+            "CREATE INDEX IF NOT EXISTS {ix} ON {t} USING hnsw (vector vector_cosine_ops) "
+            "WITH (m = {m}, ef_construction = {ef})"
+        ).format(
+            ix=sql.Identifier(f"{collection_name}_hnsw"),
+            t=self._table(collection_name),
+            m=sql.Literal(self.hnsw_m),
+            ef=sql.Literal(self.hnsw_ef_construction),
+        )
+        try:
+            if build_work_mem:
+                async with conn.transaction():
+                    await conn.execute(
+                        sql.SQL("SET LOCAL maintenance_work_mem = {}").format(sql.Literal(build_work_mem))
+                    )
+                    await conn.execute(statement)
+            else:
+                await conn.execute(statement)
+        except (errors.DuplicateTable, errors.DuplicateObject):
+            pass
+
+    @asynccontextmanager
+    async def bulk_ingest(self):
+        """Write many rows, then build the indexes once.
+
+        Inserting into an HNSW index costs about 7 ms per 1,536-dimension row; inserting
+        without one costs 0.07 ms, and building the index afterwards for 13,264 rows took
+        27.9 s. Inside this block the indexes of every collection written are dropped
+        first and built again on the way out, with more memory for the build. Searches
+        inside the block on those collections read every row.
+
+        Use around a load, for example ``async with vector_engine.bulk_ingest(): await
+        cognee.cognify(...)``.
+        """
+        self._bulk = True
+        self._bulk_touched = set()
+        try:
+            yield self
+        finally:
+            self._bulk = False
+            touched = sorted(self._bulk_touched)
+            self._bulk_touched = set()
+            if touched:
+                async def work(conn):
+                    for name in touched:
+                        await self._create_index(conn, name, build_work_mem=BUILD_WORK_MEM)
+
+                await self._run(work, wrote=True)
+
+    async def _drop_index_for_bulk(self, conn, collection_name: str) -> None:
+        await conn.execute(
+            sql.SQL("DROP INDEX IF EXISTS {ix}").format(ix=sql.Identifier(f"{collection_name}_hnsw"))
+        )
+
+    async def create_vector_index(self, index_name: str, index_property_name: str):
+        """Create the collection cognee indexes a DataPoint field into."""
+        await self.create_collection(f"{index_name}_{index_property_name}")
+
+    # ---- writes ----
+
+    async def create_data_points(self, collection_name: str, data_points: List[DataPoint]):
         if not data_points:
             return
         if not await self.has_collection(collection_name):
             await self.create_collection(collection_name, type(data_points[0]))
 
-        vectors = await self.embed_data(
-            [DataPoint.get_embeddable_data(dp) for dp in data_points]
-        )
-        params = [
-            (str(dp.id), Jsonb(dp.model_dump(mode="json")), _vec_literal(vectors[i]))
-            for i, dp in enumerate(data_points)
-        ]
-        engine = await self._ensure_engine()
-        query = sql.SQL(
-            "INSERT INTO {t} (id, payload, vector) VALUES (%s, %s, %s::vector) "
+        vectors = await self.embed_data([DataPoint.get_embeddable_data(dp) for dp in data_points])
+        # One row per id; a later point with the same id wins, as it would in sequence.
+        rows: Dict[str, Any] = {}
+        for dp, vector in zip(data_points, vectors):
+            rows[str(dp.id)] = (Jsonb(dp.model_dump(mode="json")), _vector(vector))
+        ids = list(rows)
+        # %b for the vectors: the driver sends a Vector in binary only, and for a list the
+        # automatic placeholder chooses text, which has no dumper.
+        statement = sql.SQL(
+            "INSERT INTO {t} (id, payload, vector) "
+            "SELECT * FROM unnest(%(ids)s::text[], %(payloads)s::jsonb[], %(vectors)b::vector[]) "
             "ON CONFLICT (id) DO UPDATE SET payload = EXCLUDED.payload, vector = EXCLUDED.vector"
-        ).format(t=sql.Identifier(collection_name))
-        async with engine.connection() as conn:
-            async with conn.cursor() as cur:
-                for start in range(0, len(params), CHUNK_SIZE):
-                    await cur.executemany(query, params[start : start + CHUNK_SIZE])
+        ).format(t=self._table(collection_name))
 
-    async def create_vector_index(self, index_name: str, index_property_name: str):
-        """Create the collection cognee indexes a DataPoint field into."""
-        await self.create_collection(f"{index_name}_{index_property_name}")
+        async def work(conn):
+            if self._bulk and collection_name not in self._bulk_touched:
+                await self._drop_index_for_bulk(conn, collection_name)
+                self._bulk_touched.add(collection_name)
+            for start in range(0, len(ids), CHUNK_SIZE):
+                chunk = ids[start : start + CHUNK_SIZE]
+                await conn.execute(
+                    statement,
+                    {
+                        "ids": chunk,
+                        "payloads": [rows[i][0] for i in chunk],
+                        "vectors": [rows[i][1] for i in chunk],
+                    },
+                )
+
+        await self._on_collection(collection_name, work, wrote=True)
 
     async def index_data_points(
         self, index_name: str, index_property_name: str, data_points: List[DataPoint]
@@ -146,29 +283,87 @@ class AgensgraphVectorAdapter(VectorDBInterface):
         """Embed + store the indexable field of each data point in its collection."""
         await self.create_data_points(
             f"{index_name}_{index_property_name}",
-            [
-                IndexSchema(id=dp.id, text=DataPoint.get_embeddable_data(dp))
-                for dp in data_points
-            ],
+            [IndexSchema(id=dp.id, text=DataPoint.get_embeddable_data(dp)) for dp in data_points],
         )
 
+    async def delete_data_points(self, collection_name: str, data_point_ids: List[str]):
+        if not data_point_ids:
+            return
+
+        async def work(conn):
+            await conn.execute(
+                sql.SQL("DELETE FROM {t} WHERE id = ANY(%(ids)s)").format(t=self._table(collection_name)),
+                {"ids": [str(i) for i in data_point_ids]},
+            )
+
+        try:
+            await self._on_collection(collection_name, work, wrote=True)
+        except CollectionNotFoundError:
+            return
+
+    async def prune(self):
+        """Drop every collection this adapter created.
+
+        They are the tables with a ``payload`` column and a ``vector`` column of type
+        vector, so the graph's tables and unrelated tables are never touched.
+        """
+
+        async def work(conn):
+            cur = await conn.execute(
+                """
+                SELECT c_vec.table_name
+                FROM information_schema.columns c_vec
+                JOIN information_schema.columns c_pl
+                  ON c_vec.table_schema = c_pl.table_schema
+                 AND c_vec.table_name = c_pl.table_name
+                WHERE c_vec.table_schema = 'public'
+                  AND c_vec.column_name = 'vector' AND c_vec.udt_name = 'vector'
+                  AND c_pl.column_name = 'payload'
+                """
+            )
+            tables = [r[0] for r in await cur.fetchall()]
+            for table in tables:
+                await conn.execute(sql.SQL("DROP TABLE IF EXISTS {t} CASCADE").format(t=sql.Identifier(table)))
+
+        await self._run(work, wrote=True)
+        self._known.clear()
+
+    # ---- reads ----
+
+    async def _rows(self, collection_name: str, statement, params, *, top_k: int = 0):
+        """Rows of one statement on a collection.
+
+        ``top_k > 0`` marks a search for the nearest rows, which is run with sequential
+        scans off and, when more rows are asked for than the index returns by default,
+        with the index told to return that many.
+        """
+
+        async def work(conn):
+            async with conn.cursor(row_factory=tuple_row) as cur:
+                if top_k <= 0:
+                    await cur.execute(statement, params)
+                    return await cur.fetchall()
+                async with conn.transaction():
+                    async with conn.pipeline():
+                        await conn.execute("SET LOCAL enable_seqscan = off")
+                        if top_k > DEFAULT_EF_SEARCH:
+                            await conn.vector_search_options({"hnsw.ef_search": top_k})
+                        await cur.execute(statement, params)
+                    return await cur.fetchall()
+
+        return await self._on_collection(collection_name, work)
+
     async def retrieve(self, collection_name: str, data_point_ids: List[str]):
-        if not data_point_ids or not await self.has_collection(collection_name):
+        if not data_point_ids:
             return []
-        engine = await self._ensure_engine()
-        async with engine.connection() as conn:
-            async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    sql.SQL("SELECT id, payload FROM {t} WHERE id = ANY(%(ids)s)").format(
-                        t=sql.Identifier(collection_name)
-                    ),
-                    {"ids": [str(i) for i in data_point_ids]},
-                )
-                rows = await cur.fetchall()
-        return [
-            ScoredResult(id=_to_uuid(r["id"]), payload=r["payload"], score=0)
-            for r in rows
-        ]
+        rows = await self._rows(
+            collection_name,
+            sql.SQL("SELECT id, payload FROM {t} WHERE id = ANY(%(ids)s)").format(
+                t=self._table(collection_name)
+            ),
+            {"ids": [str(i) for i in data_point_ids]},
+        )
+        return [ScoredResult(id=_to_uuid(i), payload=p, score=0) for i, p in rows]
 
     async def search(
         self,
@@ -178,37 +373,31 @@ class AgensgraphVectorAdapter(VectorDBInterface):
         limit: int = 15,
         with_vector: bool = False,
     ):
-        if not await self.has_collection(collection_name):
-            return []
+        """The rows nearest to the query, closest first.
+
+        ``score`` is the cosine distance, 0 for an identical vector. ``limit=0`` (or
+        None) returns every row, which is how cognee reads a whole collection.
+        """
         if query_text is not None and query_vector is None:
             query_vector = (await self.embed_data([query_text]))[0]
         if query_vector is None:
             return []
-
-        engine = await self._ensure_engine()
-        limit_clause = sql.SQL("LIMIT {n}").format(n=sql.SQL(str(int(limit)))) if limit and limit > 0 else sql.SQL("")
-        async with engine.connection() as conn:
-            async with conn.cursor(row_factory=dict_row) as cur:
-                await cur.execute(
-                    sql.SQL(
-                        "SELECT id, payload, vector <=> %(q)s::vector AS distance {vec} "
-                        "FROM {t} ORDER BY vector <=> %(q)s::vector {lim}"
-                    ).format(
-                        t=sql.Identifier(collection_name),
-                        vec=sql.SQL(", vector::text AS vector") if with_vector else sql.SQL(""),
-                        lim=limit_clause,
-                    ),
-                    {"q": _vec_literal(query_vector)},
-                )
-                rows = await cur.fetchall()
+        top_k = int(limit) if limit and limit > 0 else 0
+        columns = sql.SQL("id, payload, vector <=> %(q)s AS distance")
+        if with_vector:
+            columns = columns + sql.SQL(", vector")
+        statement = sql.SQL("SELECT {cols} FROM {t} ORDER BY vector <=> %(q)s {lim}").format(
+            cols=columns,
+            t=self._table(collection_name),
+            lim=sql.SQL("LIMIT {}").format(sql.Literal(top_k)) if top_k else sql.SQL(""),
+        )
+        rows = await self._rows(collection_name, statement, {"q": _vector(query_vector)}, top_k=top_k)
         results = []
-        for r in rows:
-            payload = r["payload"]
-            if with_vector and r.get("vector"):
-                payload = {**(payload or {}), "vector": r["vector"]}
-            results.append(
-                ScoredResult(id=_to_uuid(r["id"]), score=float(r["distance"]), payload=payload)
-            )
+        for row in rows:
+            payload = row[1]
+            if with_vector:
+                payload = {**(payload or {}), "vector": list(row[3])}
+            results.append(ScoredResult(id=_to_uuid(row[0]), score=float(row[2]), payload=payload))
         return results
 
     async def batch_search(
@@ -230,43 +419,3 @@ class AgensgraphVectorAdapter(VectorDBInterface):
                 for qv in query_vectors
             ]
         )
-
-    async def delete_data_points(self, collection_name: str, data_point_ids: List[str]):
-        if not data_point_ids or not await self.has_collection(collection_name):
-            return
-        engine = await self._ensure_engine()
-        async with engine.connection() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    sql.SQL("DELETE FROM {t} WHERE id = ANY(%(ids)s)").format(
-                        t=sql.Identifier(collection_name)
-                    ),
-                    {"ids": [str(i) for i in data_point_ids]},
-                )
-
-    async def prune(self):
-        # Drop every collection this adapter created. They are uniquely
-        # identified by their (payload jsonb + vector) column signature, so this
-        # never touches the graph tables or unrelated user tables.
-        engine = await self._ensure_engine()
-        async with engine.connection() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute(
-                    """
-                    SELECT c_vec.table_name
-                    FROM information_schema.columns c_vec
-                    JOIN information_schema.columns c_pl
-                      ON c_vec.table_schema = c_pl.table_schema
-                     AND c_vec.table_name = c_pl.table_name
-                    WHERE c_vec.table_schema = 'public'
-                      AND c_vec.column_name = 'vector' AND c_vec.udt_name = 'vector'
-                      AND c_pl.column_name = 'payload'
-                    """
-                )
-                tables = [r[0] for r in await cur.fetchall()]
-                for table in tables:
-                    await cur.execute(
-                        sql.SQL("DROP TABLE IF EXISTS {t} CASCADE").format(
-                            t=sql.Identifier(table)
-                        )
-                    )

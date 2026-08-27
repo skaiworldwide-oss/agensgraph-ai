@@ -1,13 +1,11 @@
 """AgensGraph graph adapter for cognee."""
 
-import asyncio
 import hashlib
 import re
 from collections import OrderedDict
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple, Type
 from uuid import UUID
 
-import psycopg
 from agensgraph import (
     DesiredIndex,
     DesiredLabel,
@@ -20,7 +18,6 @@ from agensgraph import (
     to_builtins,
 )
 from agensgraph.cypher import check_single_statement
-from agensgraph.errors import safe_message
 from agensgraph.introspect import MAX_IDENTIFIER
 from cognee.infrastructure.databases.graph.graph_db_interface import (
     GraphDBInterface,
@@ -28,12 +25,12 @@ from cognee.infrastructure.databases.graph.graph_db_interface import (
 )
 from cognee.infrastructure.engine import DataPoint
 from cognee.shared.logging_utils import ERROR, get_logger
-from psycopg import errors, sql
+from psycopg import sql
 from psycopg.conninfo import make_conninfo
 from psycopg.rows import dict_row, tuple_row
 from psycopg.types.json import Jsonb
 
-from ._engine import AgensEngine
+from ._engine import AgensEngine, run_with_retry
 from .metrics import graph_metrics
 
 logger = get_logger("AgensgraphAdapter", level=ERROR)
@@ -332,33 +329,7 @@ class AgensgraphAdapter(GraphDBInterface):
         return await self._run_with_retry(attempt, wrote=True)
 
     async def _run_with_retry(self, attempt, *, wrote: bool):
-        """Run ``attempt`` again while the driver says the failure was timing.
-
-        Concurrent writers merging onto the same keys fail each other for the moment
-        one of them takes to commit. A merge that loses such a race under a uniqueness
-        constraint is reported as an exclusion violation (23P01), so it is judged as the
-        unique violation it is.
-        """
-        number = 0
-        while True:
-            try:
-                result = await attempt()
-            except psycopg.Error as exc:
-                number += 1
-                decision = self.retry_policy.decide(
-                    exc, number=number, wrote=wrote, merging=wrote
-                )
-                if not decision.retry and isinstance(exc, errors.ExclusionViolation):
-                    decision = self.retry_policy.decide(
-                        errors.UniqueViolation(), number=number, wrote=wrote, merging=True
-                    )
-                if not decision.retry:
-                    logger.error("AgensGraph statement failed: %s", safe_message(exc))
-                    raise
-                await asyncio.sleep(decision.delay)
-            else:
-                self.retry_policy.succeeded()
-                return result
+        return await run_with_retry(self.retry_policy, attempt, wrote=wrote)
 
     @staticmethod
     async def _execute(conn, query, params, *, by_index: bool = False) -> List[Dict[str, Any]]:

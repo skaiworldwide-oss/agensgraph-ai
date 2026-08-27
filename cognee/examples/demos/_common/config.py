@@ -6,7 +6,7 @@ cognee is configured process-globally. This module:
      cognee's settings pick them up. Import ``_common.config`` (or ``_common``)
      before importing ``cognee`` in a demo.
   2. Provides a per-demo AgensGraph DSN + ``ensure_db`` (creates the database and
-     the ``vector`` extension via psycopg — ``psql`` isn't on PATH here).
+     the ``vector`` extension through the driver — ``psql`` isn't on PATH here).
   3. ``configure(db, name)`` points cognee's graph AND vector stores at one
      AgensGraph database and sets per-demo data/system directories under ``.data``.
 
@@ -92,15 +92,15 @@ def dsn(db: str) -> str:
 
 
 def ensure_db(db: str) -> None:
-    """Create ``db`` and its ``vector`` extension if missing (psycopg, autocommit)."""
-    import psycopg
+    """Create ``db`` and its ``vector`` extension if missing."""
+    import agensgraph
+    from psycopg import sql
 
-    admin = dsn("postgres")
-    with psycopg.connect(admin, autocommit=True) as conn:
+    with agensgraph.connect(dsn("postgres"), autocommit=True) as conn:
         exists = conn.execute("SELECT 1 FROM pg_database WHERE datname = %s", (db,)).fetchone()
         if not exists:
-            conn.execute(f'CREATE DATABASE "{db}"')
-    with psycopg.connect(dsn(db), autocommit=True) as conn:
+            conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(db)))
+    with agensgraph.connect(dsn(db), autocommit=True) as conn:
         conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
 
 

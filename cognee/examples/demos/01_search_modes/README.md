@@ -46,7 +46,7 @@ await cognee.search(query_text="What is anarchism connected to?",
 | `INSIGHTS` | entity → relation → entity **triplets** straight from the graph (no LLM) |
 | `CHUNKS` | the raw matching text chunks (vector search) |
 | `SUMMARIES` | the pre-computed per-document summaries |
-| `NATURAL_LANGUAGE` | your question turned into Cypher, run on the graph → rows |
+| `NATURAL_LANGUAGE` | your question turned into Cypher by the model, run on the graph → rows. The model is given the node labels and property keys, not the relationship names or any values, so it guesses both and often gets no rows; the statement itself runs (unquoted labels and Neo4j's `--` shorthand are accepted) |
 | `CYPHER` | a **Cypher query you write** (not a question), run on the graph → rows |
 
 The graph modes (`GRAPH_*`) draw on relationships *across* documents; `INSIGHTS`

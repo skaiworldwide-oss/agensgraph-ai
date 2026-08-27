@@ -37,6 +37,12 @@ from _common import config, console
 DB = "cognee_wiki"
 DEFAULT_QUESTION = "What is anarchism, and what ideas, people, and movements is it connected to?"
 
+# NATURAL_LANGUAGE turns a question into Cypher. The model is given the node labels and
+# property keys, not the relationship names or any values, so an open question makes it
+# guess names that do not exist. A question that names a node and asks what it is
+# connected to gives it what it needs.
+NL_QUESTION = "Which entities is the entity named 'anarchism' connected to, and by what relationship?"
+
 # Modes that answer the same natural-language question — the contrast is the point.
 MODES = [
     ("GRAPH_COMPLETION", "graph-aware answer (KG + chunks)"),
@@ -89,14 +95,17 @@ async def main() -> None:
 
     for name, blurb in MODES:
         console.sub(f"{name} — {blurb}")
+        asked = NL_QUESTION if name == "NATURAL_LANGUAGE" and len(sys.argv) == 1 else question
+        if asked != question:
+            print(f"  asked instead: {asked}")
         with console.timer(name):
-            results = await config.search(query_text=question, query_type=getattr(SearchType, name))
+            results = await config.search(query_text=asked, query_type=getattr(SearchType, name))
         render(results)
 
     # CYPHER is different from the modes above: instead of a question, you pass a
     # Cypher query and get rows straight from the AgensGraph-backed graph.
     console.section("CYPHER — query the graph directly (you write the Cypher)")
-    cypher = 'MATCH (n:"__Node__") WHERE n.name IS NOT NULL RETURN n.name AS name LIMIT 5'
+    cypher = "MATCH (n:Entity) RETURN n.name AS name LIMIT 5"
     print(f"  {cypher}")
     rows = await config.search(query_text=cypher, query_type=SearchType.CYPHER)
     for r in (rows or [])[:5]:

@@ -23,11 +23,12 @@ from _common import config, console
 
 DB = "cognee_wiki"
 
-# Top entities by degree, straight from AgensGraph Cypher (cognee stores every
-# node on the "__Node__" vlabel with a `name`, edges on the "DIRECTED" elabel).
+# Top entities by degree, straight from AgensGraph Cypher. Every cognee class is a
+# label of its own (entity, documentchunk, ...), all children of __node__, and every
+# edge is on a label named after its relationship (contains, is_a, ...). Labels are
+# lower case, so an unquoted label in Cypher, which folds to lower case, finds them.
 TOP_ENTITIES = """
-MATCH (n:"__Node__")
-WHERE n.name IS NOT NULL
+MATCH (n:Entity)
 OPTIONAL MATCH (n)-[r]-()
 WITH n.id AS id, n.name AS name, count(r) AS degree
 RETURN id, name, degree ORDER BY degree DESC LIMIT 12
@@ -46,8 +47,10 @@ async def main() -> None:
 
     console.section("Graph metrics (get_graph_metrics)")
     m = await g.get_graph_metrics(include_optional=False)
-    for k in ("num_nodes", "num_edges", "mean_degree", "edge_density", "num_selfloops"):
+    for k in ("num_nodes", "num_edges", "mean_degree", "edge_density",
+              "num_connected_components"):
         console.kv(k, m.get(k))
+    console.kv("largest components", m.get("sizes_of_connected_components", [])[:5])
 
     console.section("What's in the graph (node types)")
     nodes, edges = await g.get_graph_data()

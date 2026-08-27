@@ -28,7 +28,7 @@ await g.get_disconnected_nodes()                      # isolated nodes
 await g.get_degree_one_nodes("Entity")                # leaf entities
 await g.get_filtered_graph_data([{"type": ["Entity"]}])   # just the Entity subgraph
 
-await g.query('MATCH (n:"__Node__") ... RETURN n.name, count(r) ...')   # raw Cypher
+await g.query('MATCH (n:Entity) ... RETURN n.name, count(r) ...')   # raw Cypher
 
 await g.get_neighbors(node_id)                        # adjacent nodes
 await g.get_connections(node_id)                      # (node, edge, node) connections

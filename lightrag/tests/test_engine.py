@@ -117,6 +117,8 @@ async def test_concurrent_writers_on_one_key_make_one_node(graph):
     assert [r for r in results if isinstance(r, Exception)] == []
     rows = await graph._fetch("MATCH (n:base {entity_id: %(id)s}) RETURN count(n) AS c", {"id": "Race"})
     assert rows[0]["c"] == 1
+    # And one edge: the pair is stored once, under a unique index on its endpoints.
+    assert await graph.node_degree("Race") == 1
 
 
 async def test_names_that_look_like_statements_are_parameters(graph):

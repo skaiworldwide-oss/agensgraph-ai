@@ -95,9 +95,11 @@ def statements():
         remove_query_logger(counter)
 
 
-async def explain(conn, statement: str, params=None) -> str:
-    """The plan a statement gets under the settings the connection has, rolled back."""
+async def explain(conn, statement: str, params=None, *, by_index: bool = False) -> str:
+    """The plan a statement gets, under the settings the store runs it with, rolled back."""
     async with conn.transaction(force_rollback=True):
+        if by_index:
+            await conn.execute("SET LOCAL enable_seqscan = off")
         async with conn.cursor() as cur:
             await cur.execute("EXPLAIN (ANALYZE, COSTS OFF) " + statement, params)
             return "\n".join(row[0] for row in await cur.fetchall())

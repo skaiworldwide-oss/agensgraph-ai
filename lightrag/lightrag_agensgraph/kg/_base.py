@@ -107,28 +107,48 @@ class _AgensStorageBase:
         async with self._engine.connection() as conn:
             yield conn
 
-    async def _fetch(self, query: Any, params: Any = None, *, wrote: bool = False) -> List[Dict[str, Any]]:
+    @staticmethod
+    async def _rows(conn, query: Any, params: Any, row_factory: Any, by_index: bool) -> List[Any]:
+        """Run one statement on ``conn`` and read its rows.
+
+        ``by_index`` is for a statement that matches nodes from a bound list of names.
+        The server plans such a statement once, for a list of a hundred names, and on a
+        graph of a few thousand nodes that plan hashes the whole node table instead of
+        probing the unique index once per name. Turning sequential scans off for the
+        statement's own transaction keeps the probes, and the four statements go out in
+        one flush.
+        """
+        if not by_index:
+            async with conn.cursor(row_factory=row_factory) as cur:
+                await cur.execute(query, params)
+                return await cur.fetchall() if cur.description is not None else []
+        async with conn.transaction():
+            async with conn.pipeline():
+                await conn.execute("SET LOCAL enable_seqscan = off")
+                cur = conn.cursor(row_factory=row_factory)
+                await cur.execute(query, params)
+            rows = await cur.fetchall() if cur.description is not None else []
+            await cur.close()
+            return rows
+
+    async def _fetch(
+        self, query: Any, params: Any = None, *, wrote: bool = False, by_index: bool = False
+    ) -> List[Dict[str, Any]]:
         """Run one statement and return its rows as dicts of plain values."""
 
         async def attempt():
             async with self._connection() as conn:
-                async with conn.cursor(row_factory=dict_row) as cur:
-                    await cur.execute(query, params)
-                    if cur.description is None:
-                        return []
-                    rows = await cur.fetchall()
+                rows = await self._rows(conn, query, params, dict_row, by_index)
             return [{key: plain(value) for key, value in row.items()} for row in rows]
 
         return await run_with_retry(self._retry, attempt, wrote=wrote)
 
-    async def _fetch_tuples(self, query: Any, params: Any = None) -> List[tuple]:
+    async def _fetch_tuples(self, query: Any, params: Any = None, *, by_index: bool = False) -> List[tuple]:
         """Rows as tuples, with no conversion. For reads of plain SQL values only."""
 
         async def attempt():
             async with self._connection() as conn:
-                async with conn.cursor(row_factory=tuple_row) as cur:
-                    await cur.execute(query, params)
-                    return await cur.fetchall() if cur.description is not None else []
+                return await self._rows(conn, query, params, tuple_row, by_index)
 
         return await run_with_retry(self._retry, attempt, wrote=False)
 

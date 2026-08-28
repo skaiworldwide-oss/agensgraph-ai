@@ -14,7 +14,9 @@
 
 import pytest
 import pytest_asyncio
+from conftest import explain
 
+from lightrag_agensgraph.kg import agensgraph_impl as impl
 from lightrag_agensgraph.kg.agensgraph_impl import AgensgraphStorage
 
 pytestmark = pytest.mark.asyncio
@@ -128,3 +130,98 @@ async def test_chunk_id_lookups(graph):
     assert {n["entity_id"] for n in nodes} == {"Alice", "Paris"}
     edges = await graph.get_edges_by_chunk_ids(["c3"])
     assert any(e["source"] in ("Bob", "Rome") for e in edges)
+
+
+async def test_edges_are_undirected_and_stored_once(graph):
+    await _seed(graph)
+    assert await graph.has_edge("Bob", "Alice") is True
+    assert (await graph.get_edge("Bob", "Alice"))["rel"] == "knows"
+    batch = await graph.get_edges_batch([{"src": "Bob", "tgt": "Alice"}, {"src": "Alice", "tgt": "Paris"}])
+    assert set(batch) == {("Bob", "Alice"), ("Alice", "Paris")}  # keyed as asked, whichever way round
+    await graph.upsert_edge("Bob", "Alice", {"rel": "knows well"})  # the other way round: same edge
+    assert await graph.node_degree("Alice") == 2 and await graph.node_degree("Bob") == 2
+    assert (await graph.get_edge("Alice", "Bob"))["rel"] == "knows well"
+    assert (await graph.edge_degrees_batch([("Alice", "Bob")]))[("Alice", "Bob")] == 4
+
+
+async def test_node_edges_tell_absent_from_isolated(graph):
+    await _seed(graph)
+    await graph.upsert_node("Hermit", {"entity_id": "Hermit"})
+    assert await graph.get_node_edges("Ghost") is None
+    assert await graph.get_node_edges("Hermit") == []
+    assert sorted(await graph.get_node_edges("Alice")) == [("Alice", "Bob"), ("Alice", "Paris")]
+    assert await graph.get_node_edges("Bob") == [("Bob", "Alice"), ("Bob", "Rome")] or sorted(
+        await graph.get_node_edges("Bob")
+    ) == [("Bob", "Alice"), ("Bob", "Rome")]
+    batch = await graph.get_nodes_edges_batch(["Rome", "Hermit", "Ghost"])
+    assert batch == {"Rome": [("Rome", "Bob")], "Hermit": [], "Ghost": []}
+
+
+async def test_popular_labels_rank_everything_and_search_ranks_matches(graph):
+    await _seed(graph)
+    await graph.upsert_node("Zed", {"entity_id": "Zed"})  # isolated: last, but present
+    assert await graph.get_popular_labels(limit=10) == ["Alice", "Bob", "Paris", "Rome", "Zed"]
+    assert await graph.get_popular_labels(limit=2) == ["Alice", "Bob"]
+    await graph.upsert_node("Rom", {"entity_id": "Rom"})
+    assert await graph.search_labels("rom") == ["Rom", "Rome"]  # exact match first, then the prefix
+    assert await graph.search_labels("%") == [] and await graph.search_labels("  ") == []
+
+
+async def test_knowledge_graph_names_its_nodes_and_edges(graph):
+    await _seed(graph)
+    kg = await graph.get_knowledge_graph("Alice", max_depth=1)
+    assert {n.id for n in kg.nodes} == {"Alice", "Bob", "Paris"}
+    assert all(n.labels == [n.id] for n in kg.nodes)
+    assert {(e.source, e.target) for e in kg.edges} == {("Alice", "Bob"), ("Alice", "Paris")}
+    assert all(e.type == "DIRECTED" and "rel" in e.properties for e in kg.edges)
+    two = await graph.get_knowledge_graph("Alice", max_depth=2)
+    assert {n.id for n in two.nodes} == {"Alice", "Bob", "Paris", "Rome"} and len(two.edges) == 3
+    capped = await graph.get_knowledge_graph("Alice", max_depth=2, max_nodes=2)
+    assert len(capped.nodes) == 2 and capped.is_truncated is True
+
+
+@pytest_asyncio.fixture
+async def big_graph(graph):
+    # Enough rows for the planner to prefer an index over a scan, with a few hubs. On a
+    # small table a scan is the right plan and says nothing about these statements.
+    names = [f"n{i}" for i in range(12000)]
+    await graph.upsert_nodes_batch([(n, {"entity_id": n, "source_id": f"c{i % 50}"}) for i, n in enumerate(names)])
+    edges = [(names[i % 40], names[(i * 7 + 3) % 12000], {"weight": 1.0}) for i in range(24000)]
+    await graph.upsert_edges_batch(edges)
+    graph.expected_degree = {}
+    for a, b, _ in edges:
+        pair = tuple(sorted((a, b)))
+        if pair not in graph.expected_degree.setdefault("pairs", set()):
+            graph.expected_degree["pairs"].add(pair)
+            for name in pair:
+                graph.expected_degree[name] = graph.expected_degree.get(name, 0) + 1
+    async with graph._engine.connection() as conn:
+        await conn.execute(f'ANALYZE "{graph.graph_name}".base')
+        await conn.execute(f'ANALYZE "{graph.graph_name}"."DIRECTED"')
+    return graph
+
+
+async def _plan(graph, template, params, by_index):
+    async with graph._engine.connection() as conn:
+        return await explain(conn, graph._sql(template).as_string(conn), params, by_index=by_index)
+
+
+async def test_edge_reads_probe_the_pair_index_whatever_the_degree(big_graph):
+    g = big_graph
+    hub = "n0"
+    for template, params, by_index in [
+        (impl.HAS_EDGE, {"a": hub, "b": "n3"}, False),
+        (impl.GET_EDGE, {"a": hub, "b": "n3"}, False),
+        (impl.GET_EDGES, {"names": impl.Jsonb([hub, "n3", "n1", "n10"]), "src": [hub, "n1"], "tgt": ["n3", "n10"]}, True),
+        (impl.DEGREES, {"names": impl.Jsonb([hub, "n1", "n2"])}, True),
+        (impl.NODE_EDGES, {"names": impl.Jsonb([hub])}, True),
+    ]:
+        plan = await _plan(g, template, params, by_index)
+        # The empty parent tables (ag_vertex, ag_edge) appear in a Cypher plan and are
+        # never executed; the label tables themselves must be reached through an index.
+        assert "Seq Scan on base" not in plan and 'Seq Scan on "DIRECTED"' not in plan, plan
+        assert "Join Filter" not in plan and "Rows Removed by Filter" not in plan, plan
+    assert await g.has_edge("n3", hub) is True
+    expected = g.expected_degree[hub]  # the generator repeats targets; a pair is one edge
+    assert (await g.node_degrees_batch([hub]))[hub] == expected
+    assert len(await g.get_node_edges(hub)) == expected

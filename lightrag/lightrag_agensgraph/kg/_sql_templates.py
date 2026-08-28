@@ -100,73 +100,78 @@ DOC_STATUS_UPGRADE_DDL = [
     "DROP INDEX IF EXISTS lightrag_doc_status_ws_status_idx",
 ]
 
-# Vector tables (one per LightRAG vector namespace). ``content_vector`` is typed
-# VECTOR({dim}) so the query's ``content_vector <=> $q::vector`` distance matches
-# the HNSW index expression and uses the index (the cast-match invariant).
+# Vector tables, one per LightRAG vector namespace. ``content_vector`` is typed
+# VECTOR({dim}) so a search's ``<=>`` matches the HNSW index expression. The
+# chunk ids of an entity or a relation are kept as LightRAG hands them over,
+# one string joined with its separator.
 VECTOR_ENTITY_TABLE = "LIGHTRAG_VDB_ENTITY"
 VECTOR_RELATION_TABLE = "LIGHTRAG_VDB_RELATION"
 VECTOR_CHUNK_TABLE = "LIGHTRAG_VDB_CHUNKS"
 
-VECTOR_TABLE_DDL = [
-    """
+VECTOR_TABLE_DDL = {
+    VECTOR_ENTITY_TABLE: """
     CREATE TABLE IF NOT EXISTS LIGHTRAG_VDB_ENTITY (
         workspace      VARCHAR(255) NOT NULL DEFAULT '',
         id             TEXT         NOT NULL,
-        entity_name    VARCHAR(512),
+        entity_name    TEXT,
         content        TEXT,
         content_vector VECTOR({dim}),
-        chunk_ids      VARCHAR(255)[] NULL,
-        file_path      TEXT NULL,
-        create_time    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        update_time    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        chunk_ids      TEXT,
+        file_path      TEXT,
+        create_time    TIMESTAMPTZ  NOT NULL DEFAULT now(),
+        update_time    TIMESTAMPTZ  NOT NULL DEFAULT now(),
         CONSTRAINT LIGHTRAG_VDB_ENTITY_PK PRIMARY KEY (workspace, id)
     )
     """,
-    """
+    VECTOR_RELATION_TABLE: """
     CREATE TABLE IF NOT EXISTS LIGHTRAG_VDB_RELATION (
         workspace      VARCHAR(255) NOT NULL DEFAULT '',
         id             TEXT         NOT NULL,
-        source_id      VARCHAR(512),
-        target_id      VARCHAR(512),
+        src_id         TEXT,
+        tgt_id         TEXT,
         content        TEXT,
         content_vector VECTOR({dim}),
-        chunk_ids      VARCHAR(255)[] NULL,
-        file_path      TEXT NULL,
-        create_time    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        update_time    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        chunk_ids      TEXT,
+        file_path      TEXT,
+        create_time    TIMESTAMPTZ  NOT NULL DEFAULT now(),
+        update_time    TIMESTAMPTZ  NOT NULL DEFAULT now(),
         CONSTRAINT LIGHTRAG_VDB_RELATION_PK PRIMARY KEY (workspace, id)
     )
     """,
-    """
+    VECTOR_CHUNK_TABLE: """
     CREATE TABLE IF NOT EXISTS LIGHTRAG_VDB_CHUNKS (
         workspace         VARCHAR(255) NOT NULL DEFAULT '',
         id                TEXT         NOT NULL,
-        full_doc_id       VARCHAR(256),
+        full_doc_id       TEXT,
         chunk_order_index INTEGER,
         tokens            INTEGER,
         content           TEXT,
         content_vector    VECTOR({dim}),
-        file_path         TEXT NULL,
-        create_time       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-        update_time       TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        file_path         TEXT,
+        create_time       TIMESTAMPTZ  NOT NULL DEFAULT now(),
+        update_time       TIMESTAMPTZ  NOT NULL DEFAULT now(),
         CONSTRAINT LIGHTRAG_VDB_CHUNKS_PK PRIMARY KEY (workspace, id)
     )
     """,
+}
+
+# The lookups that delete by name: an entity by its name, a relation by either endpoint.
+VECTOR_LOOKUP_INDEX_DDL = [
+    "CREATE INDEX IF NOT EXISTS lightrag_vdb_entity_name_idx ON LIGHTRAG_VDB_ENTITY (workspace, entity_name)",
+    "CREATE INDEX IF NOT EXISTS lightrag_vdb_relation_src_idx ON LIGHTRAG_VDB_RELATION (workspace, src_id)",
+    "CREATE INDEX IF NOT EXISTS lightrag_vdb_relation_tgt_idx ON LIGHTRAG_VDB_RELATION (workspace, tgt_id)",
 ]
 
-VECTOR_INDEX_DDL = [
-    "CREATE INDEX IF NOT EXISTS lightrag_vdb_entity_hnsw ON "
-    "LIGHTRAG_VDB_ENTITY USING hnsw (content_vector vector_cosine_ops)",
-    "CREATE INDEX IF NOT EXISTS lightrag_vdb_relation_hnsw ON "
-    "LIGHTRAG_VDB_RELATION USING hnsw (content_vector vector_cosine_ops)",
-    "CREATE INDEX IF NOT EXISTS lightrag_vdb_chunks_hnsw ON "
-    "LIGHTRAG_VDB_CHUNKS USING hnsw (content_vector vector_cosine_ops)",
-    # delete_entity matches on entity_name; delete_entity_relation matches on
-    # source_id / target_id. Index them so those deletes (run on every entity
-    # edit/removal) use a BitmapOr index scan instead of a sequential scan.
-    "CREATE INDEX IF NOT EXISTS lightrag_vdb_entity_name_idx ON LIGHTRAG_VDB_ENTITY (workspace, entity_name)",
-    "CREATE INDEX IF NOT EXISTS lightrag_vdb_relation_src_idx "
-    "ON LIGHTRAG_VDB_RELATION (workspace, source_id)",
-    "CREATE INDEX IF NOT EXISTS lightrag_vdb_relation_tgt_idx "
-    "ON LIGHTRAG_VDB_RELATION (workspace, target_id)",
-]
+
+def vector_index_name(table: str) -> str:
+    return f"{table.lower()}_hnsw"
+
+
+def vector_index_ddl(table: str, *, m: int, ef_construction: int, if_not_exists: bool = True) -> str:
+    """The HNSW index a nearest search runs on."""
+    exists = "IF NOT EXISTS " if if_not_exists else ""
+    return (
+        f"CREATE INDEX {exists}{vector_index_name(table)} ON {table} "
+        "USING hnsw (content_vector vector_cosine_ops) "
+        f"WITH (m = {int(m)}, ef_construction = {int(ef_construction)})"
+    )

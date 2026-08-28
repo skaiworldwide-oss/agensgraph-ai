@@ -12,269 +12,416 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, final
+"""Vector storage: LightRAG's entity, relation and chunk embeddings in pgvector tables.
 
+LightRAG hands a record over one at a time while it merges a document and asks
+for the embeddings to be made by the store. Records are kept here until the
+document is done and ``index_done_callback`` runs, then embedded in batches and
+written with one statement per batch. A search runs on the HNSW index with the
+planner told so, because it cannot see that the vectors live out of line and
+would rather read the whole table.
+"""
+
+from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
+from typing import Any, AsyncIterator, Dict, List, Optional, final
+
+from agensgraph import Vector
 from lightrag.base import BaseVectorStorage
+from lightrag.constants import GRAPH_FIELD_SEP
 from lightrag.namespace import NameSpace, is_namespace
 from lightrag.utils import compute_mdhash_id, logger
-
-try:
-    from lightrag.constants import GRAPH_FIELD_SEP
-except ImportError:  # pragma: no cover
-    from lightrag.prompt import GRAPH_FIELD_SEP
+from psycopg import sql
 
 from lightrag_agensgraph.kg._base import _AgensStorageBase, resolve_workspace
 from lightrag_agensgraph.kg._sql_templates import (
     VECTOR_CHUNK_TABLE,
     VECTOR_ENTITY_TABLE,
-    VECTOR_INDEX_DDL,
+    VECTOR_LOOKUP_INDEX_DDL,
     VECTOR_RELATION_TABLE,
     VECTOR_TABLE_DDL,
+    vector_index_ddl,
+    vector_index_name,
 )
 
-# Per-kind cosine search returning exactly the columns LightRAG expects.
-_QUERY_SQL = {
-    "entities": """
-        SELECT entity_name, EXTRACT(EPOCH FROM create_time)::BIGINT AS created_at
-        FROM {table}
-        WHERE workspace = %(ws)s AND content_vector <=> %(emb)s::vector < %(thr)s
-        ORDER BY content_vector <=> %(emb)s::vector
-        LIMIT %(k)s
-    """,
-    "relationships": """
-        SELECT source_id AS src_id, target_id AS tgt_id,
-               EXTRACT(EPOCH FROM create_time)::BIGINT AS created_at
-        FROM {table}
-        WHERE workspace = %(ws)s AND content_vector <=> %(emb)s::vector < %(thr)s
-        ORDER BY content_vector <=> %(emb)s::vector
-        LIMIT %(k)s
-    """,
-    "chunks": """
-        SELECT id, content, file_path,
-               EXTRACT(EPOCH FROM create_time)::BIGINT AS created_at
-        FROM {table}
-        WHERE workspace = %(ws)s AND content_vector <=> %(emb)s::vector < %(thr)s
-        ORDER BY content_vector <=> %(emb)s::vector
-        LIMIT %(k)s
-    """,
+# The columns each kind of record carries besides its id and vector, and how a payload
+# key maps onto them. chunk_ids holds what LightRAG calls source_id: the chunk ids joined.
+KINDS = {
+    "entities": (
+        VECTOR_ENTITY_TABLE,
+        {
+            "entity_name": "entity_name",
+            "content": "content",
+            "chunk_ids": "source_id",
+            "file_path": "file_path",
+        },
+    ),
+    "relationships": (
+        VECTOR_RELATION_TABLE,
+        {
+            "src_id": "src_id",
+            "tgt_id": "tgt_id",
+            "content": "content",
+            "chunk_ids": "source_id",
+            "file_path": "file_path",
+        },
+    ),
+    "chunks": (
+        VECTOR_CHUNK_TABLE,
+        {
+            "full_doc_id": "full_doc_id",
+            "chunk_order_index": "chunk_order_index",
+            "tokens": "tokens",
+            "content": "content",
+            "file_path": "file_path",
+        },
+    ),
 }
-
-_UPSERT_SQL = {
-    "entities": """
-        INSERT INTO {table}
-            (workspace, id, entity_name, content, content_vector, chunk_ids, file_path)
-        VALUES (%s, %s, %s, %s, %s::vector, %s::varchar[], %s)
-        ON CONFLICT (workspace, id) DO UPDATE SET
-            entity_name = EXCLUDED.entity_name, content = EXCLUDED.content,
-            content_vector = EXCLUDED.content_vector, chunk_ids = EXCLUDED.chunk_ids,
-            file_path = EXCLUDED.file_path, update_time = CURRENT_TIMESTAMP
-    """,
-    "relationships": """
-        INSERT INTO {table}
-            (workspace, id, source_id, target_id, content, content_vector, chunk_ids, file_path)
-        VALUES (%s, %s, %s, %s, %s, %s::vector, %s::varchar[], %s)
-        ON CONFLICT (workspace, id) DO UPDATE SET
-            source_id = EXCLUDED.source_id, target_id = EXCLUDED.target_id,
-            content = EXCLUDED.content, content_vector = EXCLUDED.content_vector,
-            chunk_ids = EXCLUDED.chunk_ids, file_path = EXCLUDED.file_path,
-            update_time = CURRENT_TIMESTAMP
-    """,
-    "chunks": """
-        INSERT INTO {table}
-            (workspace, id, tokens, chunk_order_index, full_doc_id, content,
-             content_vector, file_path)
-        VALUES (%s, %s, %s, %s, %s, %s, %s::vector, %s)
-        ON CONFLICT (workspace, id) DO UPDATE SET
-            tokens = EXCLUDED.tokens, chunk_order_index = EXCLUDED.chunk_order_index,
-            full_doc_id = EXCLUDED.full_doc_id, content = EXCLUDED.content,
-            content_vector = EXCLUDED.content_vector, file_path = EXCLUDED.file_path,
-            update_time = CURRENT_TIMESTAMP
-    """,
-}
+INTEGER_COLUMNS = frozenset({"chunk_order_index", "tokens"})
+ROWS_PER_STATEMENT = 500
+DEFAULT_EF_SEARCH = 40
+CREATED = "EXTRACT(EPOCH FROM create_time)::BIGINT AS created_at"
 
 
-def _vec_literal(vector) -> str:
-    """Render an embedding as a pgvector text literal ``[v0,v1,...]``."""
-    if hasattr(vector, "tolist"):
-        vector = vector.tolist()
-    return "[" + ",".join(str(float(x)) for x in vector) + "]"
+def as_vector(values: Any) -> Vector:
+    if isinstance(values, Vector):
+        return values
+    return Vector(values.tolist() if hasattr(values, "tolist") else values)
 
 
 @final
 @dataclass
 class AgensgraphVectorStorage(_AgensStorageBase, BaseVectorStorage):
-    """Vector storage backed by pgvector tables (HNSW cosine) in AgensGraph."""
+    """Embeddings in a pgvector table with an HNSW index, written in batches."""
+
+    hnsw_m: int = 16
+    hnsw_ef_construction: int = 64
+    maintenance_work_mem: str = "1GB"
+    _pending: Dict[str, Dict[str, Any]] = field(default_factory=dict, init=False, repr=False)
+    _bulk: bool = field(default=False, init=False, repr=False)
+    _index_dropped: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self):
+        self._validate_embedding_func()
         self.workspace = resolve_workspace(self.workspace, self.global_config)
         self._engine = None
-        if is_namespace(self.namespace, NameSpace.VECTOR_STORE_ENTITIES):
-            self._kind, self.table = "entities", VECTOR_ENTITY_TABLE
-        elif is_namespace(self.namespace, NameSpace.VECTOR_STORE_RELATIONSHIPS):
-            self._kind, self.table = "relationships", VECTOR_RELATION_TABLE
-        elif is_namespace(self.namespace, NameSpace.VECTOR_STORE_CHUNKS):
-            self._kind, self.table = "chunks", VECTOR_CHUNK_TABLE
+        for kind, (table, columns) in KINDS.items():
+            if is_namespace(self.namespace, getattr(NameSpace, f"VECTOR_STORE_{kind.upper()}")):
+                self._kind, self.table, self._columns = kind, table, columns
+                break
         else:
             raise ValueError(f"Unsupported vector namespace: {self.namespace}")
-        cfg = (self.global_config or {}).get("vector_db_storage_cls_kwargs", {})
-        threshold = cfg.get("cosine_better_than_threshold")
-        if threshold is not None:
-            self.cosine_better_than_threshold = threshold
-        self._max_batch = int((self.global_config or {}).get("embedding_batch_num", 32))
+        config = (self.global_config or {}).get("vector_db_storage_cls_kwargs", {})
+        if config.get("cosine_better_than_threshold") is not None:
+            self.cosine_better_than_threshold = config["cosine_better_than_threshold"]
+        self.hnsw_m = int(config.get("hnsw_m", self.hnsw_m))
+        self.hnsw_ef_construction = int(config.get("hnsw_ef_construction", self.hnsw_ef_construction))
+        self._batch = int((self.global_config or {}).get("embedding_batch_num", 32))
+        self._dim = int(self.embedding_func.embedding_dim)
 
     async def initialize(self):
         await self._acquire_engine()
         await self._engine.enable_vectors()
-        dim = int(self.embedding_func.embedding_dim)
+        dim = self._dim
 
         async def ddl(conn):
-            for statement in VECTOR_TABLE_DDL:
+            for statement in VECTOR_TABLE_DDL.values():
                 await conn.execute(statement.format(dim=dim))
-            for statement in VECTOR_INDEX_DDL:
+            await self._upgrade(conn)
+            for table in VECTOR_TABLE_DDL:
+                await conn.execute(
+                    vector_index_ddl(table, m=self.hnsw_m, ef_construction=self.hnsw_ef_construction)
+                )
+            for statement in VECTOR_LOOKUP_INDEX_DDL:
                 await conn.execute(statement)
 
         await self._engine.setup_once("vector", ddl)
+        # The tables were made for one embedding width; a different model needs its own.
+        rows = await self._fetch_tuples(
+            "SELECT format_type(atttypid, atttypmod) FROM pg_attribute "
+            "WHERE attrelid = %s::regclass AND attname = 'content_vector'",
+            (self.table.lower(),),
+        )
+        if rows and rows[0][0] != f"vector({dim})":
+            raise ValueError(
+                f"{self.table} holds {rows[0][0]} embeddings and this embedding function produces "
+                f"vector({dim}); drop the LIGHTRAG_VDB_* tables to switch embedding models"
+            )
+
+    @staticmethod
+    async def _upgrade(conn) -> None:
+        """Bring tables in the previous layout to this one, keeping their rows.
+
+        The relation table named its endpoints source_id and target_id, and both the
+        entity and the relation table kept the chunk ids as an array.
+        """
+        cur = await conn.execute(
+            "SELECT table_name, column_name, data_type FROM information_schema.columns "
+            "WHERE table_name IN ('lightrag_vdb_entity', 'lightrag_vdb_relation') "
+            "AND column_name IN ('source_id', 'target_id', 'chunk_ids')"
+        )
+        columns = {(t, c): kind for t, c, kind in await cur.fetchall()}
+        async with conn.transaction():
+            if ("lightrag_vdb_relation", "source_id") in columns:
+                logger.info("renaming the relation table's endpoint columns")
+                await conn.execute("ALTER TABLE LIGHTRAG_VDB_RELATION RENAME COLUMN source_id TO src_id")
+                await conn.execute("ALTER TABLE LIGHTRAG_VDB_RELATION RENAME COLUMN target_id TO tgt_id")
+            for table in ("lightrag_vdb_entity", "lightrag_vdb_relation"):
+                if columns.get((table, "chunk_ids")) == "ARRAY":
+                    logger.info("storing %s chunk ids as one string", table)
+                    # A utility statement takes no bound parameter; the separator is a literal.
+                    await conn.execute(
+                        sql.SQL(
+                            "ALTER TABLE {} ALTER COLUMN chunk_ids TYPE TEXT "
+                            "USING array_to_string(chunk_ids, {})"
+                        ).format(sql.Identifier(table), sql.Literal(GRAPH_FIELD_SEP))
+                    )
 
     async def finalize(self):
         await self._release_engine()
 
-    async def index_done_callback(self) -> None:
-        pass
-
-    def _chunk_ids(self, item: dict) -> List[str]:
-        source_id = item.get("source_id")
-        if isinstance(source_id, str) and GRAPH_FIELD_SEP in source_id:
-            return source_id.split(GRAPH_FIELD_SEP)
-        return [source_id] if source_id is not None else []
-
-    async def _embed(self, texts: List[str]) -> List[Any]:
-        vectors: List[Any] = []
-        for start in range(0, len(texts), self._max_batch):
-            batch = texts[start : start + self._max_batch]
-            vectors.extend(await self.embedding_func(batch))
-        return vectors
+    # ---- writes ----
 
     async def upsert(self, data: Dict[str, Dict[str, Any]]) -> None:
-        if not data:
-            return
-        ids = list(data.keys())
-        contents = [data[i]["content"] for i in ids]
-        vectors = await self._embed(contents)
+        """Keep the records; they are embedded and written when the document is done."""
+        for id_, item in data.items():
+            if "content" not in item:
+                raise ValueError(f"vector record {id_!r} has no content to embed")
+            self._pending[id_] = dict(item)
 
-        params = []
-        for i, id_ in enumerate(ids):
-            item = data[id_]
-            vec = _vec_literal(vectors[i])
-            if self._kind == "entities":
-                params.append((
-                    self.workspace, id_, item["entity_name"], item["content"],
-                    vec, self._chunk_ids(item), item.get("file_path"),
-                ))
-            elif self._kind == "relationships":
-                params.append((
-                    self.workspace, id_, item["src_id"], item["tgt_id"],
-                    item["content"], vec, self._chunk_ids(item), item.get("file_path"),
-                ))
-            else:  # chunks
-                params.append((
-                    self.workspace, id_, item.get("tokens"),
-                    item.get("chunk_order_index"), item.get("full_doc_id"),
-                    item["content"], vec, item.get("file_path"),
-                ))
-        await self._run_many(
-            _UPSERT_SQL[self._kind].format(table=self.table), params
+    async def index_done_callback(self) -> None:
+        pending, self._pending = self._pending, {}
+        if not pending:
+            return
+        try:
+            if self._bulk and not self._index_dropped:
+                await self._run(f"DROP INDEX IF EXISTS {vector_index_name(self.table)}")
+                self._index_dropped = True
+            ids = list(pending)
+            vectors = await self._embed([pending[i]["content"] for i in ids])
+            for start in range(0, len(ids), ROWS_PER_STATEMENT):
+                chunk = ids[start : start + ROWS_PER_STATEMENT]
+                await self._write(
+                    chunk, [pending[i] for i in chunk], vectors[start : start + ROWS_PER_STATEMENT]
+                )
+        except BaseException:
+            # What was not written is still owed; a record written since keeps its newer value.
+            for id_, item in pending.items():
+                self._pending.setdefault(id_, item)
+            raise
+
+    async def drop_pending_index_ops(self) -> None:
+        self._pending.clear()
+
+    async def _embed(self, texts: List[str]) -> List[Vector]:
+        vectors: List[Vector] = []
+        for start in range(0, len(texts), self._batch):
+            for row in await self.embedding_func(texts[start : start + self._batch]):
+                vectors.append(as_vector(row))
+        return vectors
+
+    async def _write(self, ids: List[str], items: List[Dict[str, Any]], vectors: List[Vector]) -> None:
+        columns = list(self._columns)
+        arrays: Dict[str, list] = {"ids": ids, "vectors": vectors}
+        for column in columns:
+            arrays[column] = [item.get(self._columns[column]) for item in items]
+        typed = ", ".join(f"%({c})s::{'integer[]' if c in INTEGER_COLUMNS else 'text[]'}" for c in columns)
+        updates = ", ".join(f"{c} = EXCLUDED.{c}" for c in columns)
+        # One statement per batch: every column arrives as an array, the vectors in binary.
+        await self._run(
+            f"INSERT INTO {self.table} (workspace, id, content_vector, {', '.join(columns)}) "
+            f"SELECT %(ws)s, * FROM unnest(%(ids)s::text[], %(vectors)b::vector[], {typed}) "
+            f"ON CONFLICT (workspace, id) DO UPDATE SET content_vector = EXCLUDED.content_vector, "
+            f"{updates}, update_time = now()",
+            {"ws": self.workspace, **arrays},
         )
+
+    @asynccontextmanager
+    async def bulk_ingest(self) -> AsyncIterator[None]:
+        """Load many records: the HNSW index is dropped for the duration and rebuilt at the end.
+
+        Inserting into an HNSW index costs far more than building it afterwards, and the
+        build runs with ``maintenance_work_mem`` raised so the graph fits in memory.
+        """
+        self._bulk = True
+        try:
+            yield
+            await self.index_done_callback()
+        finally:
+            self._bulk = False
+            if self._index_dropped:
+                self._index_dropped = False
+                async with self._connection() as conn:
+                    async with conn.transaction():
+                        await conn.execute(f"SET LOCAL maintenance_work_mem = '{self.maintenance_work_mem}'")
+                        await conn.execute(
+                            vector_index_ddl(
+                                self.table, m=self.hnsw_m, ef_construction=self.hnsw_ef_construction
+                            )
+                        )
+
+    # ---- search ----
 
     async def query(
         self, query: str, top_k: int, query_embedding: Optional[List[float]] = None
     ) -> List[Dict[str, Any]]:
-        if query_embedding is not None:
-            embedding = query_embedding
-        else:
-            embedding = (await self.embedding_func([query]))[0]
-        return await self._fetch(
-            _QUERY_SQL[self._kind].format(table=self.table),
-            {
-                "ws": self.workspace,
-                "thr": 1 - self.cosine_better_than_threshold,
-                "k": top_k,
-                "emb": _vec_literal(embedding),
-            },
+        if self._pending:
+            await self.index_done_callback()
+        embedding = (
+            query_embedding if query_embedding is not None else (await self.embedding_func([query]))[0]
         )
+        columns = ", ".join(self._columns)
+        statement = (
+            f"SELECT id, {columns}, content_vector <=> %(v)b AS distance, {CREATED} FROM {self.table} "
+            "WHERE workspace = %(ws)s AND content_vector <=> %(v)b < %(threshold)s "
+            "ORDER BY content_vector <=> %(v)b LIMIT %(k)s"
+        )
+        params = {
+            "ws": self.workspace,
+            "v": as_vector(embedding),
+            "threshold": 1 - self.cosine_better_than_threshold,
+            "k": top_k,
+        }
+
+        async def attempt():
+            async with self._connection() as conn:
+                async with conn.transaction():
+                    async with conn.pipeline():
+                        # The planner costs the HNSW index above reading the table, because the
+                        # vectors are stored out of line where it cannot see them; the workspace
+                        # key then offers it a bitmap or a primary-key scan followed by a sort.
+                        # With those three off for this transaction the index walk is the only
+                        # plan left that needs no sort. The walk goes further when the threshold
+                        # drops candidates, and as far as the limit asks.
+                        await conn.execute("SET LOCAL enable_seqscan = off")
+                        await conn.execute("SET LOCAL enable_bitmapscan = off")
+                        await conn.execute("SET LOCAL enable_sort = off")
+                        await conn.vector_search_options(
+                            {
+                                "hnsw.iterative_scan": "relaxed_order",
+                                "hnsw.ef_search": max(DEFAULT_EF_SEARCH, int(top_k)),
+                            }
+                        )
+                        cur = conn.cursor()
+                        await cur.execute(statement, params)
+                    rows = await cur.fetchall()
+                    keys = [c.name for c in cur.description]
+                    await cur.close()
+            return [self._record(dict(zip(keys, row))) for row in rows]
+
+        from lightrag_agensgraph.kg._engine import run_with_retry
+
+        return await run_with_retry(self._retry, attempt, wrote=False)
+
+    def _record(self, row: Dict[str, Any]) -> Dict[str, Any]:
+        row.pop("content_vector", None)
+        if "chunk_ids" in row:
+            joined = row.pop("chunk_ids")
+            row["source_id"] = joined
+            row["chunk_ids"] = joined.split(GRAPH_FIELD_SEP) if joined else []
+        return row
+
+    def _pending_record(self, id_: str) -> Dict[str, Any]:
+        item = self._pending[id_]
+        row = {"id": id_}
+        for column, key in self._columns.items():
+            row[column] = item.get(key)
+        return self._record(row)
+
+    # ---- reads ----
 
     async def get_by_id(self, id: str) -> Optional[Dict[str, Any]]:
+        if id in self._pending:
+            return self._pending_record(id)
         rows = await self._fetch(
-            f"SELECT *, EXTRACT(EPOCH FROM create_time)::BIGINT AS created_at "
-            f"FROM {self.table} WHERE workspace = %(ws)s AND id = %(id)s",
+            f"SELECT id, {', '.join(self._columns)}, {CREATED} FROM {self.table} "
+            "WHERE workspace = %(ws)s AND id = %(id)s",
             {"ws": self.workspace, "id": id},
         )
-        if not rows:
-            return None
-        row = dict(rows[0])
-        row.pop("content_vector", None)  # not JSON-serializable; use get_vectors_by_ids
-        return row
+        return self._record(rows[0]) if rows else None
 
     async def get_by_ids(self, ids: List[str]) -> List[Dict[str, Any]]:
         if not ids:
             return []
         rows = await self._fetch(
-            f"SELECT *, EXTRACT(EPOCH FROM create_time)::BIGINT AS created_at "
-            f"FROM {self.table} WHERE workspace = %(ws)s AND id = ANY(%(ids)s)",
+            f"SELECT id, {', '.join(self._columns)}, {CREATED} FROM {self.table} "
+            "WHERE workspace = %(ws)s AND id = ANY(%(ids)s)",
             {"ws": self.workspace, "ids": list(ids)},
         )
-        out = []
-        for r in rows:
-            r = dict(r)
-            r.pop("content_vector", None)
-            out.append(r)
-        return out
+        found = {r["id"]: self._record(r) for r in rows}
+        for id_ in ids:
+            if id_ in self._pending:
+                found[id_] = self._pending_record(id_)
+        return [found[i] for i in ids if i in found]
 
     async def get_vectors_by_ids(self, ids: List[str]) -> Dict[str, List[float]]:
+        """The embedding of every id asked for, including ones not yet written."""
         if not ids:
             return {}
-        rows = await self._fetch(
-            f"SELECT id, content_vector::text AS vec FROM {self.table} "
-            f"WHERE workspace = %(ws)s AND id = ANY(%(ids)s)",
-            {"ws": self.workspace, "ids": list(ids)},
-        )
-        result: Dict[str, List[float]] = {}
-        for r in rows:
-            raw = r.get("vec")
-            if raw:
-                result[r["id"]] = [float(x) for x in raw.strip("[]").split(",") if x]
+
+        async def attempt():
+            async with self._connection() as conn:
+                async with conn.cursor(binary=True) as cur:
+                    await cur.execute(
+                        f"SELECT id, content_vector FROM {self.table} "
+                        "WHERE workspace = %(ws)s AND id = ANY(%(ids)s)",
+                        {"ws": self.workspace, "ids": list(ids)},
+                    )
+                    return await cur.fetchall()
+
+        from lightrag_agensgraph.kg._engine import run_with_retry
+
+        result = {
+            id_: vector.tolist() for id_, vector in await run_with_retry(self._retry, attempt, wrote=False)
+        }
+        waiting = [i for i in ids if i in self._pending and i not in result]
+        if waiting:
+            for id_, vector in zip(
+                waiting, await self._embed([self._pending[i]["content"] for i in waiting])
+            ):
+                result[id_] = vector.tolist()
         return result
+
+    # ---- deletes ----
 
     async def delete(self, ids: List[str]) -> None:
         if not ids:
             return
+        for id_ in ids:
+            self._pending.pop(id_, None)
         await self._run(
             f"DELETE FROM {self.table} WHERE workspace = %(ws)s AND id = ANY(%(ids)s)",
             {"ws": self.workspace, "ids": list(ids)},
         )
 
     async def delete_entity(self, entity_name: str) -> None:
-        entity_id = compute_mdhash_id(entity_name, prefix="ent-")
+        for id_ in [i for i, item in self._pending.items() if item.get("entity_name") == entity_name]:
+            self._pending.pop(id_)
         await self._run(
             f"DELETE FROM {VECTOR_ENTITY_TABLE} "
-            f"WHERE workspace = %(ws)s AND (id = %(id)s OR entity_name = %(name)s)",
-            {"ws": self.workspace, "id": entity_id, "name": entity_name},
+            "WHERE workspace = %(ws)s AND (id = %(id)s OR entity_name = %(name)s)",
+            {"ws": self.workspace, "id": compute_mdhash_id(entity_name, prefix="ent-"), "name": entity_name},
         )
 
     async def delete_entity_relation(self, entity_name: str) -> None:
+        for id_ in [
+            i for i, item in self._pending.items() if entity_name in (item.get("src_id"), item.get("tgt_id"))
+        ]:
+            self._pending.pop(id_)
         await self._run(
             f"DELETE FROM {VECTOR_RELATION_TABLE} "
-            f"WHERE workspace = %(ws)s AND (source_id = %(name)s OR target_id = %(name)s)",
+            "WHERE workspace = %(ws)s AND (src_id = %(name)s OR tgt_id = %(name)s)",
             {"ws": self.workspace, "name": entity_name},
         )
 
     async def drop(self) -> Dict[str, str]:
         try:
-            await self._run(
-                f"DELETE FROM {self.table} WHERE workspace = %(ws)s",
-                {"ws": self.workspace},
-            )
+            self._pending.clear()
+            await self._run(f"DELETE FROM {self.table} WHERE workspace = %(ws)s", {"ws": self.workspace})
             return {"status": "success", "message": "data dropped"}
-        except Exception as e:  # pragma: no cover - defensive
-            logger.error(f"Error dropping vector namespace {self.namespace}: {e}")
+        except Exception as e:
+            logger.error("Error dropping vector namespace %s: %s", self.namespace, e)
             return {"status": "error", "message": str(e)}
+
+
+__all__ = ["AgensgraphVectorStorage"]

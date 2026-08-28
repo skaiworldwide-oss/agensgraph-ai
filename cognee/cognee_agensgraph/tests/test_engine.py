@@ -60,11 +60,24 @@ async def test_a_second_initialize_sends_nothing(adapter, statements):
 async def test_one_statement_costs_one_round_trip(adapter, statements):
     ent = Ent(name="Alice")
     await adapter.add_nodes([ent])
-    statements.reset()
-    await adapter.get_node(str(ent.id))
-    # No SET graph_path, no BEGIN, no COMMIT: the graph is bound to the connection
-    # and the connection is in autocommit mode.
-    assert len(statements) == 1
+    # A few times: a call that lands on a fresh pooled connection also runs that
+    # connection's one-time setup, so the round-trip claim is about a warm call.
+    counts = []
+    for _ in range(5):
+        statements.reset()
+        await adapter.get_node(str(ent.id))
+        sent = statements.statements
+        # The adapter opens no transaction of its own: the connection is in autocommit
+        # mode. (The driver may re-bind a fresh connection's graph once; that is its
+        # own connection maintenance, not the per-checkout SET graph_path this replaced.)
+        assert not any(
+            s.lower().startswith(("begin", "commit", "start transaction")) for s in sent
+        ), sent
+        assert sum(1 for s in sent if "match" in s.lower()) == 1, sent
+        counts.append(len(sent))
+    # On a warm connection the read is a single round trip; the old code sent
+    # SET graph_path on every checkout, which would make every call two.
+    assert min(counts) == 1, counts
 
 
 async def test_graph_and_vector_adapters_share_one_pool(adapter, conn_url, embedding_engine):

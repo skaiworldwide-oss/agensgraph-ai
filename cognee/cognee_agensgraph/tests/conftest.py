@@ -23,6 +23,7 @@ from typing import List
 import agensgraph
 import numpy as np
 import pytest
+import pytest_asyncio
 
 import cognee_agensgraph  # noqa: F401  (registers the adapters)
 
@@ -141,3 +142,22 @@ def scanned_tables(plan: str) -> List[str]:
     not the scan a test is looking for.
     """
     return [table for table, rows in _SEQ_SCAN.findall(plan) if int(rows) > 0]
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def _close_engine_pools():
+    """Close each engine's pool for this test's event loop before the loop is torn down.
+
+    pytest-asyncio gives every test its own event loop. The engine keeps one pool per
+    loop, and a loop closed while its pool is open hangs in asyncio's task cancellation,
+    waiting on a pool worker's network read that never returns. Production runs one loop
+    for the whole process, so this is a test-lifecycle concern, not a runtime one.
+    """
+    yield
+    from cognee_agensgraph.infrastructure.databases.graph.agensgraph import _engine
+
+    for engine in list(_engine._ENGINES.values()):
+        try:
+            await engine.aclose()
+        except Exception:
+            pass

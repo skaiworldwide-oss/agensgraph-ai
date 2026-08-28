@@ -20,7 +20,7 @@ from lightrag import LightRAG
 from lightrag.kg.shared_storage import initialize_pipeline_status
 
 from . import config
-from .models import EMBED_DIM, get_embed_func, get_llm_func
+from .models import get_embed_func, get_llm_func
 
 # A general-purpose ontology that suits encyclopedic + news text. Demos override
 # via the ``entity_types`` argument when a domain-specific set fits better.

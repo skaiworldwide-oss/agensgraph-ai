@@ -7,7 +7,7 @@ from lightrag.utils import EmbeddingFunc
 # import nest_asyncio
 # nest_asyncio.apply()
 #########
-import lightrag_agensgraph
+import lightrag_agensgraph  # noqa: F401  (registers the AgensGraph storages)
 
 os.environ["AGENSGRAPH_DB"] = ""
 os.environ["AGENSGRAPH_USER"] = ""
@@ -109,7 +109,8 @@ custom_kg = {
     ],
     "chunks": [
         {
-            "content": "ProductX, developed by CompanyA, has revolutionized the market with its cutting-edge features.",
+            "content": "ProductX, developed by CompanyA, has revolutionized the market "
+            "with its cutting-edge features.",
             "source_id": "Source1",
             "source_chunk_index": 0,
         },
@@ -119,12 +120,14 @@ custom_kg = {
             "chunk_order_index": 1,
         },
         {
-            "content": "PersonA is a prominent researcher at UniversityB, focusing on artificial intelligence and machine learning.",
+            "content": "PersonA is a prominent researcher at UniversityB, focusing on artificial "
+            "intelligence and machine learning.",
             "source_id": "Source2",
             "source_chunk_index": 0,
         },
         {
-            "content": "EventY, held in CityC, attracts technology enthusiasts and companies from around the globe.",
+            "content": "EventY, held in CityC, attracts technology enthusiasts and companies "
+            "from around the globe.",
             "source_id": "Source3",
             "source_chunk_index": 0,
         },

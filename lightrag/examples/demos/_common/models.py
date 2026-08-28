@@ -10,7 +10,6 @@ the environment. Override the models with ``DEMO_LLM_MODEL`` / ``DEMO_EMBED_MODE
 from __future__ import annotations
 
 import os
-from functools import partial
 
 from lightrag.llm.openai import gpt_4o_mini_complete, openai_complete_if_cache, openai_embed
 from lightrag.utils import EmbeddingFunc, wrap_embedding_func_with_attrs

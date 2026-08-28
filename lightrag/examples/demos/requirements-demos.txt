@@ -2,7 +2,7 @@
 #   uv venv .venv --python 3.13
 #   uv pip install -e . -r examples/demos/requirements-demos.txt
 # (psycopg + pgvector come in via lightrag-agensgraph itself.)
-lightrag-hku>=1.5.3,<1.6
+lightrag-hku>=1.5.6,<1.6
 openai>=1.40
 datasets>=2.19
 huggingface-hub>=0.23

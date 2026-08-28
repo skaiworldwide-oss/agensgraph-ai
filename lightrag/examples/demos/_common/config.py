@@ -82,34 +82,32 @@ def apply_env(db: str, *, workspace: str = "") -> None:
     if pwd:
         os.environ["AGENSGRAPH_PASSWORD"] = pwd
     else:
-        # psycopg/libpq under trust auth is happy with an empty password; set one
-        # so the integration's `password='{...}'` conninfo fragment is well-formed.
+        # The integration requires the variable to exist; under trust auth it is empty.
         os.environ.setdefault("AGENSGRAPH_PASSWORD", "")
 
 
 def _conninfo(dbname: str) -> str:
-    pwd = password() or ""
-    return (
-        f"dbname='{dbname}' user='{user()}' password='{pwd}' "
-        f"host='{host()}' port={port()}"
-    )
+    from psycopg.conninfo import make_conninfo
+
+    parts = {"dbname": dbname, "user": user(), "host": host(), "port": port()}
+    if password():
+        parts["password"] = password()
+    return make_conninfo(**parts)
 
 
 def ensure_db(db: str) -> None:
-    """Create ``db`` and its ``vector`` extension if they don't exist (psycopg).
+    """Create ``db`` and its ``vector`` extension if they don't exist.
 
-    ``psql`` isn't on PATH in this environment, so database setup goes through
-    psycopg. ``CREATE DATABASE`` can't run inside a transaction, hence autocommit.
+    ``CREATE DATABASE`` can't run inside a transaction, hence autocommit.
     """
-    import psycopg
+    import agensgraph
+    from psycopg import sql
 
-    with psycopg.connect(_conninfo("postgres"), autocommit=True) as conn:
-        exists = conn.execute(
-            "SELECT 1 FROM pg_database WHERE datname = %s", (db,)
-        ).fetchone()
+    with agensgraph.connect(_conninfo("postgres"), autocommit=True) as conn:
+        exists = conn.execute("SELECT 1 FROM pg_database WHERE datname = %s", (db,)).fetchone()
         if not exists:
-            conn.execute(f'CREATE DATABASE "{db}"')
-    with psycopg.connect(_conninfo(db), autocommit=True) as conn:
+            conn.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(db)))
+    with agensgraph.connect(_conninfo(db), autocommit=True) as conn:
         conn.execute("CREATE EXTENSION IF NOT EXISTS vector")
 
 

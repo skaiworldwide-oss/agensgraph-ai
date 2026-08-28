@@ -59,12 +59,16 @@ include = ["/lightrag_agensgraph", "/tests", "/README.md", "/LICENSE"]
 
 [tool.ruff]
 line-length = 110
+# The notebooks are executed output, not source.
+extend-exclude = ["*.ipynb"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I"]
 
 [tool.ruff.lint.per-file-ignores]
 "tests/**" = ["E501"]
+# The demo scripts put their own folder on sys.path before importing from it.
+"examples/**" = ["E402", "I001"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

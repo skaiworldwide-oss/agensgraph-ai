@@ -32,7 +32,8 @@ cp langchain/examples/demos/.env.example langchain/examples/demos/.env
 
 `.env` only needs `OPENAI_API_KEY`. The AgensGraph connection defaults to the
 local dev instance (`localhost:55432`, database `agensgraph_demos`, trust auth);
-override with `AGENSGRAPH_*` / `AGENSGRAPH_URL` if yours differs.
+override with `AGENSGRAPH_*` / `AGENSGRAPH_URL` if yours differs. The server has to be
+AgensGraph 2.17 or later.
 
 ## Running
 

@@ -39,7 +39,7 @@ pip install -U langchain-agensgraph
 
 ### AgensGraph requirements
 
-AgensGraph 2.17+ is recommended. AgensGraph does **not** bundle the pgvector or `meta` extensions; build and install them against your AgensGraph install's `pg_config`:
+AgensGraph 2.17 or later is required; `agensgraph-python` 2.0 refuses an older server at connect. AgensGraph does **not** bundle the pgvector or `meta` extensions; build and install them against your AgensGraph install's `pg_config`:
 
 ```bash
 # pgvector

@@ -27,7 +27,8 @@ value bound as a parameter, embeddings carried in binary.
 - Python 3.11 or later
 - `lightrag-hku` 1.5.6 (the `>=1.5.6,<1.6` range)
 - `agensgraph-python` 2.0
-- A running **AgensGraph** 2.16 or later with the `vector` extension available.
+- A running **AgensGraph** 2.17 or later with the `vector` extension available.
+  `agensgraph-python` 2.0 refuses an older server at connect.
   The stores create it in the database on first use if the role may; otherwise
   run `CREATE EXTENSION vector;` once.
 

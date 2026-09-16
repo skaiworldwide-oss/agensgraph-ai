@@ -29,8 +29,8 @@ for all embeddings + LLM calls (nothing runs on a local model).
 
 ## What you'll need
 
-- A running **AgensGraph** with the `vector` extension (the local dev instance on
-  `localhost:55432` works out of the box — each demo creates its own database).
+- A running **AgensGraph** 2.17 or later with the `vector` extension (the local dev instance
+  on `localhost:55432` works out of the box — each demo creates its own database).
 - An **OpenAI API key**.
 - Python 3.11+ and [`uv`](https://github.com/astral-sh/uv) (or `pip`).
 

@@ -64,10 +64,12 @@ The `mcp` extra is for the other case: hosting a server yourself over HTTP or SS
 ## Database requirements
 
 The Python install is only half of the setup. These integrations talk to a running
-AgensGraph, 2.17 or newer recommended, and the vector-backed features need the `pgvector`
+AgensGraph, 2.17 or newer, and the vector-backed features need the `pgvector`
 and `meta` extensions, which AgensGraph does not bundle — see
 [langchain/README.md](./langchain/README.md#agensgraph-requirements) for how to build and
-enable them.
+enable them. `SHOW agversion` tells you which you have. From 2.18 a release reports four
+numbers, such as `2.18.4.0`, with `-rc1` on a release candidate; the first two are the line,
+so `2.18.6.0-rc1` is a 2.18 server.
 
 # 🎯 Purpose
 This repository is designed to help developers:

@@ -36,7 +36,7 @@ Short, single-feature notebooks:
 ## Requirements
 
 - Python 3.10+
-- AgensGraph with the `vector` extension (for vector / HNSW search). The `meta`
+- AgensGraph 2.17 or later with the `vector` extension (for vector / HNSW search). The `meta`
   extension is used for schema introspection when present, with a catalog
   fallback otherwise.
 

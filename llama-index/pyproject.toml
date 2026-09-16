@@ -35,7 +35,7 @@ classifiers = [
 ]
 dependencies = [
     "llama-index-core>=0.12,<0.15",
-    "agensgraph-python>=1.0.3",
+    "agensgraph-python>=2.0.0",
     "psycopg[binary]>=3.3.4,<4.0.0",
 ]
 

@@ -23,8 +23,8 @@ These demos run on real public datasets (Wikipedia, CC-News, a Python repo) and 
 
 ## What you'll need
 
-- A running **AgensGraph** with the `vector` extension (the local dev instance on
-  `localhost:55432` works out of the box — each demo creates its own database).
+- A running **AgensGraph** 2.17 or later with the `vector` extension (the local dev instance
+  on `localhost:55432` works out of the box — each demo creates its own database).
 - An **OpenAI API key**.
 - The `cognee` venv (already set up at `cognee/.venv`).
 

@@ -28,7 +28,7 @@ uv pip install --python .venv/bin/python \
     -r requirements-demos.txt
 ```
 
-Connection defaults to the local AgensGraph (`127.0.0.1:55432`, trust auth); override via
+Connection defaults to the local AgensGraph (`127.0.0.1:55432`, trust auth; 2.17 or later); override via
 `AGENS_HOST/PORT/USER/PASSWORD` or a `.env` (copy `.env.example`). Demos 01–04 use their own
 databases (`mcp_flights`, `mcp_memory`), so nothing collides with other suites. Demo 05 is the
 exception on purpose: it reads the shared `agensgraph_demos` database, which is what makes it a

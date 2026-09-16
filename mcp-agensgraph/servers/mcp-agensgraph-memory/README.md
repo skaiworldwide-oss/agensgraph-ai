@@ -254,6 +254,8 @@ mcp-agensgraph-memory --transport http \
 
 ### 📦 Prerequisites
 
+A running AgensGraph 2.17 or later. The driver refuses an older server at connect.
+
 1. Install `uv` (Universal Virtualenv):
 ```bash
 # Using pip

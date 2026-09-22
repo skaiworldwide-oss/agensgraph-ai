@@ -135,14 +135,13 @@ id)` order with a cursor, strict reads by id, resolution of a source file to the
 documents it produced, and listing and repairing sources with more than one
 primary document.
 
-### Upgrading from the previous layout
+### Upgrading from 0.2.0
 
-The document status table and the vector tables of the previous development
-layout are brought to the current one in place, keeping their rows, the first
-time a store starts. The graph is not: the previous layout stored relations in
-extraction order and could hold the same relation twice, and the unique index on
-the pair refuses such a graph. Drop the graph (`DROP GRAPH chunk_entity_relation
-CASCADE;`) and ingest again.
+The document status table and the vector tables written by 0.2.0 are brought to
+the current layout in place, keeping their rows, the first time a store starts.
+The graph is not: 0.2.0 stored relations in extraction order and could hold the
+same relation twice, and the unique index on the pair refuses such a graph. Drop
+the graph (`DROP GRAPH chunk_entity_relation CASCADE;`) and ingest again.
 
 ## Configuration
 
@@ -255,19 +254,19 @@ What the table says:
 
 ## Demos
 
-A runnable demo suite lives in [`examples/demos/`](./examples/demos): five
+A runnable demo suite lives in [`examples/demos/`](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/lightrag/examples/demos): five
 focused examples on real public datasets (Wikipedia, CC-News), each with its own
 README and an executed notebook.
 
 | Demo | What it shows |
 |---|---|
-| [01 · KG modes](./examples/demos/01_kg_modes) | build a knowledge graph from Wikipedia, then compare all five query modes |
-| [02 · Incremental](./examples/demos/02_incremental) | incremental ingestion, the document status pipeline, cross-document entity merging |
-| [03 · Explore](./examples/demos/03_kg_explore) | explore the extracted graph (top entities, search, subgraph export) and a multi-hop question |
-| [04 · Curation](./examples/demos/04_curation) | merge, edit and delete entities, relations and documents |
-| [05 · Workspace](./examples/demos/05_workspace) | two tenants, isolated, in one database |
+| [01 · KG modes](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/lightrag/examples/demos/01_kg_modes) | build a knowledge graph from Wikipedia, then compare all five query modes |
+| [02 · Incremental](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/lightrag/examples/demos/02_incremental) | incremental ingestion, the document status pipeline, cross-document entity merging |
+| [03 · Explore](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/lightrag/examples/demos/03_kg_explore) | explore the extracted graph (top entities, search, subgraph export) and a multi-hop question |
+| [04 · Curation](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/lightrag/examples/demos/04_curation) | merge, edit and delete entities, relations and documents |
+| [05 · Workspace](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/lightrag/examples/demos/05_workspace) | two tenants, isolated, in one database |
 
-Start at [`examples/demos/README.md`](./examples/demos/README.md).
+Start at [`examples/demos/README.md`](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/lightrag/examples/demos/README.md).
 
 ## Tests
 
@@ -278,3 +277,7 @@ reporting success.
 AGENSGRAPH_DB=lightrag_test AGENSGRAPH_USER=postgres AGENSGRAPH_PASSWORD=postgres \
   AGENSGRAPH_HOST=localhost AGENSGRAPH_PORT=5432 pytest
 ```
+
+## License
+
+Apache-2.0.

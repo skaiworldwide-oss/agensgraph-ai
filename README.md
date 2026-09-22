@@ -1,18 +1,22 @@
-🧠 AgensGraph AI Tools and Libraries
-====================================
+# AgensGraph AI
 
-Welcome to [AgensGraph AI](https://github.com/skaiworldwide-oss/agensgraph-ai) — a curated collection of tools, integrations, and starter templates for building AI-powered applications that work with [AgensGraph](https://github.com/skaiworldwide-oss/agensgraph), a PostgreSQL-based multi-model graph database.
+Integrations, tools and starter material for building AI applications on
+[AgensGraph](https://github.com/skaiworldwide-oss/agensgraph), the PostgreSQL-based graph
+database. Every integration here runs on the
+[`agensgraph-python`](https://pypi.org/project/agensgraph-python/) 2.0 driver.
 
-This repository currently includes:
-* [LangChain](./langchain/) — LLM agents, tools, and chains
-* [LlamaIndex](./llama-index/) — custom data indexing and retrieval
-* [LightRag](./lightrag/) — graph-aware RAG for accurate, context-rich retrieval
-* [cognee](./cognee) — dynamic memory for Agents
-* [mcp](./mcp-agensgraph/) — Model Context Protocol server for AgensGraph enabling database access and graph exploration.
+| Integration | Package | What it gives you |
+| --- | --- | --- |
+| [LangChain](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/langchain) | `langchain-agensgraph` | a graph store and a vector store, three retrievers, a text2cypher chain, a LangGraph checkpointer and long-term memory store, chat message history |
+| [LlamaIndex](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/llama-index) | `llama-index-agensgraph` | a property graph store for `PropertyGraphIndex` and a vector store for `VectorStoreIndex` |
+| [LightRAG](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/lightrag) | `lightrag-agensgraph` | all four LightRAG storages — graph, vectors, key-value, document status — in one database |
+| [cognee](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/cognee) | `cognee-agensgraph` | cognee's graph store and vector store in one database |
+| [MCP](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/mcp-agensgraph) | `mcp-agensgraph-cypher`, `mcp-agensgraph-memory`, `mcp-agensgraph-data-modeling` | three Model Context Protocol servers: Cypher over a graph, a knowledge-graph memory, and graph data modeling |
 
-> ✅ Each library has its own subfolder with a dedicated README to guide you through setup and usage.
+Each directory has a README of its own with setup and usage, and an `examples/demos/` suite
+that runs on real datasets.
 
-# 📦 Installation
+## Installation
 
 The `agensgraph-ai` package installs any combination of the integrations under one name.
 Pick the ones you need:
@@ -61,27 +65,22 @@ them itself with `uvx`, which needs no install at all:
 
 The `mcp` extra is for the other case: hosting a server yourself over HTTP or SSE.
 
-## Database requirements
+## Requirements
 
-The Python install is only half of the setup. These integrations talk to a running
-AgensGraph, 2.17 or newer, and the vector-backed features need the `pgvector`
-and `meta` extensions, which AgensGraph does not bundle — see
-[langchain/README.md](./langchain/README.md#agensgraph-requirements) for how to build and
-enable them. `SHOW agversion` tells you which you have. From 2.18 a release reports four
-numbers, such as `2.18.4.0`, with `-rc1` on a release candidate; the first two are the line,
-so `2.18.6.0-rc1` is a 2.18 server.
+- Python 3.11 or later.
+- A running AgensGraph 2.17 or later; the driver refuses an older server at connect.
+  `SHOW agversion` tells you which you have. From 2.18 a release reports four numbers, such
+  as `2.18.4.0`, with `-rc1` on a release candidate; the first two are the line, so
+  `2.18.6.0-rc1` is a 2.18 server.
+- The vector-backed features need the `pgvector` extension, and schema introspection is
+  faster with the `meta` extension. AgensGraph bundles neither; see
+  [how to build them](https://github.com/skaiworldwide-oss/agensgraph-ai/blob/main/langchain/README.md#agensgraph-requirements).
 
-# 🎯 Purpose
-This repository is designed to help developers:
-* Integrate AgensGraph with modern LLM frameworks
-* Leverage graph data in conversational and intelligent apps
-* Explore Retrieval-Augmented Generation (RAG), agents, and graph reasoning
+## License
 
-Everything is open-source and modular — feel free to use, fork, or contribute.
+Apache License 2.0 — see
+[LICENSE](https://github.com/skaiworldwide-oss/agensgraph-ai/blob/main/LICENSE).
 
-# 📄 License
-This repository is licensed under the [Apache License 2.0](./LICENSE).
+## Contact
 
-# 📬 Contact
-For questions, feature requests, or collaboration:
-* Open an [Issue](https://github.com/skaiworldwide-oss/agensgraph-ai/issues) or Pull Request
+Open an [issue](https://github.com/skaiworldwide-oss/agensgraph-ai/issues) or a pull request.

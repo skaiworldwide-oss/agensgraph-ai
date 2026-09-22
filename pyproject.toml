@@ -1,6 +1,6 @@
 [project]
 name = "agensgraph-ai"
-version = "0.3.0"
+version = "0.3.1"
 description = "Umbrella installer for the AgensGraph AI integrations (LangChain, LlamaIndex, LightRAG, cognee, MCP)."
 readme = "README.md"
 requires-python = ">=3.11"

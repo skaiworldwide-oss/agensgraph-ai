@@ -1,6 +1,6 @@
 [project]
 name = "mcp-agensgraph-memory"
-version = "0.3.0"
+version = "0.3.1"
 description = "AgensGraph knowledge-graph memory MCP server (entities, relations, observations)."
 readme = "README.md"
 requires-python = ">=3.11,<4.0"

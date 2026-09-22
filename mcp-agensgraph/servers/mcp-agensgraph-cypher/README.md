@@ -195,7 +195,7 @@ Alternatively, using the released package:
 "mcpServers": {
   "agensgraph-cypher": {
     "command": "uvx",
-    "args": [ "mcp-agensgraph-cypher@0.3.0", "--transport", "stdio"  ],
+    "args": [ "mcp-agensgraph-cypher", "--transport", "stdio"  ],
     "env": {
       "AGENSGRAPH_URL": "postgresql://<host>:<port>",
       "AGENSGRAPH_USERNAME": "<your-username>",
@@ -258,7 +258,7 @@ Alternatively, using the released package with namespaces:
   "mcpServers": {
     "graph1-agensgraph": {
       "command": "uvx",
-      "args": [ "mcp-agensgraph-cypher@0.3.0", "--namespace", "graph1" ],
+      "args": [ "mcp-agensgraph-cypher", "--namespace", "graph1" ],
       "env": {
         "AGENSGRAPH_URL": "postgresql://<host>:<port>",
         "AGENSGRAPH_USERNAME": "<your-username>",
@@ -269,7 +269,7 @@ Alternatively, using the released package with namespaces:
     },
     "graph2-agensgraph": {
       "command": "uvx",
-      "args": [ "mcp-agensgraph-cypher@0.3.0", "--namespace", "graph2" ],
+      "args": [ "mcp-agensgraph-cypher", "--namespace", "graph2" ],
       "env": {
         "AGENSGRAPH_URL": "postgresql://<host>:<port>",
         "AGENSGRAPH_USERNAME": "<your-username>",
@@ -296,7 +296,7 @@ Syntax with `--db-url`, `--username`, `--password` and other command line argume
   "agensgraph": {
     "command": "uvx",
     "args": [
-      "mcp-agensgraph-cypher@0.3.0",
+      "mcp-agensgraph-cypher",
       "--db-url",
       "postgresql://<host>:<port>",
       "--database",

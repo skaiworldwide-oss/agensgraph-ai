@@ -2,7 +2,7 @@
   "mcpServers": {
     "agensgraph-cypher": {
       "command": "uvx",
-      "args": ["mcp-agensgraph-cypher@0.2.0", "--transport", "stdio"],
+      "args": ["mcp-agensgraph-cypher", "--transport", "stdio"],
       "env": {
         "AGENSGRAPH_URL": "postgresql://127.0.0.1:55432",
         "AGENSGRAPH_USERNAME": "<your-username>",
@@ -13,7 +13,7 @@
     },
     "agensgraph-memory": {
       "command": "uvx",
-      "args": ["mcp-agensgraph-memory@0.2.0", "--transport", "stdio"],
+      "args": ["mcp-agensgraph-memory", "--transport", "stdio"],
       "env": {
         "AGENSGRAPH_URL": "postgresql://127.0.0.1:55432",
         "AGENSGRAPH_USERNAME": "<your-username>",
@@ -24,7 +24,7 @@
     },
     "agensgraph-data-modeling": {
       "command": "uvx",
-      "args": ["mcp-agensgraph-data-modeling@0.2.0", "--transport", "stdio"]
+      "args": ["mcp-agensgraph-data-modeling", "--transport", "stdio"]
     }
   }
 }

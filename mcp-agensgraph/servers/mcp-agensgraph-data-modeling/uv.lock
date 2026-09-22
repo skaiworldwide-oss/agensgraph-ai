@@ -1166,7 +1166,7 @@ wheels = [
 
 [[package]]
 name = "mcp-agensgraph-common"
-version = "0.3.0"
+version = "0.3.1"
 source = { editable = "../mcp-agensgraph-common" }
 dependencies = [
     { name = "agensgraph-python" },
@@ -1199,7 +1199,7 @@ dev = [
 
 [[package]]
 name = "mcp-agensgraph-data-modeling"
-version = "0.3.0"
+version = "0.3.1"
 source = { editable = "." }
 dependencies = [
     { name = "agensgraph-python" },

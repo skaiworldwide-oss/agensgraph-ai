@@ -137,6 +137,7 @@ if __name__ == "__main__":
 ## Requirements
 
 - Python >= 3.11, < 3.14
+- cognee 0.2 (the `>=0.2.1,<0.3` range; 0.3 and later changed the graph interface)
 - AgensGraph 2.17 or later, with the `vector` extension available for the vector adapter
 - agensgraph-python >= 2.0.0 (installed with the package)
 

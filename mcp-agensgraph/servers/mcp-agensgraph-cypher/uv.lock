@@ -10,45 +10,16 @@ resolution-markers = [
 
 [[package]]
 name = "agensgraph-python"
-source = { editable = "../../../../agensgraph-python" }
+version = "2.0.0"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "msgspec" },
     { name = "psycopg", extra = ["binary"] },
     { name = "psycopg-pool" },
 ]
-
-[package.metadata]
-requires-dist = [
-    { name = "msgspec", specifier = ">=0.19" },
-    { name = "opentelemetry-api", marker = "extra == 'otel'", specifier = ">=1.33" },
-    { name = "pandas", marker = "extra == 'pandas'", specifier = ">=2.2" },
-    { name = "polars", marker = "extra == 'polars'", specifier = ">=1.0" },
-    { name = "psycopg", extras = ["binary"], specifier = ">=3.3.4" },
-    { name = "psycopg-pool", specifier = ">=3.3.1" },
-    { name = "pyarrow", marker = "extra == 'arrow'", specifier = ">=17" },
-]
-provides-extras = ["arrow", "otel", "pandas", "polars"]
-
-[package.metadata.requires-dev]
-dev = [
-    { name = "hypothesis", specifier = ">=6.100" },
-    { name = "mypy", specifier = ">=1.13" },
-    { name = "pytest", specifier = ">=8.3" },
-    { name = "pytest-asyncio", specifier = ">=0.24" },
-    { name = "ruff", specifier = "==0.16.1" },
-    { name = "sqlalchemy", specifier = ">=2.0.31" },
-    { name = "typing-extensions", specifier = ">=4.12" },
-]
-lint = [{ name = "ruff", specifier = "==0.16.1" }]
-tests = [
-    { name = "hypothesis", specifier = ">=6.100" },
-    { name = "pytest", specifier = ">=8.3" },
-    { name = "pytest-asyncio", specifier = ">=0.24" },
-    { name = "sqlalchemy", specifier = ">=2.0.31" },
-]
-typing = [
-    { name = "mypy", specifier = ">=1.13" },
-    { name = "typing-extensions", specifier = ">=4.12" },
+sdist = { url = "https://files.pythonhosted.org/packages/0f/fe/d6bc49a1ba5a9c712f231b3ab8079388a1413571253826756d46412526e0/agensgraph_python-2.0.0.tar.gz", hash = "sha256:ee3cf60843dc415b387e41b7f3eab527e16f36236017021a282c3d5f23be107d", size = 382333, upload-time = "2026-09-17T23:02:47.387Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/9e/b8/2714df1942967ecaff27f397edff967efa9ea4f02f906cd3939e7da20ac5/agensgraph_python-2.0.0-py3-none-any.whl", hash = "sha256:b376eed9621298ed39b09e53e40e684382b7cb046d057cfe4f6e9c5299dfed2a", size = 222032, upload-time = "2026-09-17T23:02:45.191Z" },
 ]
 
 [[package]]
@@ -1066,7 +1037,7 @@ db = [
 
 [package.metadata]
 requires-dist = [
-    { name = "agensgraph-python", editable = "../../../../agensgraph-python" },
+    { name = "agensgraph-python", specifier = ">=2.0.0" },
     { name = "fastmcp", specifier = ">=3.0.0,<4.0.0" },
     { name = "psycopg", extras = ["binary", "pool"], marker = "extra == 'db'", specifier = ">=3.2.9,<4.0.0" },
     { name = "psycopg-pool", marker = "extra == 'db'", specifier = ">=3.2.6,<4.0.0" },
@@ -1109,7 +1080,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "agensgraph-python", editable = "../../../../agensgraph-python" },
+    { name = "agensgraph-python", specifier = ">=2.0.0" },
     { name = "fastmcp", specifier = ">=3.0.0,<4.0.0" },
     { name = "mcp-agensgraph-common", extras = ["db"], editable = "../mcp-agensgraph-common" },
     { name = "psycopg", extras = ["binary", "pool"], specifier = ">=3.2.9,<4.0.0" },

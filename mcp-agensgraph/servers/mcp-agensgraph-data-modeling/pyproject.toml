@@ -21,7 +21,6 @@ classifiers = [
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -30,7 +29,7 @@ classifiers = [
 ]
 dependencies = [
     "mcp-agensgraph-common>=0.3.0",
-    "agensgraph-python",
+    "agensgraph-python>=2.0.0",
     "fastmcp>=3.0.0,<4.0.0",
     "pydantic>=2.10.1",
 ]
@@ -52,7 +51,6 @@ include = ["/src", "/tests", "/README.md", "/LICENSE", "/NOTICE"]
 
 [tool.uv.sources]
 mcp-agensgraph-common = { path = "../mcp-agensgraph-common", editable = true }
-agensgraph-python = { path = "../../../../agensgraph-python", editable = true }
 
 [tool.uv]
 dev-dependencies = [

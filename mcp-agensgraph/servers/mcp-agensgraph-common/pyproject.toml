@@ -19,7 +19,6 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -27,7 +26,7 @@ classifiers = [
     "Topic :: Software Development :: Libraries",
 ]
 dependencies = [
-    "agensgraph-python",
+    "agensgraph-python>=2.0.0",
     "fastmcp>=3.0.0,<4.0.0",
     "pydantic>=2.10.1",
     "starlette>=0.47.0",
@@ -52,9 +51,6 @@ tokens = [
 Homepage = "https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/mcp-agensgraph"
 Repository = "https://github.com/skaiworldwide-oss/agensgraph-ai"
 Issues = "https://github.com/skaiworldwide-oss/agensgraph-ai/issues"
-
-[tool.uv.sources]
-agensgraph-python = { path = "../../../../agensgraph-python", editable = true }
 
 [build-system]
 requires = ["hatchling"]

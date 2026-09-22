@@ -111,7 +111,9 @@ def test_value_sanitize_reaches_into_nested_maps():
 
 def test_fit_rows_keeps_whole_rows():
     rows = [{"text": "word " * 100} for _ in range(20)]
-    kept, dropped = fit_rows(rows, token_limit=250)
+    # A row is about 105 tokens counted and 256 by the estimate, so this budget keeps some
+    # rows and drops others whichever measure is in use.
+    kept, dropped = fit_rows(rows, token_limit=600)
     assert 0 < len(kept) < len(rows)
     assert dropped == len(rows) - len(kept)
     # Whole rows, so what is kept still serializes and parses.

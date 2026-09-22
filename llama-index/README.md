@@ -36,13 +36,61 @@ Short, single-feature notebooks:
 ## Requirements
 
 - Python 3.11+
+- `agensgraph-python` 2.0, installed with the package
 - AgensGraph 2.17 or later with the `vector` extension (for vector / HNSW search). The `meta`
   extension is used for schema introspection when present, with a catalog
   fallback otherwise.
 
-## Changes since 0.1
+## What's new in 0.3.0
 
-Not released yet -- this is what is in the tree.
+Every statement goes through the [`agensgraph-python`](https://github.com/skaiworldwide-oss/agensgraph-python) 2.0 driver.
+
+- **An element is written on the label naming what it is.** `MATCH (n:Author)`
+  reads that label's storage and nothing else, so nothing has to keep a list of
+  types or a scalar copy of one beside every element. Measured on twenty thousand
+  of each of two types, counting one of them: 217 buffers by label against 335
+  through a btree over such a copy, which also cost an index entry on every
+  write. Each label carries its own uniqueness on `id`, because a constraint on
+  the label they inherit does not reach them.
+- **The embedding has a column of its own.** Read out of the property map it is
+  text in a bag that has to come out of TOAST and be parsed before a distance can
+  be taken, once per element a filter kept -- which is where a metadata-filtered
+  search spent its time. Over 20,000 entities with a filter keeping one in ten:
+  1,209 ms against 171 ms for the same complete answer -- 7x, and 111x against
+  the un-promoted path once both are asked for every row they were asked for.
+  The 180x first published here compared a complete answer against a partial one.
+  Decline it with `promote_embedding=False`.
+- **The query's mode is read.** `VectorStoreQuery.mode` was never looked at, so
+  every mode got a plain vector search. Hybrid, text search and MMR are answered
+  now, `alpha`/`sparse_top_k`/`hybrid_top_k` do what they say, a metadata filter
+  reaches both halves of a hybrid search, and `distance_strategy` takes `l2` and
+  `inner_product` as well as `cosine`.
+- **A generated statement runs read-only.** `SafeTextToCypherRetriever` runs what
+  a model wrote in a transaction the server will not let write, so what it may do
+  is the server's decision. A list of Cypher's write keywords is not that: it is
+  PostgreSQL underneath, so `INSERT`, `TRUNCATE`, `GRANT` and `COPY` are all
+  available and none of them is on such a list, while a read whose text merely
+  mentions DELETE looks like a write.
+- **True async.** All twelve async methods the contract declares are implemented
+  here. The base class answers most of them by calling the synchronous one, which
+  holds the event loop for the whole round trip: twelve concurrent rel maps ran in
+  76.9 ms with the loop doing nothing else at all, against 31.8 ms with it still
+  running other work. See [Async & connection pooling](#async--connection-pooling).
+- **Nothing is installed in your database.** Opening a store used to create three
+  plpgsql functions there. The catalogs answer the same questions, and faster: on
+  twenty thousand elements carrying embeddings, 1,213 ms of walking every one of
+  them against 19 ms.
+- **Performance.** Ingest is index-backed and near-linear (a btree index on the
+  `id` MERGE key; bulk `add`/`upsert` batched). Id-keyed lookups (`get`,
+  `get_nodes`, `get_triplets`, `get_rel_map`, `delete_nodes`) and the vector
+  store's `delete(ref_doc_id)` are index-backed rather than sequential scans,
+  relation upserts are UNWIND-batched per type, and schema introspection no
+  longer materializes every distinct property value. Metadata-filter keys can be
+  indexed with `create_property_index(...)`. See
+  [Performance & indexing](#performance--indexing).
+- AgensGraph 2.17 or later; an older server is refused at connect. Python 3.11 to 3.14.
+
+## Changes in 0.2.0
 
 - **`AgensPropertyGraphStore.vector_query` works.** It hard-coded a 3-dimension
   cast and ordered by a fixed literal vector, so results ignored the query
@@ -66,35 +114,9 @@ Not released yet -- this is what is in the tree.
   on the label naming what it is, and every such label inherits `"__Node__"` --
   and avoids Neo4j-only syntax, so `TextToCypherRetriever` generates runnable
   Cypher out of the box.
-- **A generated statement runs read-only.** `SafeTextToCypherRetriever` runs what
-  a model wrote in a transaction the server will not let write, so what it may do
-  is the server's decision. A list of Cypher's write keywords is not that: it is
-  PostgreSQL underneath, so `INSERT`, `TRUNCATE`, `GRANT` and `COPY` are all
-  available and none of them is on such a list, while a read whose text merely
-  mentions DELETE looks like a write.
 - **Lazy schema introspection.** `AgensPropertyGraphStore(refresh_schema=False)`
   defers the (O(N)) schema scan to the first `get_schema()`/`get_schema_str()`
   call, so opening a large existing graph is instant.
-- **An element is written on the label naming what it is.** `MATCH (n:Author)`
-  reads that label's storage and nothing else, so nothing has to keep a list of
-  types or a scalar copy of one beside every element. Measured on twenty thousand
-  of each of two types, counting one of them: 217 buffers by label against 335
-  through a btree over such a copy, which also cost an index entry on every
-  write. Each label carries its own uniqueness on `id`, because a constraint on
-  the label they inherit does not reach them.
-- **The embedding has a column of its own.** Read out of the property map it is
-  text in a bag that has to come out of TOAST and be parsed before a distance can
-  be taken, once per element a filter kept -- which is where a metadata-filtered
-  search spent its time. Over 20,000 entities with a filter keeping one in ten:
-  1,209 ms against 171 ms for the same complete answer -- 7x, and 111x against
-  the un-promoted path once both are asked for every row they were asked for.
-  The 180x first published here compared a complete answer against a partial one.
-  Decline it with `promote_embedding=False`.
-- **The query's mode is read.** `VectorStoreQuery.mode` was never looked at, so
-  every mode got a plain vector search. Hybrid, text search and MMR are answered
-  now, `alpha`/`sparse_top_k`/`hybrid_top_k` do what they say, a metadata filter
-  reaches both halves of a hybrid search, and `distance_strategy` takes `l2` and
-  `inner_product` as well as `cosine`.
 - **Correctness fixes.** Entity embeddings are persisted on `upsert_nodes` even
   when the entity has no source chunk; `get(ids=[])` returns nothing (instead of
   the whole graph); and depth-1 `get_rel_map` uses a fixed pattern (AgensGraph's
@@ -106,23 +128,6 @@ Not released yet -- this is what is in the tree.
   `min` / `max` / `distinct_count`, list properties get `min_size` / `max_size`,
   and other properties get example values + `distinct_count` (computed
   exhaustively under a row threshold, sampled above it).
-- **Performance.** Ingest is index-backed and near-linear (a btree index on the
-  `id` MERGE key; bulk `add`/`upsert` batched). Id-keyed lookups (`get`,
-  `get_nodes`, `get_triplets`, `get_rel_map`, `delete_nodes`) and the vector
-  store's `delete(ref_doc_id)` are index-backed rather than sequential scans,
-  relation upserts are UNWIND-batched per type, and schema introspection no
-  longer materializes every distinct property value. Metadata-filter keys can be
-  indexed with `create_property_index(...)`. See
-  [Performance & indexing](#performance--indexing).
-- **True async.** All twelve async methods the contract declares are implemented
-  here. The base class answers most of them by calling the synchronous one, which
-  holds the event loop for the whole round trip: twelve concurrent rel maps ran in
-  76.9 ms with the loop doing nothing else at all, against 31.8 ms with it still
-  running other work. See [Async & connection pooling](#async--connection-pooling).
-- **Nothing is installed in your database.** Opening a store used to create three
-  plpgsql functions there. The catalogs answer the same questions, and faster: on
-  twenty thousand elements carrying embeddings, 1,213 ms of walking every one of
-  them against 19 ms.
 - **Breaking change.** The deprecated triplet `AgensGraphStore` (Knowledge Graph
   Store) has been removed. Use `AgensPropertyGraphStore` with `PropertyGraphIndex`.
 

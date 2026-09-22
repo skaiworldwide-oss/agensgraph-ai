@@ -1,9 +1,9 @@
 [project]
 name = "agensgraph-ai"
-version = "0.2.0"
+version = "0.3.0"
 description = "Umbrella installer for the AgensGraph AI integrations (LangChain, LlamaIndex, LightRAG, cognee, MCP)."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
 authors = [
@@ -23,7 +23,6 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
-    "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
@@ -34,14 +33,14 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-langchain = ["langchain-agensgraph>=0.2"]
-llama-index = ["llama-index-agensgraph>=0.2"]
-lightrag = ["lightrag-agensgraph>=0.2"]
-cognee = ["cognee-agensgraph>=0.2"]
+langchain = ["langchain-agensgraph>=0.3"]
+llama-index = ["llama-index-agensgraph>=0.3"]
+lightrag = ["lightrag-agensgraph>=0.3"]
+cognee = ["cognee-agensgraph>=0.3"]
 mcp = [
-    "mcp-agensgraph-cypher>=0.2",
-    "mcp-agensgraph-memory>=0.2",
-    "mcp-agensgraph-data-modeling>=0.2",
+    "mcp-agensgraph-cypher>=0.3",
+    "mcp-agensgraph-memory>=0.3",
+    "mcp-agensgraph-data-modeling>=0.3",
 ]
 all = [
     "agensgraph-ai[langchain]",

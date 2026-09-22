@@ -18,7 +18,7 @@ from langchain_agensgraph.retrievers import (
 )
 from langchain_agensgraph.vectorstores.agensgraph_vector import AgensgraphVector
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 __all__ = [
     "AgensChatMessageHistory",

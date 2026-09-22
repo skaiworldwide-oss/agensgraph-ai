@@ -54,7 +54,7 @@ them itself with `uvx`, which needs no install at all:
 "mcpServers": {
   "agensgraph-cypher": {
     "command": "uvx",
-    "args": ["mcp-agensgraph-cypher@0.2.0", "--transport", "stdio"]
+    "args": ["mcp-agensgraph-cypher@0.3.0", "--transport", "stdio"]
   }
 }
 ```

@@ -34,11 +34,8 @@ value bound as a parameter, embeddings carried in binary.
 
 ## Install
 
-> 0.2.0 is in development and not on PyPI yet; install it from this repository.
-
 ```bash
-pip install lightrag-hku
-pip install -e .          # from the lightrag/ directory of this repository
+pip install lightrag-agensgraph
 ```
 
 ## Quickstart

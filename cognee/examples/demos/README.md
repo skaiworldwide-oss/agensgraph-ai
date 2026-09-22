@@ -26,16 +26,16 @@ These demos run on real public datasets (Wikipedia, CC-News, a Python repo) and 
 - A running **AgensGraph** 2.17 or later with the `vector` extension (the local dev instance
   on `localhost:55432` works out of the box — each demo creates its own database).
 - An **OpenAI API key**.
-- The `cognee` venv (already set up at `cognee/.venv`).
+- Python 3.11 to 3.13 and [`uv`](https://github.com/astral-sh/uv) (or `pip`).
 
 ## Quickstart
 
 From the `cognee/` directory of this repo:
 
 ```bash
-# 1. install the demo extras into the cognee venv
-.venv/bin/python -m pip install -r examples/demos/requirements-demos.txt
-#    (or: uv pip install --python .venv/bin/python -r examples/demos/requirements-demos.txt)
+# 1. install the integration + demo extras (uv)
+uv venv .venv --python 3.13
+uv pip install -e . -r examples/demos/requirements-demos.txt
 
 # 2. your OpenAI key
 cp examples/demos/.env.example examples/demos/.env     # then edit: OPENAI_API_KEY=...

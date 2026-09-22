@@ -21,29 +21,17 @@ Both adapters talk to the server through
 [agensgraph-python](https://github.com/skaiworldwide-oss/agensgraph-python), the
 AgensGraph driver.
 
-## Try the demos
+## Requirements
 
-The fastest way to see what this enables is the runnable demo suite in
-[`examples/demos/`](./examples/demos) — five focused examples on real public
-datasets (Wikipedia, CC-News, a Python repo), each with its own README and a
-**pre-executed notebook** you can read without running anything:
-
-| Demo | What it shows |
-|---|---|
-| [01 · Search modes](./examples/demos/01_search_modes) | Build a knowledge graph from Wikipedia, then query it ten ways — `GRAPH_COMPLETION` (+ summary / chain-of-thought / context-extension variants), `RAG_COMPLETION`, `INSIGHTS`, `CHUNKS`, `SUMMARIES`, `NATURAL_LANGUAGE`, and raw `CYPHER` |
-| [02 · Typed](./examples/demos/02_typed) | Ontology-guided extraction — make the graph follow *your* domain vocabulary |
-| [03 · Memory](./examples/demos/03_memory) | A multi-dataset memory layer — named datasets, `node_set` tags, incremental builds |
-| [04 · Code graph](./examples/demos/04_code_graph) | Turn a Python repo into a code knowledge graph; `SearchType.CODE` + visualize |
-| [05 · Explore](./examples/demos/05_explore) | Inspect the AgensGraph-backed graph — metrics, traversal, raw Cypher, HTML visualization |
-
-Start at [`examples/demos/README.md`](./examples/demos/README.md).
+- Python >= 3.11, < 3.14
+- cognee 0.2 (the `>=0.2.1,<0.3` range)
+- AgensGraph 2.17 or later, with the `vector` extension available for the vector adapter
+- agensgraph-python >= 2.0.0 (installed with the package)
 
 ## Installation
 
 ```bash
-# from the cognee/ directory of this repo
-pip install -e .          # installs cognee-agensgraph, cognee, and the agensgraph-python driver
-# (uv: uv pip install -e .)
+pip install cognee-agensgraph
 ```
 
 Then activate the adapters by importing the package once at startup:
@@ -133,13 +121,6 @@ async def main():
 if __name__ == "__main__":
     asyncio.run(main())
 ```
-
-## Requirements
-
-- Python >= 3.11, < 3.14
-- cognee 0.2 (the `>=0.2.1,<0.3` range; 0.3 and later changed the graph interface)
-- AgensGraph 2.17 or later, with the `vector` extension available for the vector adapter
-- agensgraph-python >= 2.0.0 (installed with the package)
 
 ## Configuration
 
@@ -304,6 +285,27 @@ Where the time went before, and what changed:
 > The vector embedding dimension is fixed when a collection's table is first
 > created; to change embedding models, drop the affected collection tables.
 
+## Demos
+
+The fastest way to see what this enables is the runnable demo suite in
+[`examples/demos/`](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/cognee/examples/demos) — five focused examples on real public
+datasets (Wikipedia, CC-News, a Python repo), each with its own README and a
+**pre-executed notebook** you can read without running anything:
+
+| Demo | What it shows |
+|---|---|
+| [01 · Search modes](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/cognee/examples/demos/01_search_modes) | Build a knowledge graph from Wikipedia, then query it ten ways — `GRAPH_COMPLETION` (+ summary / chain-of-thought / context-extension variants), `RAG_COMPLETION`, `INSIGHTS`, `CHUNKS`, `SUMMARIES`, `NATURAL_LANGUAGE`, and raw `CYPHER` |
+| [02 · Typed](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/cognee/examples/demos/02_typed) | Ontology-guided extraction — make the graph follow *your* domain vocabulary |
+| [03 · Memory](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/cognee/examples/demos/03_memory) | A multi-dataset memory layer — named datasets, `node_set` tags, incremental builds |
+| [04 · Code graph](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/cognee/examples/demos/04_code_graph) | Turn a Python repo into a code knowledge graph; `SearchType.CODE` + visualize |
+| [05 · Explore](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/cognee/examples/demos/05_explore) | Inspect the AgensGraph-backed graph — metrics, traversal, raw Cypher, HTML visualization |
+
+Start at [`examples/demos/README.md`](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/cognee/examples/demos/README.md).
+
 ## Contributing
 
 Contributions are welcome! Please open an issue or submit a Pull Request.
+
+## License
+
+Apache-2.0.

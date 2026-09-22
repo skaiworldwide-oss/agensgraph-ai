@@ -128,3 +128,7 @@ Twelve, all read-only and none of them a database lookup.
 `data_context` (what the data is, and what to pay attention to), `use_cases` (what the model
 has to answer), and optionally `desired_nodes` and `desired_relationships`. Give it sample data
 alongside the prompt.
+
+## 📄 License
+
+This MCP server is licensed under the Apache License 2.0, which is what `LICENSE`, `NOTICE` and the package metadata declare. You are free to use, modify and distribute it subject to that licence; see `LICENSE` for the terms.

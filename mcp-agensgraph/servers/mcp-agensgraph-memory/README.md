@@ -270,6 +270,10 @@ cargo install uv
 
 2. Clone the repository and set up development environment:
 ```bash
+# Clone the repository
+git clone https://github.com/skaiworldwide-oss/agensgraph-ai.git
+cd agensgraph-ai/mcp-agensgraph/servers/mcp-agensgraph-memory
+
 # Create and activate virtual environment using uv
 uv venv
 source .venv/bin/activate  # On Unix/macOS

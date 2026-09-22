@@ -1,9 +1,10 @@
 # mcp-agensgraph-common
 
 Shared core for the AgensGraph MCP servers
-([cypher](../mcp-agensgraph-cypher), [memory](../mcp-agensgraph-memory),
-[data-modeling](../mcp-agensgraph-data-modeling)). It exists so the three servers
-don't each re-implement (and drift on) the same plumbing.
+([cypher](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/mcp-agensgraph/servers/mcp-agensgraph-cypher),
+[memory](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/mcp-agensgraph/servers/mcp-agensgraph-memory),
+[data-modeling](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/mcp-agensgraph/servers/mcp-agensgraph-data-modeling)).
+It exists so the three servers don't each re-implement (and drift on) the same plumbing.
 
 ## What's in it
 
@@ -54,3 +55,7 @@ Deciding by reading the statement is not done here at all. `agensgraph.cypher`'s
 
 The DB-backed servers depend on `mcp-agensgraph-common[db]`; the DB-less
 data-modeling server depends on `mcp-agensgraph-common` (no psycopg).
+
+## License
+
+Apache-2.0, as `LICENSE`, `NOTICE` and the package metadata declare.

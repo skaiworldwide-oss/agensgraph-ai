@@ -349,8 +349,8 @@ cargo install uv
 2. Clone the repository and set up development environment:
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/agensgraph-ai.git
-cd mcp-agensgraph/servers/mcp-agensgraph-cypher
+git clone https://github.com/skaiworldwide-oss/agensgraph-ai.git
+cd agensgraph-ai/mcp-agensgraph/servers/mcp-agensgraph-cypher
 
 # Create and activate virtual environment using uv
 uv venv
@@ -375,14 +375,14 @@ uv sync
   "agensgraph": {
     "command": "uv",
     "args": [
-      "--directory", 
-      "parent_of_servers_repo/servers/mcp-agensgraph-cypher/src",
-      "run", 
-      "mcp-agensgraph-cypher", 
-      "--transport", 
-      "stdio", 
-      "--namespace", 
-      "dev",
+      "--directory",
+      "/path/to/agensgraph-ai/mcp-agensgraph/servers/mcp-agensgraph-cypher",
+      "run",
+      "mcp-agensgraph-cypher",
+      "--transport",
+      "stdio",
+      "--namespace",
+      "dev"
     ],
     "env": {
       "AGENSGRAPH_URL": "postgresql://localhost:5432",

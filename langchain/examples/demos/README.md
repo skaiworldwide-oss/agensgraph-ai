@@ -13,6 +13,7 @@ on a local model).
 | [`02_wikipedia_kg`](02_wikipedia_kg/) | `LLMGraphTransformer` → `add_graph_documents`; `enhanced_schema`; natural-language **Text2Cypher** QA | Wikipedia articles |
 | [`03_news_vector_rag`](03_news_vector_rag/) | `AgensgraphVector` at scale: HNSW, **RRF hybrid search**, MongoDB-style **metadata filters**, `effective_search_ratio`, RAG | CC-News (~100k chunks) |
 | [`04_chat_memory_agent`](04_chat_memory_agent/) | `AgensSaver` (LangGraph checkpointer) + `AgensChatMessageHistory`; **conversation resumes across processes** | (uses demo 03's vectors) |
+| [`05_graph_retrievers`](05_graph_retrievers/) | `AgensVectorRetriever`, `AgensGraphContextRetriever` and `AgensText2CypherRetriever` side by side on a film catalog, then against demo 01's arXiv graph | an invented catalog; arXiv |
 
 Plus [`bench/`](bench/) — EXPLAIN proofs that the hot paths use the right
 indexes, and a throughput summary.

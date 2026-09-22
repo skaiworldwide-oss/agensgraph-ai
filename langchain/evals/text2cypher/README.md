@@ -9,7 +9,7 @@ plausibly but returns the wrong rows scores zero.
 
 ## Layout
 
-- `dataset.jsonl` — 90 entries. Each has a `question`, a dialect-correct `gold`
+- `dataset.jsonl` — 100 entries. Each has a `question`, a dialect-correct `gold`
   query, a `category`, optional capability `requires`, and — for the traps —
   the `habit` query a model writes elsewhere, with its declared `habit_outcome`
   (`error`, or `different` from gold). Gold results are never stored; they are

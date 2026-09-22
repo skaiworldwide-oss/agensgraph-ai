@@ -85,6 +85,10 @@ def requires_met(entry: Dict[str, Any], capabilities: Any) -> Optional[str]:
         elif requirement == "element_ordering":
             if not capabilities.has_element_ordering():
                 return requirement
+        elif requirement == "boolean_condition":
+            # From 2.18 a condition takes only a boolean; 2.17 reads a value as truthy.
+            if capabilities.version < (2, 18):
+                return requirement
         else:
             return requirement
     return None

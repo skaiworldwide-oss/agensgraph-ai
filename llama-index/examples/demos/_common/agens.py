@@ -2,9 +2,9 @@
 
 Centralizing this means demos never duplicate connection wiring and they all
 exercise pooled connections against the live database. The property-graph store
-and the vector store both accept ``engine=`` and can safely share one pool: the
-engine re-applies ``SET graph_path`` on every checkout, so each store stays bound
-to its own graph (different ``graph_name``s never collide).
+and the vector store both accept ``engine=`` and can share one pool: a checkout
+selects the store's graph when it differs from the one the pool was built for, so
+each store stays bound to its own graph (different ``graph_name``s never collide).
 """
 
 from __future__ import annotations

@@ -1,1 +1,2 @@
 evals/text2cypher/results_*.jsonl
+tests/bench/results.jsonl

@@ -64,7 +64,7 @@ def test_no_debug_prints_in_vectorstore_module() -> None:
     # Bug: `print("DEBUG: ...")` at two callsites — replaced by self.logger.debug.
     import langchain_agensgraph.vectorstores.agensgraph_vector as mod
 
-    src = open(mod.__file__).read()
+    src = inspect.getsource(mod)
     assert 'print("DEBUG:' not in src
     assert "print('DEBUG:" not in src
 
@@ -75,7 +75,7 @@ def test_nothing_installs_a_plpgsql_typeof() -> None:
     # driver's describe() uses it, so nothing here should carry that DDL any more.
     from langchain_agensgraph.graphs import agensgraph as mod
 
-    src = open(mod.__file__).read()
+    src = inspect.getsource(mod)
     assert "CREATE OR REPLACE FUNCTION" not in src
     assert "LANGUAGE plpgsql" not in src
 
@@ -87,7 +87,7 @@ def test_the_regex_wire_decoder_is_gone() -> None:
     from langchain_agensgraph.vectorstores import agensgraph_vector as vec
 
     for mod in (graphs, vec):
-        src = open(mod.__file__).read()
+        src = inspect.getsource(mod)
         assert "vertex_regex" not in src, mod.__name__
         assert "edge_regex" not in src, mod.__name__
         assert "_record_to_dict" not in src, mod.__name__
@@ -98,7 +98,7 @@ def test_verify_vector_support_error_mentions_pg_config() -> None:
     # because AgensGraph does not bundle the pgvector control file.
     from langchain_agensgraph.vectorstores import agensgraph_vector as mod
 
-    src = open(mod.__file__).read()
+    src = inspect.getsource(mod)
     assert "pgvector" in src
     assert "pg_config" in src
 

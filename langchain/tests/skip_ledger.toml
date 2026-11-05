@@ -1,0 +1,5 @@
+# The skip reasons each release may give, read when SKIP_LEDGER names this file. A skip for any
+# other reason fails the run. "all" holds the reasons every release may give.
+
+[all]
+reasons = []

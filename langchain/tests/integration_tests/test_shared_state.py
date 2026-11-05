@@ -48,9 +48,7 @@ def graph():
 @pytest.fixture
 def pooled():
     engine = AgensEngine.from_url(_url(), min_size=2, max_size=5)
-    g = AgensGraph(
-        "shared_state_it", _conf(), create=True, engine=engine, refresh_schema=False
-    )
+    g = AgensGraph("shared_state_it", _conf(), create=True, engine=engine, refresh_schema=False)
     g.query("MATCH (n) DETACH DELETE n")
     yield g
     g.query("MATCH (n) DETACH DELETE n")
@@ -95,7 +93,7 @@ class TestATransactionBelongsToItsCaller:
         def other():
             holding.wait(10)
             try:
-                pooled.query('CREATE (:"Mark" {who: \'other\'})')
+                pooled.query("CREATE (:\"Mark\" {who: 'other'})")
                 outcome["other"] = "wrote"
             except Exception as exc:  # noqa: BLE001 - recorded, then asserted on
                 outcome["other"] = f"refused: {exc}"
@@ -113,7 +111,7 @@ class TestATransactionBelongsToItsCaller:
     def test_the_holder_is_still_inside_its_own(self, pooled: AgensGraph):
         with pooled.read_only(allow_server_programs=True):
             with pytest.raises(Exception):
-                pooled.query('CREATE (:"Mark" {who: \'holder\'})')
+                pooled.query("CREATE (:\"Mark\" {who: 'holder'})")
         assert pooled.query('MATCH (n:"Mark") RETURN count(*) AS c')[0]["c"] == 0
 
     @pytest.mark.asyncio
@@ -129,7 +127,7 @@ class TestATransactionBelongsToItsCaller:
         async def other():
             await asyncio.wait_for(holding.wait(), 10)
             try:
-                await pooled.aquery('CREATE (:"Mark" {who: \'other\'})')
+                await pooled.aquery("CREATE (:\"Mark\" {who: 'other'})")
                 return "wrote"
             finally:
                 release.set()
@@ -147,9 +145,7 @@ class TestAStoreSharesItsGraphsTransaction:
     """
 
     def test_a_search_runs_on_the_transactions_connection(self, pooled: AgensGraph):
-        store = AgensgraphVector(
-            FakeEmbeddings(), graph=pooled, node_label="SharedChunk"
-        )
+        store = AgensgraphVector(FakeEmbeddings(), graph=pooled, node_label="SharedChunk")
         held = pooled.connection.execute("SELECT pg_backend_pid()").fetchone()[0]
 
         loose = store.query("RETURN pg_backend_pid() AS pid")[0]["pid"]
@@ -161,9 +157,7 @@ class TestAStoreSharesItsGraphsTransaction:
 
     @pytest.mark.asyncio
     async def test_the_async_search_does_too(self, pooled: AgensGraph):
-        store = AgensgraphVector(
-            FakeEmbeddings(), graph=pooled, node_label="SharedChunk"
-        )
+        store = AgensgraphVector(FakeEmbeddings(), graph=pooled, node_label="SharedChunk")
         conn = await pooled._aconn_get()
         held = (await (await conn.execute("SELECT pg_backend_pid()")).fetchone())[0]
 
@@ -223,9 +217,7 @@ class TestTwoWritersMergingTheSameKey:
     def _race(self, build, write):
         """Each writer on its own connection, all starting together."""
         graphs = [
-            AgensGraph(
-                "shared_state_it", _conf(), create=True, refresh_schema=False
-            )
+            AgensGraph("shared_state_it", _conf(), create=True, refresh_schema=False)
             for _ in range(self.WRITERS)
         ]
         targets = [build(g) for g in graphs]
@@ -240,9 +232,7 @@ class TestTwoWritersMergingTheSameKey:
                 except Exception as exc:  # noqa: BLE001 - counted, then asserted on
                     refused.append(exc)
 
-        threads = [
-            threading.Thread(target=worker, args=(w,)) for w in range(self.WRITERS)
-        ]
+        threads = [threading.Thread(target=worker, args=(w,)) for w in range(self.WRITERS)]
         for t in threads:
             t.start()
         for t in threads:
@@ -295,13 +285,13 @@ class TestTwoWritersMergingTheSameKey:
         AgensChatMessageHistory(session_id="warmup", graph=graph)
         refused = self._race(
             lambda g: g,
-            lambda g, k, w: AgensChatMessageHistory(
-                session_id=f"s{k}", graph=g
-            ).add_user_message(f"m{w}"),
+            lambda g, k, w: AgensChatMessageHistory(session_id=f"s{k}", graph=g).add_user_message(
+                f"m{w}"
+            ),
         )
-        held = graph.query(
-            "MATCH (n:\"Session\") WHERE n.id <> 'warmup' RETURN count(*) AS c"
-        )[0]["c"]
+        held = graph.query("MATCH (n:\"Session\") WHERE n.id <> 'warmup' RETURN count(*) AS c")[0][
+            "c"
+        ]
         assert held == self.KEYS, f"{refused[:1]}"
 
 
@@ -316,11 +306,7 @@ class TestTheIndexesAreTheOnesAskedFor:
         graph.query('CREATE PROPERTY INDEX "Recon_pk" ON "Recon" (a, b)')
         assert [i.unique for i in graph.connection.indexes("Recon")] == [False]
 
-        wanted = [
-            DesiredIndex(
-                label="Recon", properties=("a", "b"), unique=True, name="Recon_pk"
-            )
-        ]
+        wanted = [DesiredIndex(label="Recon", properties=("a", "b"), unique=True, name="Recon_pk")]
         graph.ensure_indexes(wanted)
         assert [i.unique for i in graph.connection.indexes("Recon")] == [True]
         assert graph.ensure_indexes(wanted) == [], "a second call changes nothing"
@@ -463,7 +449,7 @@ class TestAPooledReadCostsOneRoundTrip:
         """Autocommit is the default, not a refusal to open a transaction."""
         with pooled.read_only(allow_server_programs=True):
             with pytest.raises(Exception):
-                pooled.query('CREATE (:"Mark" {who: \'inside\'})')
+                pooled.query("CREATE (:\"Mark\" {who: 'inside'})")
         assert pooled.query('MATCH (n:"Mark") RETURN count(*) AS c')[0]["c"] == 0
 
     @pytest.mark.asyncio
@@ -480,9 +466,7 @@ class TestAPooledReadCostsOneRoundTrip:
 
 
 _SESSION_INDEX = [
-    DesiredIndex(
-        label="Session", properties=("id",), unique=True, name="Session_id_idx"
-    )
+    DesiredIndex(label="Session", properties=("id",), unique=True, name="Session_id_idx")
 ]
 
 
@@ -512,9 +496,7 @@ class TestReconcilingIndexesIsNotPaidPerRequest:
             remove_query_logger(watch)
         return seen
 
-    def test_a_second_construction_reads_only_the_label_it_asks_about(
-        self, graph: AgensGraph
-    ):
+    def test_a_second_construction_reads_only_the_label_it_asks_about(self, graph: AgensGraph):
         from langchain_agensgraph.chat_message_histories.agensgraph import (
             AgensChatMessageHistory,
         )
@@ -537,9 +519,7 @@ class TestReconcilingIndexesIsNotPaidPerRequest:
             after = statement.split("labname", 1)
             narrowed = len(after) == 2 and "%s" in after[1]
             assert narrowed, f"narrowed to one label, not graph-wide: {statement}"
-            assert read.elapsed < 0.01, (
-                f"a per-label read, not a graph-wide one: {read.elapsed}"
-            )
+            assert read.elapsed < 0.01, f"a per-label read, not a graph-wide one: {read.elapsed}"
 
     def test_a_second_construction_writes_nothing(self, graph: AgensGraph):
         from langchain_agensgraph.chat_message_histories.agensgraph import (
@@ -585,14 +565,10 @@ class TestReconcilingIndexesIsNotPaidPerRequest:
         graph.query('CREATE VLABEL IF NOT EXISTS "Remembered"')
         graph.query('DROP PROPERTY INDEX IF EXISTS "Remembered_a"')
         graph.query('DROP PROPERTY INDEX IF EXISTS "Remembered_b"')
-        first = [
-            DesiredIndex(label="Remembered", properties=("a",), name="Remembered_a")
-        ]
+        first = [DesiredIndex(label="Remembered", properties=("a",), name="Remembered_a")]
         assert graph.ensure_indexes(first)
         assert graph.ensure_indexes(first) == []
-        second = [
-            DesiredIndex(label="Remembered", properties=("b",), name="Remembered_b")
-        ]
+        second = [DesiredIndex(label="Remembered", properties=("b",), name="Remembered_b")]
         assert graph.ensure_indexes(second)
 
 
@@ -634,9 +610,9 @@ class TestTheAwaitedWritePathsRetryToo:
         for g in graphs:
             g.close()
 
-        sessions = graph.query(
-            "MATCH (s:\"Session\") WHERE s.id <> 'warm' RETURN count(*) AS c"
-        )[0]["c"]
+        sessions = graph.query("MATCH (s:\"Session\") WHERE s.id <> 'warm' RETURN count(*) AS c")[
+            0
+        ]["c"]
         messages = graph.query('MATCH (m:"Message") RETURN count(*) AS c')[0]["c"]
         assert sessions == self.KEYS
         # The count alone would pass even if most writers had died, which is how the
@@ -677,9 +653,7 @@ class TestATransactionTakesAConnectionOfItsOwn:
         held = pooled.query('MATCH (n:"StoreItem") RETURN count(*) AS c')[0]["c"]
         assert held == 10, f"{refused[:1]}"
 
-    def test_a_transaction_does_not_occupy_the_dedicated_connection(
-        self, pooled: AgensGraph
-    ):
+    def test_a_transaction_does_not_occupy_the_dedicated_connection(self, pooled: AgensGraph):
         dedicated = pooled.connection.execute("SELECT pg_backend_pid()").fetchone()[0]
         with pooled.transaction():
             inside = pooled.query("RETURN pg_backend_pid() AS pid")[0]["pid"]

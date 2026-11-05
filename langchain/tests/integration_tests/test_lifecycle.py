@@ -54,9 +54,7 @@ def test_per_call_timeout_overrides_instance():
 
 def test_application_name_is_set():
     g = AgensGraph("lifecycle", _conf(), create=True)
-    rows = g.query(
-        "SELECT current_setting('application_name') AS app"
-    )
+    rows = g.query("SELECT current_setting('application_name') AS app")
     assert rows[0]["app"].startswith("langchain-agensgraph/")
     g.close()
 

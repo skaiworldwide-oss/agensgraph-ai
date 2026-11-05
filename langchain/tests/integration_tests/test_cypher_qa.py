@@ -28,8 +28,8 @@ def graph():
     g.query("MATCH (n) DETACH DELETE n")
     # the key is quoted so the graph stores "firstName" case-preserved; written bare it
     # would be stored as "firstname" and the repair would rightly leave it alone
-    g.query('CREATE (:"Person" {name: \'Alice\', "firstName": \'Alice\'})')
-    g.query('CREATE (:"Person" {name: \'Bob\', "firstName": \'Bob\'})')
+    g.query("CREATE (:\"Person\" {name: 'Alice', \"firstName\": 'Alice'})")
+    g.query("CREATE (:\"Person\" {name: 'Bob', \"firstName\": 'Bob'})")
     g.refresh_schema(force=True)
     yield g
     g.close()
@@ -176,9 +176,7 @@ class TestRefusals:
 class TestServerPrograms:
     """A role that can run a command on the server's host has no boundary to give it."""
 
-    def test_a_privileged_role_is_refused_rather_than_given_a_boundary_that_is_not_one(
-        self, graph
-    ):
+    def test_a_privileged_role_is_refused_rather_than_given_a_boundary_that_is_not_one(self, graph):
         chain = AgensCypherQAChain.from_llm(
             FakeListChatModel(responses=["MATCH (n:Person) RETURN n.name AS name"]),
             graph=graph,

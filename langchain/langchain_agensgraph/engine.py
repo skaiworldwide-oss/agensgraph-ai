@@ -166,9 +166,7 @@ class AgensEngine:
                 conn.graph(wanted)
             yield conn
 
-    def open_connection(
-        self, graph_path: Optional[str] = None
-    ) -> agensgraph.Connection:
+    def open_connection(self, graph_path: Optional[str] = None) -> agensgraph.Connection:
         """Open a standalone (non-pooled) connection from this engine's conninfo.
 
         Used by stores for one-off setup work that wants a dedicated connection rather

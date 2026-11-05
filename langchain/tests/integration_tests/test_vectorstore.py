@@ -10,25 +10,6 @@ from langchain_core.documents import Document
 from psycopg import sql
 from yaml import safe_load
 
-
-def _no_id(docs):
-    """Drop ``Document.id`` from results.
-
-    These tests pre-date 0.2.0's ``Document.id`` population (which the
-    LangChain conformance suite requires). Comparing on page_content +
-    metadata only preserves the original test intent.
-    """
-    out = []
-    for item in docs:
-        if isinstance(item, tuple):
-            d, s = item
-            out.append((Document(page_content=d.page_content, metadata=d.metadata), s))
-        else:
-            out.append(
-                Document(page_content=item.page_content, metadata=item.metadata)
-            )
-    return out
-
 from langchain_agensgraph.graphs.agensgraph import AgensGraph
 from langchain_agensgraph.vectorstores.agensgraph_vector import (
     AgensgraphVector,
@@ -47,6 +28,24 @@ from tests.integration_tests.fixtures.filtering_test_cases import (
     TYPE_4_FILTERING_TEST_CASES,
 )
 
+
+def _no_id(docs):
+    """Drop ``Document.id`` from results.
+
+    These tests pre-date 0.2.0's ``Document.id`` population (which the
+    LangChain conformance suite requires). Comparing on page_content +
+    metadata only preserves the original test intent.
+    """
+    out = []
+    for item in docs:
+        if isinstance(item, tuple):
+            d, s = item
+            out.append((Document(page_content=d.page_content, metadata=d.metadata), s))
+        else:
+            out.append(Document(page_content=item.page_content, metadata=item.metadata))
+    return out
+
+
 OS_TOKEN_COUNT = 1536
 
 texts = ["foo", "bar", "baz", "It is the end of the world. Take shelter!"]
@@ -59,21 +58,27 @@ conf = {
     "port": int(os.getenv("AGENSGRAPH_PORT", 5432)),
 }
 
-url = os.environ.get("AGENSGRAPH_URL", f"postgresql://{conf['user']}:{conf['password']}@{conf['host']}:{conf['port']}/{conf['dbname']}")
+url = os.environ.get(
+    "AGENSGRAPH_URL",
+    f"postgresql://{conf['user']}:{conf['password']}@{conf['host']}:{conf['port']}/{conf['dbname']}",
+)
+
 
 def drop_vector_indexes(store: AgensgraphVector) -> None:
     """Cleanup all vector indexes"""
     for index in store._vector_indexes():
-        store.query(f"""DROP PROPERTY INDEX "{index['name']}" CASCADE""")
+        store.query(f"""DROP PROPERTY INDEX "{index["name"]}" CASCADE""")
 
     store.query("MATCH (n) DETACH DELETE n;")
+
 
 def drop_fulltext_indexes(store: AgensgraphVector) -> None:
     """Cleanup all keyword indexes"""
     for index in store._text_indexes():
-        store.query(f"""DROP PROPERTY INDEX "{index['name']}" CASCADE""")
+        store.query(f"""DROP PROPERTY INDEX "{index["name"]}" CASCADE""")
 
     store.query("MATCH (n) DETACH DELETE n;")
+
 
 class FakeEmbeddingsWithOsDimension(FakeEmbeddings):
     """Fake embeddings functionality for testing."""
@@ -205,8 +210,7 @@ def test_agensgraph_vector_with_metadatas_with_scores() -> None:
         pre_delete_collection=True,
     )
     output = [
-        (doc, round(score, 1))
-        for doc, score in docsearch.similarity_search_with_score("foo", k=1)
+        (doc, round(score, 1)) for doc, score in docsearch.similarity_search_with_score("foo", k=1)
     ]
     assert _no_id(output) == [(Document(page_content="foo", metadata={"page": "0"}), 1.0)]
 
@@ -312,6 +316,7 @@ def test_agensgraph_vector_prefer_indexname() -> None:
     assert _no_id(output) == [Document(page_content="bar", metadata={})]
     drop_vector_indexes(existing_index)
 
+
 def test_agensgraph_vector_hybrid() -> None:
     """Test end to end construction with hybrid search."""
     text_embeddings = FakeEmbeddingsWithOsDimension().embed_documents(texts)
@@ -404,9 +409,7 @@ def test_agensgraph_vector_missing_keyword() -> None:
             search_type=SearchType.HYBRID,
         )
     except ValueError as e:
-        assert str(e) == (
-            "keyword_index name has to be specified when using hybrid search option"
-        )
+        assert str(e) == ("keyword_index name has to be specified when using hybrid search option")
     drop_vector_indexes(docsearch)
 
 
@@ -574,22 +577,19 @@ def test_agensgraph_vector_special_character() -> None:
         pre_delete_collection=True,
         search_type=SearchType.HYBRID,
     )
-    output = docsearch.similarity_search(
-        "It is the end of the world. Take shelter!", k=1
-    )
+    output = docsearch.similarity_search("It is the end of the world. Take shelter!", k=1)
     assert _no_id(output) == [
         Document(page_content="It is the end of the world. Take shelter!", metadata={})
     ]
 
     drop_vector_indexes(docsearch)
 
+
 def test_index_fetching() -> None:
     """testing correct index creation and fetching"""
     embeddings = FakeEmbeddings()
 
-    def create_store(
-        node_label: str, index: str, text_properties: List[str]
-    ) -> AgensgraphVector:
+    def create_store(node_label: str, index: str, text_properties: List[str]) -> AgensgraphVector:
         return AgensgraphVector.from_existing_graph(
             embedding=embeddings,
             url=url,
@@ -640,9 +640,7 @@ def test_retrieval_params() -> None:
     # declared type and the Cypher parser *parsed* it as JSON, so every value had to be
     # `json.dumps`-ed first -- and a value that happened to read as JSON, like an order
     # number or a postcode, silently matched nothing. A string is now sent as text.
-    output = docsearch.similarity_search(
-        "Foo", k=2, params={"test": "test", "test1": "test1"}
-    )
+    output = docsearch.similarity_search("Foo", k=2, params={"test": "test", "test1": "test1"})
     assert _no_id(output) == [
         Document(page_content="test", metadata={"test": "test1"}),
         Document(page_content="test", metadata={"test": "test1"}),
@@ -668,8 +666,7 @@ def test_retrieval_dictionary() -> None:
     expected_output = [
         Document(
             page_content=(
-                "skills:\n- Python\n- Data Analysis\n- "
-                "Machine Learning\nage: 30\nname: John\n"
+                "skills:\n- Python\n- Data Analysis\n- Machine Learning\nage: 30\nname: John\n"
             )
         )
     ]
@@ -709,9 +706,7 @@ def test_metadata_filters_type1() -> None:
         # 0.2.0 separated system id (__id__) from user metadata, so user's
         # metadata["id"] now round-trips. Only strip None-valued keys.
         for doc in expected_output:
-            keys_with_none = [
-                key for key, value in doc.metadata.items() if value is None
-            ]
+            keys_with_none = [key for key, value in doc.metadata.items() if value is None]
             for key in keys_with_none:
                 del doc.metadata[key]
 
@@ -827,9 +822,7 @@ def test_agensgraph_max_marginal_relevance_search() -> None:
     }
 
     output = docsearch.max_marginal_relevance_search("0.0", k=2, fetch_k=3)
-    output_set = {
-        (mmr_doc.page_content, mmr_doc.metadata["page"]) for mmr_doc in output
-    }
+    output_set = {(mmr_doc.page_content, mmr_doc.metadata["page"]) for mmr_doc in output}
     assert output_set == expected_set
 
     drop_vector_indexes(docsearch)
@@ -876,9 +869,7 @@ class TestABitColumnIsUsable:
         def embed_query(self, text: str) -> List[float]:
             return self._vec(text)
 
-    @pytest.mark.parametrize(
-        "strategy", [DistanceStrategy.HAMMING, DistanceStrategy.JACCARD]
-    )
+    @pytest.mark.parametrize("strategy", [DistanceStrategy.HAMMING, DistanceStrategy.JACCARD])
     def test_a_bit_distance_indexes_ingests_and_searches(self, strategy) -> None:
         store = AgensgraphVector.from_texts(
             texts=["alpha", "beta", "gamma"],
@@ -892,9 +883,7 @@ class TestABitColumnIsUsable:
             pre_delete_collection=True,
         )
         try:
-            stored = store.query(
-                'MATCH (n:"BitChunk") RETURN n.embedding AS e LIMIT 1'
-            )[0]["e"]
+            stored = store.query('MATCH (n:"BitChunk") RETURN n.embedding AS e LIMIT 1')[0]["e"]
             assert set(stored) <= {"0", "1"} and len(stored) == 12
             assert store.similarity_search("beta", k=1)[0].page_content == "beta"
         finally:
@@ -913,9 +902,7 @@ class TestMetadataDoesNotOverwriteWhatTheStoreWrites:
         store = AgensgraphVector.from_texts(
             texts=["the quick brown fox"],
             embedding=FakeEmbeddings(),
-            metadatas=[
-                {"embedding": "clobbered", "text": "clobbered", "__id__": "clobbered"}
-            ],
+            metadatas=[{"embedding": "clobbered", "text": "clobbered", "__id__": "clobbered"}],
             url=url,
             graph_name="vector_it",
             node_label="ReservedChunk",
@@ -1013,9 +1000,7 @@ class TestAGraphThatWasAlreadyThere:
     async def test_the_async_path_agrees(self) -> None:
         store = self._seed()
         try:
-            picked = await store.amax_marginal_relevance_search(
-                "quantum", k=2, fetch_k=3
-            )
+            picked = await store.amax_marginal_relevance_search("quantum", k=2, fetch_k=3)
             assert len(picked) == 2
         finally:
             drop_vector_indexes(store)
@@ -1104,9 +1089,7 @@ class TestTheStoreInstallsNothing:
 
     @staticmethod
     def _function_count(store: AgensgraphVector) -> int:
-        return int(
-            store.query("SELECT count(*) AS c FROM pg_catalog.pg_proc")[0]["c"]
-        )
+        return int(store.query("SELECT count(*) AS c FROM pg_catalog.pg_proc")[0]["c"])
 
     def test_pg_proc_is_the_same_size_afterwards(self) -> None:
         graph = AgensGraph("vector_install_it", conf, create=True)
@@ -1118,9 +1101,7 @@ class TestTheStoreInstallsNothing:
             "WHERE p.proname LIKE 'ag\\_list%'"
         ):
             graph.query(f"DROP FUNCTION IF EXISTS {leftover['signature']}")
-        before = int(
-            graph.query("SELECT count(*) AS c FROM pg_catalog.pg_proc")[0]["c"]
-        )
+        before = int(graph.query("SELECT count(*) AS c FROM pg_catalog.pg_proc")[0]["c"])
         store = AgensgraphVector.from_texts(
             texts=["alpha", "beta"],
             embedding=FakeEmbeddings(),
@@ -1135,8 +1116,7 @@ class TestTheStoreInstallsNothing:
             assert store.similarity_search("alpha", k=1)
             assert self._function_count(store) == before
             named = store.query(
-                "SELECT count(*) AS c FROM pg_catalog.pg_proc "
-                "WHERE proname LIKE 'ag\\_list%'"
+                "SELECT count(*) AS c FROM pg_catalog.pg_proc WHERE proname LIKE 'ag\\_list%'"
             )
             assert int(named[0]["c"]) == 0
         finally:
@@ -1200,9 +1180,7 @@ class TestNamingElementsByIdReachesTheIndex:
         graph.close()
 
     def _plan(self, store, statement, params) -> str:
-        rows = store.query(
-            "EXPLAIN (COSTS OFF) " + statement.as_string(store.connection), params
-        )
+        rows = store.query("EXPLAIN (COSTS OFF) " + statement.as_string(store.connection), params)
         return "\n".join(str(next(iter(r.values()))) for r in rows)
 
     def test_reading_by_id_is_an_index_scan(self, loaded) -> None:
@@ -1222,9 +1200,7 @@ class TestNamingElementsByIdReachesTheIndex:
         """
         params: dict = {}
         few = loaded._named_by_id(["id1"], params).as_string(loaded.connection)
-        many = loaded._named_by_id(
-            [f"id{i}" for i in range(200)], {}
-        ).as_string(loaded.connection)
+        many = loaded._named_by_id([f"id{i}" for i in range(200)], {}).as_string(loaded.connection)
         assert few == many, "the statement says the same thing however many ids"
 
     def test_get_by_ids_returns_what_was_asked_for(self, loaded) -> None:
@@ -1342,9 +1318,7 @@ class TestBuildingAStoreCostsNoEmbedding:
         )
         assert store.embedding_dimension == 10
 
-    def test_a_model_of_the_wrong_width_is_refused_on_the_first_write(
-        self, seeded
-    ) -> None:
+    def test_a_model_of_the_wrong_width_is_refused_on_the_first_write(self, seeded) -> None:
         class Wider(self.Counting):
             def embed_documents(self, texts):
                 return [[0.1] * 99 for _ in texts]
@@ -1414,9 +1388,7 @@ class TestPerCallRetrievalQuery:
             pre_delete_collection=True,
             url=url,
         )
-        shaped = await docsearch.asimilarity_search(
-            "foo", k=1, retrieval_query=self.OVERRIDE
-        )
+        shaped = await docsearch.asimilarity_search("foo", k=1, retrieval_query=self.OVERRIDE)
         assert _no_id(shaped) == [
             Document(page_content="overridden", metadata={"shape": "override"})
         ]
@@ -1445,12 +1417,8 @@ class TestAsyncHybridConfig:
             url=url,
         )
         sharp = HybridSearchConfig(rank_constant=1, keyword_weight=2.0)
-        wanted = docsearch.similarity_search_with_score(
-            "foo", k=3, hybrid_config=sharp
-        )
-        got = await docsearch.asimilarity_search_with_score(
-            "foo", k=3, hybrid_config=sharp
-        )
+        wanted = docsearch.similarity_search_with_score("foo", k=3, hybrid_config=sharp)
+        got = await docsearch.asimilarity_search_with_score("foo", k=3, hybrid_config=sharp)
         assert [(d.page_content, s) for d, s in _no_id(wanted)] == [
             (d.page_content, s) for d, s in _no_id(got)
         ]

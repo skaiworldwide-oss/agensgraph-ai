@@ -102,4 +102,5 @@ timeout = 300
 filterwarnings = [
     "error",
     "ignore::DeprecationWarning:pydantic",
+    "ignore::DeprecationWarning:langsmith",
 ]

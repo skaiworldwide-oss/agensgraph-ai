@@ -79,8 +79,8 @@ to the caller -- a thread sees only what it set, and so does a task, since a tas
 given a copy of the context it was created in.
 """
 
-_IN_ASYNC_TRANSACTION: contextvars.ContextVar[Mapping[int, Any]] = (
-    contextvars.ContextVar("agensgraph_in_async_transaction", default={})
+_IN_ASYNC_TRANSACTION: contextvars.ContextVar[Mapping[int, Any]] = contextvars.ContextVar(
+    "agensgraph_in_async_transaction", default={}
 )
 """The same, for the async connection, which is a different connection.
 
@@ -174,9 +174,7 @@ def _sanitize_value(value: Any, *, list_limit: int = LIST_LIMIT) -> Any:
         return _sanitize_value(agensgraph.to_builtins(value), list_limit=list_limit)
     if isinstance(value, Path):
         return {
-            "vertices": [
-                _sanitize_value(v, list_limit=list_limit) for v in value.vertices
-            ],
+            "vertices": [_sanitize_value(v, list_limit=list_limit) for v in value.vertices],
             "edges": [_sanitize_value(e, list_limit=list_limit) for e in value.edges],
         }
     if isinstance(value, dict):
@@ -213,9 +211,7 @@ class AgensQueryException(Exception):
             # Both spellings are read. Every raise site writes "detail"; this class used
             # to read only "details", so the server's own account of the failure was
             # captured and then thrown away on every error.
-            self.details = (
-                exception.get("detail") or exception.get("details") or "unknown"
-            )
+            self.details = exception.get("detail") or exception.get("details") or "unknown"
         else:
             self.message = exception
             self.details = "unknown"
@@ -360,9 +356,7 @@ class AgensGraph(GraphStore):
                     }
                 )
             self._run(
-                sql.SQL("CREATE GRAPH IF NOT EXISTS {name}").format(
-                    name=sql.Identifier(graph_name)
-                )
+                sql.SQL("CREATE GRAPH IF NOT EXISTS {name}").format(name=sql.Identifier(graph_name))
             )
 
         # Selects the graph and fills the label table the composite rendering resolves a
@@ -412,9 +406,7 @@ class AgensGraph(GraphStore):
     @contextmanager
     def _pinned(self, conn: Any) -> Iterator[None]:
         """Say that statements from here belong on ``conn``."""
-        token = _IN_TRANSACTION.set(
-            {**_IN_TRANSACTION.get(), id(self): _Pin(conn)}
-        )
+        token = _IN_TRANSACTION.set({**_IN_TRANSACTION.get(), id(self): _Pin(conn)})
         try:
             yield
         finally:
@@ -423,17 +415,13 @@ class AgensGraph(GraphStore):
     @asynccontextmanager
     async def _apinned(self, conn: Any) -> AsyncIterator[None]:
         """Async sibling of :meth:`_pinned`."""
-        token = _IN_ASYNC_TRANSACTION.set(
-            {**_IN_ASYNC_TRANSACTION.get(), id(self): _Pin(conn)}
-        )
+        token = _IN_ASYNC_TRANSACTION.set({**_IN_ASYNC_TRANSACTION.get(), id(self): _Pin(conn)})
         try:
             yield
         finally:
             _IN_ASYNC_TRANSACTION.reset(token)
 
-    async def amerging(
-        self, write: Callable[[], Any], *, attempts: Optional[int] = None
-    ) -> Any:
+    async def amerging(self, write: Callable[[], Any], *, attempts: Optional[int] = None) -> Any:
         """Async sibling of :meth:`merging`.
 
         The awaited write paths need this for the same reason the blocking ones do, and
@@ -557,9 +545,7 @@ class AgensGraph(GraphStore):
             yield pin.conn
             return
         if self._engine is not None:
-            async with self._engine.aconnection(
-                self.graph_name, deadline=timeout
-            ) as conn:
+            async with self._engine.aconnection(self.graph_name, deadline=timeout) as conn:
                 yield conn
             return
         async with self._aexclusive:
@@ -616,9 +602,7 @@ class AgensGraph(GraphStore):
         self.connection.execute(self._timeout_statement(wanted))
         self._applied_timeout = wanted
 
-    async def _aapply_timeout(
-        self, pin: Optional[_Pin], timeout: Optional[float]
-    ) -> None:
+    async def _aapply_timeout(self, pin: Optional[_Pin], timeout: Optional[float]) -> None:
         wanted = timeout if timeout is not None else self.timeout
         if pin is not None:
             if wanted == pin.applied:
@@ -657,9 +641,7 @@ class AgensGraph(GraphStore):
         of a second connection.
         """
         if self._aconn is None or self._aconn.closed:
-            self._aconn = await agensgraph.AsyncConnection.connect(
-                **self._conf, autocommit=True
-            )
+            self._aconn = await agensgraph.AsyncConnection.connect(**self._conf, autocommit=True)
             await self._aconn.graph(self.graph_name)
             if self._vectors_registered:
                 await self._aconn.register_vectors()
@@ -691,9 +673,7 @@ class AgensGraph(GraphStore):
         show it -- the text form spells the label out -- which is why it is worth stating:
         registering vectors turns binary on, so a store is exactly where it would appear.
         """
-        wanted = sorted(
-            {("v", name) for name in vertices} | {("e", name) for name in edges}
-        )
+        wanted = sorted({("v", name) for name in vertices} | {("e", name) for name in edges})
         if not wanted:
             return
         with self._dedicated() as conn:
@@ -800,11 +780,7 @@ class AgensGraph(GraphStore):
                 continue
             if not reconcile_indexes([one], held):
                 continue  # what is there is what is wanted
-            self._run(
-                sql.SQL("DROP PROPERTY INDEX IF EXISTS {n}").format(
-                    n=sql.Identifier(name)
-                )
-            )
+            self._run(sql.SQL("DROP PROPERTY INDEX IF EXISTS {n}").format(n=sql.Identifier(name)))
 
     def ensure_indexes(self, desired: Sequence[Any]) -> List[str]:
         """Make this graph's indexes the ones asked for, and say what changed.
@@ -832,9 +808,7 @@ class AgensGraph(GraphStore):
         """
         try:
             with self._dedicated() as conn:
-                statements = reconcile_indexes(
-                    desired, self._held_indexes(conn, desired)
-                )
+                statements = reconcile_indexes(desired, self._held_indexes(conn, desired))
                 if not statements:
                     return []
                 # Something has to be built, so the graph-wide read is worth paying for
@@ -926,15 +900,15 @@ class AgensGraph(GraphStore):
         driver's answer rather than overriding it -- a caller who has decided the role's
         privileges are acceptable passes ``allow_server_programs=True`` and says so.
         """
-        with self._borrowed() as conn, self._pinned(conn), conn.read_only_transaction(
-            allow_server_programs=allow_server_programs
+        with (
+            self._borrowed() as conn,
+            self._pinned(conn),
+            conn.read_only_transaction(allow_server_programs=allow_server_programs),
         ):
             yield
 
     @asynccontextmanager
-    async def aread_only(
-        self, *, allow_server_programs: bool = False
-    ) -> AsyncIterator[None]:
+    async def aread_only(self, *, allow_server_programs: bool = False) -> AsyncIterator[None]:
         """Async sibling of :meth:`read_only`.
 
         Statements inside the block run on the dedicated async connection, which is a
@@ -943,8 +917,9 @@ class AgensGraph(GraphStore):
         gets.
         """
         async with self._aborrowed() as conn:
-            async with self._apinned(conn), conn.read_only_transaction(
-                allow_server_programs=allow_server_programs
+            async with (
+                self._apinned(conn),
+                conn.read_only_transaction(allow_server_programs=allow_server_programs),
             ):
                 yield
 
@@ -1031,9 +1006,7 @@ class AgensGraph(GraphStore):
         driver recovers by running the batch again singly, which would apply a write
         twice.
         """
-        pairs = [
-            (item, None) if not isinstance(item, tuple) else item for item in statements
-        ]
+        pairs = [(item, None) if not isinstance(item, tuple) else item for item in statements]
         with self._acquire() as conn:
             try:
                 results = conn.pipeline_query(pairs)
@@ -1069,9 +1042,7 @@ class AgensGraph(GraphStore):
         ):
             return
 
-        sample = (
-            ENHANCED_SCHEMA_SAMPLE if self.enhanced_schema else DEFAULT_SCHEMA_SAMPLE
-        )
+        sample = ENHANCED_SCHEMA_SAMPLE if self.enhanced_schema else DEFAULT_SCHEMA_SAMPLE
         # The triple catalog is filled by a gather, and `auto_gather_graphmeta` is off by
         # default, so a refresh asks for one. The driver gathers only when the server
         # reports the catalog is not current, so a read-mostly graph pays a catalog read
@@ -1111,9 +1082,7 @@ class AgensGraph(GraphStore):
             keys = keys.split(" WHERE ", 1)[0].strip()
             if method != "btree" or "__id__" in keys or not keys:
                 continue
-            entries.append(
-                {"label": index.label, "on": keys, "unique": index.unique}
-            )
+            entries.append({"label": index.label, "on": keys, "unique": index.unique})
         return entries
 
     def _augment_with_examples(
@@ -1212,9 +1181,7 @@ class AgensGraph(GraphStore):
         }
 
     @staticmethod
-    def _rendered(
-        description: agensgraph.GraphDescription, structured: Dict[str, Any]
-    ) -> str:
+    def _rendered(description: agensgraph.GraphDescription, structured: Dict[str, Any]) -> str:
         """The schema as the string a prompt carries.
 
         The counts are here because they cost nothing -- they came from the catalogs
@@ -1244,11 +1211,14 @@ class AgensGraph(GraphStore):
         )
         return f"""
         Node properties are the following:
-        {[{"labels": label, "properties": props}
-          for label, props in structured["node_props"].items()]}
+        {
+            [
+                {"labels": label, "properties": props}
+                for label, props in structured["node_props"].items()
+            ]
+        }
         Relationship properties are the following:
-        {[{"type": label, "properties": props}
-          for label, props in structured["rel_props"].items()]}
+        {[{"type": label, "properties": props} for label, props in structured["rel_props"].items()]}
         The relationships are the following:
         {triples}
         Element counts are the following:
@@ -1365,9 +1335,7 @@ class AgensGraph(GraphStore):
             for label, rows in vertices.items():
                 # `update` rather than `skip`: re-reading a source is meant to refresh
                 # what it says about an element it has seen before.
-                conn.upsert_vertices(
-                    label, "id", list(rows.values()), on_existing="update"
-                )
+                conn.upsert_vertices(label, "id", list(rows.values()), on_existing="update")
             for triple, pairs in edges.items():
                 self._write_edges(conn, triple, pairs)
 
@@ -1424,9 +1392,9 @@ class AgensGraph(GraphStore):
                 remember(source_label, doc.source.metadata["id"], doc.source.metadata)
                 for node in doc.nodes:
                     node_label = self.clean_graph_labels(node.type)
-                    edges.setdefault(
-                        (source_label, "MENTIONS", node_label), []
-                    ).append((doc.source.metadata["id"], node.id, {}))
+                    edges.setdefault((source_label, "MENTIONS", node_label), []).append(
+                        (doc.source.metadata["id"], node.id, {})
+                    )
         return vertices, edges
 
     def _ensure_graph_doc_labels(
@@ -1490,16 +1458,13 @@ class AgensGraph(GraphStore):
         # Only the edges that carry properties are written to. Most extracted edges carry
         # none, and `SET r += {}` still rewrites the row -- so re-reading a source rewrote
         # every edge it had ever produced to say nothing about any of them.
-        assignment = (
-            "\n                   SET r += row.p"
-            if any(row["p"] for row in rows)
-            else ""
-        )
+        assignment = "\n                   SET r += row.p" if any(row["p"] for row in rows) else ""
         conn.execute(
             sql.SQL(
                 """UNWIND %(rows)s AS row
                    MATCH (f:{start} {{id: row.f}}), (t:{end} {{id: row.t}}) MERGE
-                   (f)-[r:{label}]->(t)""" + assignment
+                   (f)-[r:{label}]->(t)"""
+                + assignment
             ).format(
                 start=sql.Identifier(start_label),
                 end=sql.Identifier(end_label),

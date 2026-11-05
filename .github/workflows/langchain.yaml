@@ -1,0 +1,159 @@
+name: langchain-agensgraph
+
+on:
+  push:
+    paths:
+      - 'langchain/**'
+      - '.github/workflows/langchain.yaml'
+  pull_request:
+    paths:
+      - 'langchain/**'
+      - '.github/workflows/langchain.yaml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: langchain
+
+jobs:
+  # Everything that needs no server, on every supported Python, on amd64 and arm64 natively. Kept
+  # apart from the server legs so a lint failure is reported in seconds.
+  checks:
+    name: checks (${{ matrix.python-version }}, ${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.12', '3.13', '3.14']
+        runner: ['ubuntu-latest', 'ubuntu-24.04-arm']
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: langchain/uv.lock
+
+      - name: Install
+        run: uv sync --locked --group test --group lint --python ${{ matrix.python-version }}
+
+      - name: Format and lint
+        run: |
+          uv run ruff format --check langchain_agensgraph tests evals
+          uv run ruff check langchain_agensgraph tests evals
+
+      # -X dev makes ResourceWarning visible, which is how an unclosed connection is found; the
+      # pytest configuration turns every warning into an error.
+      - name: Tests that need no server
+        run: uv run python -X dev -m pytest -q tests/unit_tests
+
+      - name: Import time
+        run: uv run python -X importtime -c "import langchain_agensgraph" 2>&1 | tail -1
+
+  # What would be published, installed away from the source tree: a clean environment resolves
+  # every dependency from PyPI, as a user's does.
+  package:
+    name: package (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: ['ubuntu-latest', 'ubuntu-24.04-arm']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Build both distributions
+        run: uv build
+
+      # Run from /tmp: from the project directory, the source tree would be imported instead.
+      - name: Install each into a clean environment
+        run: |
+          for dist in dist/*.whl dist/*.tar.gz; do
+            uv venv --clear /tmp/installed
+            VIRTUAL_ENV=/tmp/installed uv pip install "$dist"
+            (cd /tmp && /tmp/installed/bin/python -c '
+          import langchain_agensgraph as package
+          assert "site-packages" in package.__file__, package.__file__
+          print(package.__version__, package.__file__)
+          ')
+          done
+
+  # The suites against every release the package supports, each from its published image plus
+  # pgvector, on amd64 and arm64. The image is built in every run for the runner's own
+  # architecture -- every base is multi-arch, so there is no emulation -- and never published.
+  #
+  # REQUIRE_SERVER fails the run if a server test would skip for want of a server, and SKIP_LEDGER
+  # fails it if any test skips for a reason the ledger does not allow on this release.
+  against-a-release:
+    name: against ${{ matrix.release }} (${{ matrix.runner }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        release: ['2.14.1', '2.15.0', '2.16.0', '2.17.0', '2.18.4.0', '2.18.6.1']
+        runner: ['ubuntu-latest', 'ubuntu-24.04-arm']
+        include:
+          - {release: '2.14.1', python: '3.11'}
+          - {release: '2.15.0', python: '3.13'}
+          - {release: '2.16.0', python: '3.13'}
+          - {release: '2.17.0', python: '3.13'}
+          - {release: '2.18.4.0', python: '3.13'}
+          - {release: '2.18.6.1', python: '3.14'}
+    env:
+      # The image's superuser: postgres up to 2.17, agens from 2.18.
+      AG_USER: ${{ startsWith(matrix.release, '2.18') && 'agens' || 'postgres' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build the test image
+        uses: docker/build-push-action@v6
+        with:
+          context: langchain/tests/images
+          build-args: |
+            BASE=skaiworldwide/agensgraph:v${{ matrix.release }}-bookworm
+            AGVERSION=${{ matrix.release }}
+          tags: agensgraph-test:${{ matrix.release }}
+          load: true
+          push: false
+          cache-from: type=gha,scope=langchain-test-${{ matrix.release }}-${{ runner.arch }}
+          cache-to: type=gha,mode=max,scope=langchain-test-${{ matrix.release }}-${{ runner.arch }}
+
+      # Healthy means the server answers and reports the release the image was built for.
+      - name: Start it
+        run: |
+          docker run -d --name agensgraph -e POSTGRES_PASSWORD=agens -p 5432:5432 \
+            agensgraph-test:${{ matrix.release }}
+          for _ in $(seq 90); do
+            status=$(docker inspect -f '{{.State.Health.Status}}' agensgraph)
+            [ "$status" = healthy ] && break
+            sleep 1
+          done
+          [ "$status" = healthy ] || { docker logs agensgraph | tail -50; exit 1; }
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: langchain/uv.lock
+
+      - name: Install
+        run: uv sync --locked --group test --python ${{ matrix.python }}
+
+      - name: Tests, against the server
+        env:
+          AGENSGRAPH_TEST_DSN: postgresql://${{ env.AG_USER }}:agens@127.0.0.1:5432/postgres
+          AGENSGRAPH_COMPAT_DSNS: ${{ matrix.release }}=postgresql://${{ env.AG_USER }}:agens@127.0.0.1:5432/postgres
+          AGENSGRAPH_COMPAT_DOCKER: ${{ matrix.release }}=agensgraph
+          REQUIRE_SERVER: '1'
+          SKIP_LEDGER: tests/skip_ledger.toml
+        run: uv run python -X dev -m pytest -q -rs tests/unit_tests tests/integration_tests tests/compat
+
+      - name: The server's own log, if anything failed
+        if: failure()
+        run: docker logs agensgraph 2>&1 | tail -100

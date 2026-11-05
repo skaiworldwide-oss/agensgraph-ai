@@ -101,25 +101,17 @@ class AgensText2CypherRetriever(_AgensRetrieverBase):
     def _corrected(self, question: str, cypher: str, error: object) -> str:
         """Ask the model again, showing it what it wrote and what the server said."""
         chain = self._chain
-        messages = chain.cypher_prompt.format_messages(
-            schema=chain._schema(), question=question
-        )
+        messages = chain.cypher_prompt.format_messages(schema=chain._schema(), question=question)
         messages.append(AIMessage(content=cypher))
-        messages.append(
-            HumanMessage(content=_CORRECTION.format(error=str(error)[:500]))
-        )
+        messages.append(HumanMessage(content=_CORRECTION.format(error=str(error)[:500])))
         raw = StrOutputParser().invoke(self.llm.invoke(messages))
         return quote_identifiers(strip_fences(raw), chain._known_names())
 
     async def _acorrected(self, question: str, cypher: str, error: object) -> str:
         chain = self._chain
-        messages = chain.cypher_prompt.format_messages(
-            schema=chain._schema(), question=question
-        )
+        messages = chain.cypher_prompt.format_messages(schema=chain._schema(), question=question)
         messages.append(AIMessage(content=cypher))
-        messages.append(
-            HumanMessage(content=_CORRECTION.format(error=str(error)[:500]))
-        )
+        messages.append(HumanMessage(content=_CORRECTION.format(error=str(error)[:500])))
         raw = StrOutputParser().invoke(await self.llm.ainvoke(messages))
         return quote_identifiers(strip_fences(raw), chain._known_names())
 

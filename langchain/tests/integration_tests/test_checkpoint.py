@@ -42,11 +42,15 @@ def _empty_checkpoint(cid: str, channel_values: dict, versions: dict):
 
 def test_put_get_roundtrip(saver: AgensSaver):
     cfg = {"configurable": {"thread_id": "t1", "checkpoint_ns": ""}}
-    ckpt = _empty_checkpoint("c1", {"messages": ["hi"], "count": 1}, {"messages": "1", "count": "1"})
+    ckpt = _empty_checkpoint(
+        "c1", {"messages": ["hi"], "count": 1}, {"messages": "1", "count": "1"}
+    )
     new_cfg = saver.put(cfg, ckpt, {"source": "input", "step": 1}, {"messages": "1", "count": "1"})
     assert new_cfg["configurable"]["checkpoint_id"] == "c1"
 
-    tup = saver.get_tuple({"configurable": {"thread_id": "t1", "checkpoint_ns": "", "checkpoint_id": "c1"}})
+    tup = saver.get_tuple(
+        {"configurable": {"thread_id": "t1", "checkpoint_ns": "", "checkpoint_id": "c1"}}
+    )
     assert tup is not None
     assert tup.checkpoint["id"] == "c1"
     assert tup.checkpoint["channel_values"] == {"messages": ["hi"], "count": 1}
@@ -92,7 +96,12 @@ def test_delete_thread(saver: AgensSaver):
     cfg = {"configurable": {"thread_id": "t5", "checkpoint_ns": ""}}
     saver.put(cfg, _empty_checkpoint("c1", {"x": 1}, {"x": "1"}), {}, {"x": "1"})
     saver.delete_thread("t5")
-    assert saver.get_tuple({"configurable": {"thread_id": "t5", "checkpoint_ns": "", "checkpoint_id": "c1"}}) is None
+    assert (
+        saver.get_tuple(
+            {"configurable": {"thread_id": "t5", "checkpoint_ns": "", "checkpoint_id": "c1"}}
+        )
+        is None
+    )
 
 
 from langgraph.graph.message import add_messages  # noqa: E402
@@ -133,7 +142,9 @@ def test_end_to_end_stategraph_resume(saver: AgensSaver):
 async def test_async_put_get(saver: AgensSaver):
     cfg = {"configurable": {"thread_id": "at1", "checkpoint_ns": ""}}
     await saver.aput(cfg, _empty_checkpoint("c1", {"x": 9}, {"x": "1"}), {"step": 1}, {"x": "1"})
-    tup = await saver.aget_tuple({"configurable": {"thread_id": "at1", "checkpoint_ns": "", "checkpoint_id": "c1"}})
+    tup = await saver.aget_tuple(
+        {"configurable": {"thread_id": "at1", "checkpoint_ns": "", "checkpoint_id": "c1"}}
+    )
     assert tup.checkpoint["channel_values"] == {"x": 9}
 
 
@@ -276,15 +287,11 @@ class TestDeltaChannelHistory:
                 {"source": "loop"},
                 {"delta": version},
             )
-            saver.put_writes(
-                self._cfg(thread_id, cid), [("delta", f"w{cid}")], f"t{cid}"
-            )
+            saver.put_writes(self._cfg(thread_id, cid), [("delta", f"w{cid}")], f"t{cid}")
 
     def test_history_seeds_from_the_storing_ancestor(self, saver: AgensSaver):
         self._chain(saver)
-        hist = saver.get_delta_channel_history(
-            config=self._cfg("d1", "c3"), channels=["delta"]
-        )
+        hist = saver.get_delta_channel_history(config=self._cfg("d1", "c3"), channels=["delta"])
         assert hist["delta"]["seed"] == "SNAPSHOT"
         # the target's own writes are excluded; ancestors' arrive oldest first
         got = [w[2] for w in hist["delta"]["writes"]]
@@ -295,9 +302,7 @@ class TestDeltaChannelHistory:
         self._chain(saver)
         cfg = self._cfg("d1", "c3")
         mine = saver.get_delta_channel_history(config=cfg, channels=["delta"])
-        base = BaseCheckpointSaver.get_delta_channel_history(
-            saver, config=cfg, channels=["delta"]
-        )
+        base = BaseCheckpointSaver.get_delta_channel_history(saver, config=cfg, channels=["delta"])
         assert mine == base
 
     def test_no_storing_ancestor_means_no_seed(self, saver: AgensSaver):
@@ -307,9 +312,7 @@ class TestDeltaChannelHistory:
             {"source": "loop"},
             {"delta": "1"},
         )
-        hist = saver.get_delta_channel_history(
-            config=self._cfg("d2", "c1"), channels=["delta"]
-        )
+        hist = saver.get_delta_channel_history(config=self._cfg("d2", "c1"), channels=["delta"])
         assert "seed" not in hist["delta"]
 
     def test_empty_channels_is_an_empty_mapping(self, saver: AgensSaver):
@@ -324,9 +327,7 @@ class TestDeltaChannelHistory:
         """
         self._chain(saver)
         saver.prune(["d1"])
-        hist = saver.get_delta_channel_history(
-            config=self._cfg("d1", "c3"), channels=["delta"]
-        )
+        hist = saver.get_delta_channel_history(config=self._cfg("d1", "c3"), channels=["delta"])
         assert hist["delta"]["seed"] == "SNAPSHOT"
         assert [w[2] for w in hist["delta"]["writes"]] == ["w1", "wc2"]
 
@@ -457,9 +458,9 @@ class TestAgreesWithTheReferenceSaver:
             (
                 "an emptied channel is absent from the state, not stale in it",
                 lambda s, t: sorted(
-                    s.get_tuple(
-                        {"configurable": {"thread_id": t, "checkpoint_ns": ""}}
-                    ).checkpoint["channel_values"]
+                    s.get_tuple({"configurable": {"thread_id": t, "checkpoint_ns": ""}}).checkpoint[
+                        "channel_values"
+                    ]
                 ),
             ),
         ],
@@ -483,7 +484,7 @@ class TestAgreesWithTheReferenceSaver:
         stored = {
             (r["ch"], r["v"], r["t"])
             for r in saver._graph.query(
-                'MATCH (b:"CheckpointBlob") WHERE b.thread_id = \'ref2\' '
+                "MATCH (b:\"CheckpointBlob\") WHERE b.thread_id = 'ref2' "
                 "RETURN b.channel AS ch, b.version AS v, b.type AS t"
             )
         }

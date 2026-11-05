@@ -118,12 +118,8 @@ def arxiv_present() -> bool:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", default=None, help="chat model name")
-    parser.add_argument(
-        "--examples", type=int, default=0, help="few-shot pairs (0=off)"
-    )
-    parser.add_argument(
-        "--retry", action="store_true", help="max_retries=1 + retry_on_empty"
-    )
+    parser.add_argument("--examples", type=int, default=0, help="few-shot pairs (0=off)")
+    parser.add_argument("--retry", action="store_true", help="max_retries=1 + retry_on_empty")
     parser.add_argument("--graphs", default="t2c_movies,t2c_traps")
     parser.add_argument("--out", default=None, help="per-item JSONL path")
     args = parser.parse_args()
@@ -151,9 +147,7 @@ def main() -> None:
             console.kv(graph_name, "absent — skipped")
             continue
         with console.timer(f"{graph_name}: {len(entries)} entries"):
-            all_outcomes += score_graph(
-                graph_name, entries, llm, args.examples, args.retry
-            )
+            all_outcomes += score_graph(graph_name, entries, llm, args.examples, args.retry)
 
     scored = [o for o in all_outcomes if "skipped" not in o]
     ran = [o for o in scored if o["ok"]]
@@ -161,9 +155,7 @@ def main() -> None:
     console.section(f"results — {tag}")
     console.kv("entries", len(scored))
     total = max(1, len(scored))
-    console.kv(
-        "executable", f"{len(ran)}/{len(scored)} ({100 * len(ran) / total:.0f}%)"
-    )
+    console.kv("executable", f"{len(ran)}/{len(scored)} ({100 * len(ran) / total:.0f}%)")
     console.kv(
         "execution accuracy",
         f"{len(matched)}/{len(scored)} ({100 * len(matched) / total:.0f}%)",

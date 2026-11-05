@@ -106,7 +106,7 @@ class TestNamespaces:
         assert {h.key for h in hits} == {"m1", "m2"}
 
     def test_string_prefix_is_not_a_namespace_prefix(self, store):
-        """"users.alice" must not match a namespace merely starting with those bytes."""
+        """ "users.alice" must not match a namespace merely starting with those bytes."""
         store.put(("users", "alice"), "k", {"v": 1})
         store.put(("users", "alicia"), "k", {"v": 2})
         hits = store.search(("users", "alice"))
@@ -256,9 +256,7 @@ class TestSemanticSearch:
     def test_semantic_search_applies_filter_operators(self, vector_store: AgensStore):
         vector_store.put(("docs",), "d1", {"text": "alpha", "score": 1})
         vector_store.put(("docs",), "d2", {"text": "beta", "score": 9})
-        hits = vector_store.search(
-            ("docs",), query="alpha", filter={"score": {"$gt": 5}}
-        )
+        hits = vector_store.search(("docs",), query="alpha", filter={"score": {"$gt": 5}})
         assert [h.key for h in hits] == ["d2"]
 
     def test_embedding_row_is_removed_with_its_item(self, vector_store: AgensStore):
@@ -311,19 +309,14 @@ class TestOneFilterMeansOneAnswer:
         flt = {"age": {"$gt": 5}}
         plain = sorted(i.key for i in mixed.search(("f",), filter=flt, limit=50))
         semantic = sorted(
-            i.key
-            for i in await mixed.asearch(
-                ("f",), query="shared text", filter=flt, limit=50
-            )
+            i.key for i in await mixed.asearch(("f",), query="shared text", filter=flt, limit=50)
         )
         assert plain == semantic
 
     def test_a_filter_still_narrows(self, mixed):
         """Guards against the two paths agreeing by both matching everything."""
         everything = mixed.search(("f",), query="shared text", limit=50)
-        narrowed = mixed.search(
-            ("f",), query="shared text", filter={"age": {"$eq": 3}}, limit=50
-        )
+        narrowed = mixed.search(("f",), query="shared text", filter={"age": {"$eq": 3}}, limit=50)
         assert len(everything) == len(self.MIXED)
         assert [i.key for i in narrowed] == ["num3"]
 
@@ -372,16 +365,12 @@ class TestEveryMatchConditionHolds:
         return store
 
     def test_a_wildcard_condition_beside_a_plain_one(self, tree: AgensStore):
-        found = tree.list_namespaces(
-            prefix=("users", "*"), suffix=("memories",), limit=50
-        )
+        found = tree.list_namespaces(prefix=("users", "*"), suffix=("memories",), limit=50)
         assert found == [("users", "alice", "memories")]
 
     @pytest.mark.asyncio
     async def test_the_async_path_agrees(self, tree: AgensStore):
-        found = await tree.alist_namespaces(
-            prefix=("users", "*"), suffix=("memories",), limit=50
-        )
+        found = await tree.alist_namespaces(prefix=("users", "*"), suffix=("memories",), limit=50)
         assert found == [("users", "alice", "memories")]
 
 
@@ -438,9 +427,7 @@ class TestQueryPlans:
             for i in range(5000)
         ]
         store._graph.query(store._put_cypher(), {"rows": Jsonb(rows)})
-        store._graph.query(
-            f'ANALYZE "{store._graph.graph_name}"."{store._label}"'
-        )
+        store._graph.query(f'ANALYZE "{store._graph.graph_name}"."{store._label}"')
         return store
 
     def test_get_uses_the_composite_index(self, loaded: AgensStore):
@@ -508,9 +495,7 @@ class TestAnEmbeddingGoesOverTheWireAsItself:
     def test_the_stored_vector_has_the_width_it_was_given(self, wide: AgensStore):
         wide.put(("ns",), "k", {"t": "a memory"})
         table = f'"{wide._graph.graph_name}_store".item_vec'
-        dims = wide._graph.query(
-            f"SELECT vector_dims(embedding) AS d FROM {table} LIMIT 1"
-        )[0]["d"]
+        dims = wide._graph.query(f"SELECT vector_dims(embedding) AS d FROM {table} LIMIT 1")[0]["d"]
         assert int(dims) == self.DIMS
 
     @pytest.mark.asyncio
@@ -616,9 +601,7 @@ class TestAnItemAndItsEmbeddingLandTogether:
             def embed_query(self, text):
                 return [0.1] * 10
 
-        store = AgensStore(
-            graph=graph, index={"dims": 10, "embed": Working(), "fields": ["t"]}
-        )
+        store = AgensStore(graph=graph, index={"dims": 10, "embed": Working(), "fields": ["t"]})
         try:
             store.put(("ns",), "k", {"t": "a memory"})
             table = f'"{graph.graph_name}_store".item_vec'
@@ -654,9 +637,7 @@ class TestASearchOfOneNamespaceFindsIt:
         from langgraph.store.base import PutOp
 
         graph = AgensGraph("store_ns_it", _conf(), create=True)
-        store = AgensStore(
-            graph=graph, index={"dims": 10, "embed": self.Spread(), "fields": ["t"]}
-        )
+        store = AgensStore(graph=graph, index={"dims": 10, "embed": self.Spread(), "fields": ["t"]})
         held = graph.query('MATCH (n:"StoreItem") RETURN count(*) AS c')[0]["c"]
         if held < 2000:
             graph.query("MATCH (n) DETACH DELETE n")

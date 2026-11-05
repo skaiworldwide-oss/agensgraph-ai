@@ -1,4 +1,4 @@
-'''
+"""
 Copyright (c) 2025, SKAI Worldwide Co., Ltd.
 
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -12,7 +12,7 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
-'''
+"""
 
 import os
 import unittest
@@ -52,6 +52,7 @@ conf = {
     "port": int(os.getenv("AGENSGRAPH_PORT", 5432)),
 }
 
+
 class TestAgensGraph(unittest.TestCase):
     def setUp(self) -> None:
         self.assertIsNotNone(conf["dbname"])
@@ -76,9 +77,7 @@ class TestAgensGraph(unittest.TestCase):
     def test_node_properties(self) -> None:
         self._seed()
         node_props = self.graph.get_structured_schema["node_props"]
-        self.assertEqual(
-            node_props["LabelA"], [{"property": "property_a", "type": "string"}]
-        )
+        self.assertEqual(node_props["LabelA"], [{"property": "property_a", "type": "string"}])
         # A label with no properties is still a label, and is still reported.
         self.assertIn("LabelB", node_props)
 
@@ -86,9 +85,7 @@ class TestAgensGraph(unittest.TestCase):
         self._seed()
         rel_props = self.graph.get_structured_schema["rel_props"]
         # An edge's own properties, which are only reachable if the decoder keeps them.
-        self.assertEqual(
-            rel_props["REL_TYPE"], [{"property": "rel_prop", "type": "string"}]
-        )
+        self.assertEqual(rel_props["REL_TYPE"], [{"property": "rel_prop", "type": "string"}])
 
     def test_relationships(self) -> None:
         self._seed()
@@ -114,9 +111,7 @@ class TestAgensGraph(unittest.TestCase):
         output = self.graph.query(
             "MATCH (n) RETURN label(n) AS label, count(*) AS count ORDER BY label"
         )
-        self.assertEqual(
-            output, [{"label": "bar", "count": 1}, {"label": "foo", "count": 1}]
-        )
+        self.assertEqual(output, [{"label": "bar", "count": 1}, {"label": "foo", "count": 1}])
 
     def test_add_documents_source(self) -> None:
         # Create two nodes and a relationship
@@ -183,12 +178,8 @@ class TestAgensGraph(unittest.TestCase):
                 "c": [{"property": "id", "type": "integer"}],
             },
         )
-        self.assertEqual(
-            refreshed["rel_props"], {"b": [{"property": "id", "type": "integer"}]}
-        )
-        self.assertEqual(
-            refreshed["relationships"], [{"start": "a", "type": "b", "end": "c"}]
-        )
+        self.assertEqual(refreshed["rel_props"], {"b": [{"property": "id", "type": "integer"}]})
+        self.assertEqual(refreshed["relationships"], [{"start": "a", "type": "b", "end": "c"}])
         # Counts arrive from the catalogs with everything else.
         self.assertEqual(refreshed["counts"], {"a": 1, "c": 1, "b": 1})
         self.assertIn('(:"a")-[:"b"]->(:"c")', self.graph.get_schema)
@@ -203,9 +194,7 @@ class TestSchemaIndexes(unittest.TestCase):
     """
 
     def setUp(self) -> None:
-        self.graph = AgensGraph(
-            "schema_idx_test", conf, create=True, refresh_schema=False
-        )
+        self.graph = AgensGraph("schema_idx_test", conf, create=True, refresh_schema=False)
         self.graph.query("CREATE VLABEL IF NOT EXISTS doc")
         self.graph.query("MATCH (n) DETACH DELETE n")
         self.graph.query("CREATE (:doc {title: 'one', code: 'x1'})")
@@ -235,9 +224,7 @@ class TestSchemaIndexes(unittest.TestCase):
         self.assertIn('(:"doc") ON ((tolower(title)))', rendered)
 
     def test_the_section_can_be_turned_off(self) -> None:
-        quiet = AgensGraph(
-            "schema_idx_test", conf, include_indexes=False, refresh_schema=False
-        )
+        quiet = AgensGraph("schema_idx_test", conf, include_indexes=False, refresh_schema=False)
         quiet.refresh_schema(force=True)
         self.assertEqual(quiet.get_structured_schema["indexes"], [])
         self.assertNotIn("Property indexes", quiet.get_schema)

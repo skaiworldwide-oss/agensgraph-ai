@@ -85,8 +85,7 @@ class LLMGraphTransformer:
     ) -> None:
         if not hasattr(llm, "with_structured_output"):
             raise ValueError(
-                "LLMGraphTransformer requires an LLM that supports "
-                "`with_structured_output`."
+                "LLMGraphTransformer requires an LLM that supports `with_structured_output`."
             )
         self.allowed_nodes = allowed_nodes or []
         self.allowed_relationships = allowed_relationships or []
@@ -110,9 +109,7 @@ class LLMGraphTransformer:
         ]
         if self.allowed_nodes:
             parts.append(
-                "Only extract nodes of these types: "
-                + ", ".join(self.allowed_nodes)
-                + "."
+                "Only extract nodes of these types: " + ", ".join(self.allowed_nodes) + "."
             )
         if self.allowed_relationships:
             parts.append(
@@ -150,9 +147,7 @@ class LLMGraphTransformer:
         """The relationship type as the caller spelled it, for one they named."""
         return self._rel_case.get(type_.lower(), type_)
 
-    def _to_graph_document(
-        self, schema: _GraphSchema, source: Document
-    ) -> GraphDocument:
+    def _to_graph_document(self, schema: _GraphSchema, source: Document) -> GraphDocument:
         # Keyed by the type as the caller spells it, which is also how a relationship's
         # endpoint is looked up. A model naming the same entity `Person` here and
         # `PERSON` in a relationship is naming one entity, and keying on what it wrote
@@ -175,12 +170,12 @@ class LLMGraphTransformer:
                 self._keep_node(r.source_type) and self._keep_node(r.target_type)
             ):
                 continue
-            source_node = nodes.get(
-                (r.source_id, self._node_type(r.source_type))
-            ) or Node(id=r.source_id, type=self._node_type(r.source_type))
-            target_node = nodes.get(
-                (r.target_id, self._node_type(r.target_type))
-            ) or Node(id=r.target_id, type=self._node_type(r.target_type))
+            source_node = nodes.get((r.source_id, self._node_type(r.source_type))) or Node(
+                id=r.source_id, type=self._node_type(r.source_type)
+            )
+            target_node = nodes.get((r.target_id, self._node_type(r.target_type))) or Node(
+                id=r.target_id, type=self._node_type(r.target_type)
+            )
             props = _props_to_dict(r.properties) if self.node_properties else {}
             rels.append(
                 Relationship(
@@ -190,9 +185,7 @@ class LLMGraphTransformer:
                     properties=props,
                 )
             )
-        return GraphDocument(
-            nodes=list(nodes.values()), relationships=rels, source=source
-        )
+        return GraphDocument(nodes=list(nodes.values()), relationships=rels, source=source)
 
     @staticmethod
     def _coerce(result: Any) -> _GraphSchema:
@@ -208,9 +201,7 @@ class LLMGraphTransformer:
         result = self._structured.invoke(self._messages(document.page_content))
         return self._to_graph_document(self._coerce(result), document)
 
-    def convert_to_graph_documents(
-        self, documents: Sequence[Document]
-    ) -> List[GraphDocument]:
+    def convert_to_graph_documents(self, documents: Sequence[Document]) -> List[GraphDocument]:
         return [self.process_response(d) for d in documents]
 
     async def aprocess_response(self, document: Document) -> GraphDocument:
@@ -242,8 +233,7 @@ class LLMGraphTransformer:
                 raise result
             if isinstance(result, BaseException):
                 logger.warning(
-                    "LLMGraphTransformer: skipping a document after extraction "
-                    "error: %s",
+                    "LLMGraphTransformer: skipping a document after extraction error: %s",
                     result,
                 )
             else:

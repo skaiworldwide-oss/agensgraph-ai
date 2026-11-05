@@ -162,9 +162,7 @@ class AgensStore(BaseStore):
                 raise ValueError("AgensStore requires either `graph` or `conf`.")
             # Nothing here reads the schema, and describing a graph counts every vertex
             # and every edge in it, for a component that never looks at the answer.
-            graph = AgensGraph(
-                graph_name, conf, create=True, refresh_schema=False
-            )
+            graph = AgensGraph(graph_name, conf, create=True, refresh_schema=False)
             self._owns_graph = True
         else:
             self._owns_graph = False
@@ -255,16 +253,10 @@ class AgensStore(BaseStore):
             return sql.SQL("CREATE VLABEL IF NOT EXISTS {l} ({cols})").format(
                 l=sql.Identifier(self._label), cols=cols
             )
-        return sql.SQL("CREATE VLABEL IF NOT EXISTS {l}").format(
-            l=sql.Identifier(self._label)
-        )
+        return sql.SQL("CREATE VLABEL IF NOT EXISTS {l}").format(l=sql.Identifier(self._label))
 
-    def _create_property_index_cypher(
-        self, name: str, props: Sequence[str]
-    ) -> sql.Composed:
-        return sql.SQL(
-            "CREATE PROPERTY INDEX IF NOT EXISTS {name} ON {l} ({cols})"
-        ).format(
+    def _create_property_index_cypher(self, name: str, props: Sequence[str]) -> sql.Composed:
+        return sql.SQL("CREATE PROPERTY INDEX IF NOT EXISTS {name} ON {l} ({cols})").format(
             name=sql.Identifier(name),
             l=sql.Identifier(self._label),
             cols=sql.SQL(", ").join(sql.Identifier(p) for p in props),
@@ -302,9 +294,7 @@ class AgensStore(BaseStore):
             sql.SQL(
                 "CREATE INDEX IF NOT EXISTS {name} ON {vec} "
                 "USING hnsw (embedding vector_cosine_ops)"
-            ).format(
-                name=sql.Identifier(f"{DEFAULT_VECTOR_TABLE}_hnsw"), vec=vec
-            ),
+            ).format(name=sql.Identifier(f"{DEFAULT_VECTOR_TABLE}_hnsw"), vec=vec),
             # The namespace test, in a form the search that joins this table can use.
             #
             # A property index is written in terms of the graph's own property accessor,
@@ -349,9 +339,7 @@ class AgensStore(BaseStore):
         return sql.SQL(" OR ").join(terms)
 
     @staticmethod
-    def _namespace_predicate_named(
-        prefix: str, params: Dict[str, Any], tag: str
-    ) -> sql.Composed:
+    def _namespace_predicate_named(prefix: str, params: Dict[str, Any], tag: str) -> sql.Composed:
         """Match a namespace and all of its descendants.
 
         An item stores every namespace that contains it, so this asks whether the one
@@ -373,9 +361,7 @@ class AgensStore(BaseStore):
             [sql.SQL("n"), sql.SQL("value")] + [sql.Identifier(p) for p in path]
         )
 
-    def _filter_predicate(
-        self, flt: Dict[str, Any], params: Dict[str, Any]
-    ) -> sql.Composed:
+    def _filter_predicate(self, flt: Dict[str, Any], params: Dict[str, Any]) -> sql.Composed:
         """Filters over ``value``, including comparison operators and nested keys.
 
         A field maps to a scalar or list for equality, or to a map of ``$`` operators
@@ -389,9 +375,7 @@ class AgensStore(BaseStore):
         def emit(path: List[str], want: Any) -> None:
             if isinstance(want, dict) and any(k.startswith("$") for k in want):
                 for op, operand in want.items():
-                    terms.append(
-                        self._operator_term(path, op, operand, params, counter)
-                    )
+                    terms.append(self._operator_term(path, op, operand, params, counter))
                 return
             if isinstance(want, dict):
                 for key, nested in want.items():
@@ -424,15 +408,11 @@ class AgensStore(BaseStore):
             return sql.SQL("{ref} = {v}").format(ref=ref, v=placeholder)
         if op == "$ne":
             # An absent key is unequal to anything, so it satisfies $ne.
-            return sql.SQL("({ref} IS NULL OR {ref} <> {v})").format(
-                ref=ref, v=placeholder
-            )
+            return sql.SQL("({ref} IS NULL OR {ref} <> {v})").format(ref=ref, v=placeholder)
         comparison = {"$gt": ">", "$gte": ">=", "$lt": "<", "$lte": "<="}.get(op)
         if comparison is None:
             raise ValueError(f"Unsupported operator: {op}")
-        return sql.SQL("{ref} {cmp} {v}").format(
-            ref=ref, cmp=sql.SQL(comparison), v=placeholder
-        )
+        return sql.SQL("{ref} {cmp} {v}").format(ref=ref, cmp=sql.SQL(comparison), v=placeholder)
 
     # ---- row <-> item ----
 
@@ -476,9 +456,7 @@ class AgensStore(BaseStore):
             "       n.created_at AS created_at, n.updated_at AS updated_at"
         ).format(l=sql.Identifier(self._label), pred=predicate)
 
-    def _search_cypher(
-        self, predicate: sql.Composed, limit: int, offset: int
-    ) -> sql.Composed:
+    def _search_cypher(self, predicate: sql.Composed, limit: int, offset: int) -> sql.Composed:
         return sql.SQL(
             "MATCH (n:{l}) WHERE {pred} "
             "RETURN n.prefix AS prefix, n.key AS key, n.value AS value, "
@@ -494,10 +472,7 @@ class AgensStore(BaseStore):
     def _list_namespaces_cypher(
         self, predicate: Optional[sql.Composed], limit: int, offset: int
     ) -> sql.Composed:
-        where = (
-            sql.SQL("WHERE {p} ").format(p=predicate) if predicate is not None
-            else sql.SQL("")
-        )
+        where = sql.SQL("WHERE {p} ").format(p=predicate) if predicate is not None else sql.SQL("")
         return sql.SQL(
             "MATCH (n:{l}) {where}RETURN DISTINCT n.prefix AS prefix "
             "ORDER BY prefix SKIP {off} LIMIT {lim}"
@@ -576,9 +551,7 @@ class AgensStore(BaseStore):
         return sql.SQL(
             "INSERT INTO {vec} (id, embedding) VALUES {vals} "
             "ON CONFLICT (id) DO UPDATE SET embedding = EXCLUDED.embedding"
-        ).format(
-            vec=sql.Identifier(self._vector_schema, DEFAULT_VECTOR_TABLE), vals=values
-        )
+        ).format(vec=sql.Identifier(self._vector_schema, DEFAULT_VECTOR_TABLE), vals=values)
 
     # ---- embedding ----
 
@@ -605,9 +578,7 @@ class AgensStore(BaseStore):
         parts: List[str] = []
         for field in fields:
             try:
-                parts.extend(
-                    str(found) for found in get_text_at_path(value, field) if found
-                )
+                parts.extend(str(found) for found in get_text_at_path(value, field) if found)
             except Exception:
                 if field in value:
                     parts.append(str(value[field]))
@@ -616,7 +587,9 @@ class AgensStore(BaseStore):
     # ---- op grouping ----
 
     @staticmethod
-    def _group(ops: Iterable[Op]) -> Tuple[
+    def _group(
+        ops: Iterable[Op],
+    ) -> Tuple[
         List[Tuple[int, GetOp]],
         List[Tuple[int, PutOp]],
         List[Tuple[int, PutOp]],
@@ -675,10 +648,7 @@ class AgensStore(BaseStore):
 
     @staticmethod
     def _has_wildcard(op: ListNamespacesOp) -> bool:
-        return any(
-            any(part == "*" for part in cond.path)
-            for cond in (op.match_conditions or ())
-        )
+        return any(any(part == "*" for part in cond.path) for cond in (op.match_conditions or ()))
 
     @classmethod
     def _match_predicate_sql(
@@ -701,9 +671,9 @@ class AgensStore(BaseStore):
                 params[f"mc_s{i}"] = NS_SEP + joined
                 params[f"mc_x{i}"] = joined
                 terms.append(
-                    sql.SQL(
-                        "(n.prefix = %({x})s OR n.prefix ENDS WITH %({s})s)"
-                    ).format(x=sql.SQL(f"mc_x{i}"), s=sql.SQL(f"mc_s{i}"))
+                    sql.SQL("(n.prefix = %({x})s OR n.prefix ENDS WITH %({s})s)").format(
+                        x=sql.SQL(f"mc_x{i}"), s=sql.SQL(f"mc_s{i}")
+                    )
                 )
         # ANDed: LangGraph's reference applies `all(...)` over the conditions, so a
         # namespace has to satisfy every one of them.
@@ -728,9 +698,7 @@ class AgensStore(BaseStore):
             raise ValueError(f"Unsupported match type: {condition.match_type}")
         return all(want == "*" or part == want for part, want in pairs)
 
-    def _apply_match_conditions(
-        self, prefixes: List[str], op: ListNamespacesOp
-    ) -> List[str]:
+    def _apply_match_conditions(self, prefixes: List[str], op: ListNamespacesOp) -> List[str]:
         """Keep the namespaces satisfying every condition.
 
         Read here rather than in the statement when any condition holds a ``*``, since a
@@ -768,12 +736,8 @@ class AgensStore(BaseStore):
 
         if deletes:
             params: Dict[str, Any] = {}
-            pairs = [
-                (flatten_namespace(op.namespace), op.key) for _, op in deletes
-            ]
-            self._graph.query(
-                self._delete_cypher(self._key_predicate(pairs, params)), params
-            )
+            pairs = [(flatten_namespace(op.namespace), op.key) for _, op in deletes]
+            self._graph.query(self._delete_cypher(self._key_predicate(pairs, params)), params)
             for i, _ in deletes:
                 results[i] = None
 
@@ -792,9 +756,7 @@ class AgensStore(BaseStore):
 
             def write() -> List[Dict[str, Any]]:
                 with self._graph.transaction():
-                    written = self._graph.query(
-                        self._put_cypher(), {"rows": Jsonb(rows)}
-                    )
+                    written = self._graph.query(self._put_cypher(), {"rows": Jsonb(rows)})
                     if vectors:
                         self._write_vectors(indexed, written, vectors)
                     return written
@@ -806,9 +768,7 @@ class AgensStore(BaseStore):
         if gets:
             params = {}
             pairs = [(flatten_namespace(op.namespace), op.key) for _, op in gets]
-            rows = self._graph.query(
-                self._get_cypher(self._key_predicate(pairs, params)), params
-            )
+            rows = self._graph.query(self._get_cypher(self._key_predicate(pairs, params)), params)
             found = {(r["prefix"], r["key"]): r for r in rows}
             for i, op in gets:
                 row = found.get((flatten_namespace(op.namespace), op.key))
@@ -899,9 +859,7 @@ class AgensStore(BaseStore):
             predicate = sql.SQL("({ns}) AND ({f})").format(
                 ns=predicate, f=self._filter_predicate(op.filter, params)
             )
-        rows = self._graph.query(
-            self._search_cypher(predicate, op.limit, op.offset), params
-        )
+        rows = self._graph.query(self._search_cypher(predicate, op.limit, op.offset), params)
         return [self._row_to_item(r, SearchItem, score=None) for r in rows]
 
     def _semantic_search(self, op: SearchOp, prefix: str) -> List[SearchItem]:
@@ -912,18 +870,14 @@ class AgensStore(BaseStore):
         """
         over_fetch = max(op.limit + op.offset, 1) * 4
         qvec = self._embed([op.query])[0]  # type: ignore[list-item]
-        ranked = self._in_namespace(
-            self._ranked_by_distance(over_fetch, qvec, prefix), prefix
-        )
+        ranked = self._in_namespace(self._ranked_by_distance(over_fetch, qvec, prefix), prefix)
         if not (op.filter and ranked):
             return self._semantic_items(ranked, None, op)
         statement, params = self._filter_query(ranked, op.filter)
         return self._semantic_items(ranked, self._graph.query(statement, params), op)
 
     @staticmethod
-    def _in_namespace(
-        rows: List[Dict[str, Any]], prefix: str
-    ) -> List[Dict[str, Any]]:
+    def _in_namespace(rows: List[Dict[str, Any]], prefix: str) -> List[Dict[str, Any]]:
         """The candidates under the namespace searched, itself included.
 
         Read here because the rows are already in hand and a namespace is compared as a
@@ -957,9 +911,9 @@ class AgensStore(BaseStore):
 
     def _select_keys_cypher(self, predicate: sql.Composed) -> sql.Composed:
         """Only which items matched: the values are already in hand."""
-        return sql.SQL(
-            "MATCH (n:{l}) WHERE {pred} RETURN n.prefix AS prefix, n.key AS key"
-        ).format(l=sql.Identifier(self._label), pred=predicate)
+        return sql.SQL("MATCH (n:{l}) WHERE {pred} RETURN n.prefix AS prefix, n.key AS key").format(
+            l=sql.Identifier(self._label), pred=predicate
+        )
 
     def _semantic_items(
         self,
@@ -1056,11 +1010,10 @@ class AgensStore(BaseStore):
                 if self._index and indexed
                 else []
             )
+
             async def write() -> None:
                 async with self._graph.atransaction():
-                    written = await self._graph.aquery(
-                        self._put_cypher(), {"rows": Jsonb(rows)}
-                    )
+                    written = await self._graph.aquery(self._put_cypher(), {"rows": Jsonb(rows)})
                     if vectors:
                         await self._awrite_vectors(indexed, written, vectors)
 
@@ -1109,18 +1062,14 @@ class AgensStore(BaseStore):
             if not (op.filter and ranked):
                 return self._semantic_items(ranked, None, op)
             statement, params = self._filter_query(ranked, op.filter)
-            return self._semantic_items(
-                ranked, await self._graph.aquery(statement, params), op
-            )
+            return self._semantic_items(ranked, await self._graph.aquery(statement, params), op)
         params: Dict[str, Any] = {}
         predicate = self._namespace_predicate(prefix, params)
         if op.filter:
             predicate = sql.SQL("({ns}) AND ({f})").format(
                 ns=predicate, f=self._filter_predicate(op.filter, params)
             )
-        rows = await self._graph.aquery(
-            self._search_cypher(predicate, op.limit, op.offset), params
-        )
+        rows = await self._graph.aquery(self._search_cypher(predicate, op.limit, op.offset), params)
         return [self._row_to_item(r, SearchItem, score=None) for r in rows]
 
     async def _alist_namespaces(self, op: ListNamespacesOp) -> List[Tuple[str, ...]]:

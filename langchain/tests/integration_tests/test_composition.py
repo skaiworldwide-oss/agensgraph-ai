@@ -88,9 +88,7 @@ class TestConcurrentWritesOnOneHandle:
                     with lock:
                         failures.append(exc)
 
-        threads = [
-            threading.Thread(target=work, args=(t,)) for t in range(self.THREADS)
-        ]
+        threads = [threading.Thread(target=work, args=(t,)) for t in range(self.THREADS)]
         for one in threads:
             one.start()
         for one in threads:
@@ -142,18 +140,16 @@ class TestATransactionInsideATransaction:
                 with pooled.transaction():
                     pooled.query("CREATE (:T {k: 'pooled-nested'})")
                 raise RuntimeError("undo")
-        found = pooled.query(
-            "MATCH (n:T {k: 'pooled-nested'}) RETURN count(n) AS c"
-        )[0]["c"]
+        found = pooled.query("MATCH (n:T {k: 'pooled-nested'}) RETURN count(n) AS c")[0]["c"]
         assert int(found) == 0
 
     def test_a_component_write_inside_a_pooled_transaction(self, pooled: AgensGraph):
         """The shape the package documents: a shared graph, a component, a transaction."""
         with pytest.raises(RuntimeError):
             with pooled.transaction():
-                AgensChatMessageHistory(
-                    session_id="in-a-transaction", graph=pooled
-                ).add_messages([HumanMessage(content="undone")])
+                AgensChatMessageHistory(session_id="in-a-transaction", graph=pooled).add_messages(
+                    [HumanMessage(content="undone")]
+                )
                 raise RuntimeError("undo")
         found = pooled.query(
             'MATCH (m:"Message") WHERE m.session = %(s)s RETURN count(m) AS c',
@@ -195,9 +191,7 @@ class TestATransactionInsideATransaction:
         nothing creates nothing and reports success -- so an ingest wrote every vertex and
         not one edge, silently. Both shapes, because only one of them was wrong.
         """
-        g: AgensGraph = request.getfixturevalue(
-            "graph" if shape == "shared" else "pooled"
-        )
+        g: AgensGraph = request.getfixturevalue("graph" if shape == "shared" else "pooled")
         g.query('MATCH (n:"Ghost") DETACH DELETE n')
         g.add_graph_documents([self._linked_document(shape)], include_source=True)
 
@@ -209,9 +203,7 @@ class TestATransactionInsideATransaction:
         assert int(edges) == 1, "the edge between the batch's own vertices"
         assert int(mentions) >= 1, "the edges to the source document"
 
-    def test_read_only_inside_a_transaction_still_refuses_a_write(
-        self, graph: AgensGraph
-    ):
+    def test_read_only_inside_a_transaction_still_refuses_a_write(self, graph: AgensGraph):
         with graph.transaction():
             with pytest.raises(Exception):
                 with graph.read_only(allow_server_programs=True):
@@ -244,9 +236,7 @@ class TestTheTimeoutHoldsInsideABlock:
                     pooled.query(self.SLOW, timeout=0.3)
         assert time.perf_counter() - started < 1.5, "it waited the whole two seconds"
 
-    def test_the_transaction_does_not_leave_its_timeout_behind(
-        self, pooled: AgensGraph
-    ):
+    def test_the_transaction_does_not_leave_its_timeout_behind(self, pooled: AgensGraph):
         """Stated for the transaction, so the connection goes back as it was found."""
         with pooled.transaction():
             pooled.query("MATCH (n:T) RETURN count(n)", timeout=0.3)
@@ -327,9 +317,7 @@ class TestSharedComponentsUnderConcurrency:
             def invoke(self, *a, **k):  # pragma: no cover
                 raise AssertionError
 
-        chain = AgensCypherQAChain(
-            graph=graph, cypher_llm=Unused(), qa_llm=Unused(), timeout=30.0
-        )
+        chain = AgensCypherQAChain(graph=graph, cypher_llm=Unused(), qa_llm=Unused(), timeout=30.0)
         seen: dict = {}
 
         # The second question has to start while the first is still going, and the first
@@ -363,9 +351,7 @@ class TestSharedComponentsUnderConcurrency:
         def work(w: int) -> None:
             own = AgensGraph(GRAPH, _conf(), create=True, refresh_schema=False)
             for i in range(per):
-                history = AgensChatMessageHistory(
-                    session_id=f"k{(w * per + i) % keys}", graph=own
-                )
+                history = AgensChatMessageHistory(session_id=f"k{(w * per + i) % keys}", graph=own)
                 try:
                     history.add_messages([HumanMessage(content=f"{w}-{i}")])
                 except Exception as exc:  # noqa: BLE001

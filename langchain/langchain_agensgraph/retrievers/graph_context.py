@@ -71,9 +71,7 @@ def build_expansion_query(
     """
     if not 1 <= int(hops) <= 3:
         raise ValueError("expand_by_hops must be between 1 and 3")
-    if relationship_type is not None and not _RELATIONSHIP_TYPE.match(
-        relationship_type
-    ):
+    if relationship_type is not None and not _RELATIONSHIP_TYPE.match(relationship_type):
         raise ValueError(
             "relationship_type must be a plain identifier "
             "(letters, digits and underscores, not starting with a digit); "
@@ -130,8 +128,7 @@ class AgensGraphContextRetriever(AgensVectorRetriever):
             )
         if self.store._index_type != IndexType.NODE:
             raise ValueError(
-                "Graph context expands from vertices; this store searches a "
-                "relationship index."
+                "Graph context expands from vertices; this store searches a relationship index."
             )
         self._expansion_query = build_expansion_query(
             hops=self.expand_by_hops,
@@ -179,9 +176,7 @@ def render_graph_context(doc: Document) -> Document:
         return str(fallback)
 
     named = {
-        node["id"]: "{}:{}".format(
-            node["label"], name_of(node.get("properties") or {}, node["id"])
-        )
+        node["id"]: "{}:{}".format(node["label"], name_of(node.get("properties") or {}, node["id"]))
         for node in nodes
     }
     lines = [f"- {name}" for name in named.values()]

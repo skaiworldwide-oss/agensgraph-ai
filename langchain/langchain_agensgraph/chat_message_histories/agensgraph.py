@@ -58,14 +58,10 @@ class AgensChatMessageHistory(BaseChatMessageHistory):
     ) -> None:
         if graph is None:
             if conf is None:
-                raise ValueError(
-                    "AgensChatMessageHistory requires either `graph` or `conf`."
-                )
+                raise ValueError("AgensChatMessageHistory requires either `graph` or `conf`.")
             # Nothing here reads the schema, and describing a graph counts every vertex
             # and every edge in it, for a component that never looks at the answer.
-            graph = AgensGraph(
-                graph_name, conf, create=True, refresh_schema=False
-            )
+            graph = AgensGraph(graph_name, conf, create=True, refresh_schema=False)
         self._graph = graph
         self.session_id = session_id
         self.session_node_label = session_node_label
@@ -205,15 +201,14 @@ class AgensChatMessageHistory(BaseChatMessageHistory):
     def _number_query(self) -> Any:
         """Give a session the number it now carries, counted once."""
         return sql.SQL(
-            "MATCH (s:{sl} {{id: %(sid)s}}) WHERE s.next_seq IS NULL "
-            "SET s.next_seq = %(cnt)s"
+            "MATCH (s:{sl} {{id: %(sid)s}}) WHERE s.next_seq IS NULL SET s.next_seq = %(cnt)s"
         ).format(sl=sql.Identifier(self.session_node_label))
 
     def _mark_named_query(self) -> Any:
         """Record that this session's messages carry it, so nobody asks again."""
-        return sql.SQL(
-            "MATCH (s:{sl} {{id: %(sid)s}}) SET s.named = true"
-        ).format(sl=sql.Identifier(self.session_node_label))
+        return sql.SQL("MATCH (s:{sl} {{id: %(sid)s}}) SET s.named = true").format(
+            sl=sql.Identifier(self.session_node_label)
+        )
 
     def _name_session_query(self) -> Any:
         """Tell a session's messages which session they belong to.
@@ -242,9 +237,7 @@ class AgensChatMessageHistory(BaseChatMessageHistory):
                 ml=sql.Identifier(self.message_node_label),
                 rl=sql.Identifier(self.relationship),
             )
-        return sql.SQL(
-            "MATCH (s:{sl} {{id: %(sid)s}})-[:{rl}]->(m:{ml}) DETACH DELETE m"
-        ).format(
+        return sql.SQL("MATCH (s:{sl} {{id: %(sid)s}})-[:{rl}]->(m:{ml}) DETACH DELETE m").format(
             sl=sql.Identifier(self.session_node_label),
             ml=sql.Identifier(self.message_node_label),
             rl=sql.Identifier(self.relationship),
@@ -262,9 +255,7 @@ class AgensChatMessageHistory(BaseChatMessageHistory):
     @staticmethod
     def _offsets(messages: Sequence[BaseMessage]) -> List[Dict[str, Any]]:
         """Each message with its offset from wherever the session's numbering resumes."""
-        return [
-            {"i": i, "data": message_to_dict(m)} for i, m in enumerate(messages)
-        ]
+        return [{"i": i, "data": message_to_dict(m)} for i, m in enumerate(messages)]
 
     @property
     def messages(self) -> List[BaseMessage]:
@@ -275,9 +266,7 @@ class AgensChatMessageHistory(BaseChatMessageHistory):
             # when the read found nothing, so a conversation that has any messages is
             # still one statement.
             if self._number_existing_messages():
-                rows = self._graph.query(
-                    self._select_query(), {"sid": self.session_id}
-                )
+                rows = self._graph.query(self._select_query(), {"sid": self.session_id})
         return self._rows_to_messages(rows)
 
     def _number_existing_messages(self) -> bool:
@@ -298,24 +287,16 @@ class AgensChatMessageHistory(BaseChatMessageHistory):
         if numbered and named:
             return False  # it carries both already
         count = (
-            int(self._graph.query(
-                self._count_messages_query(), {"sid": self.session_id}
-            )[0]["cnt"])
+            int(self._graph.query(self._count_messages_query(), {"sid": self.session_id})[0]["cnt"])
             if not numbered
             else 0
         )
         with self._graph.transaction():
             if not named:
-                self._graph.query(
-                    self._name_session_query(), {"sid": self.session_id}
-                )
-                self._graph.query(
-                    self._mark_named_query(), {"sid": self.session_id}
-                )
+                self._graph.query(self._name_session_query(), {"sid": self.session_id})
+                self._graph.query(self._mark_named_query(), {"sid": self.session_id})
             if not numbered:
-                self._graph.query(
-                    self._number_query(), {"sid": self.session_id, "cnt": count}
-                )
+                self._graph.query(self._number_query(), {"sid": self.session_id, "cnt": count})
         return True
 
     def add_messages(self, messages: Sequence[BaseMessage]) -> None:
@@ -334,9 +315,7 @@ class AgensChatMessageHistory(BaseChatMessageHistory):
         )
 
     def clear(self, delete_session_node: bool = False) -> None:
-        self._graph.query(
-            self._clear_query(delete_session_node), {"sid": self.session_id}
-        )
+        self._graph.query(self._clear_query(delete_session_node), {"sid": self.session_id})
 
     # ---- async API ----
 
@@ -344,9 +323,7 @@ class AgensChatMessageHistory(BaseChatMessageHistory):
         rows = await self._graph.aquery(self._select_query(), {"sid": self.session_id})
         if not rows and not self._numbered:
             if await self._anumber_existing_messages():
-                rows = await self._graph.aquery(
-                    self._select_query(), {"sid": self.session_id}
-                )
+                rows = await self._graph.aquery(self._select_query(), {"sid": self.session_id})
         return self._rows_to_messages(rows)
 
     async def _anumber_existing_messages(self) -> bool:
@@ -354,9 +331,7 @@ class AgensChatMessageHistory(BaseChatMessageHistory):
         if self._numbered:
             return False
         self._numbered = True
-        rows = await self._graph.aquery(
-            self._repair_needed_query(), {"sid": self.session_id}
-        )
+        rows = await self._graph.aquery(self._repair_needed_query(), {"sid": self.session_id})
         if not rows or not int(rows[0]["sessions"]):
             return False
         numbered = int(rows[0]["numbered"])
@@ -371,12 +346,8 @@ class AgensChatMessageHistory(BaseChatMessageHistory):
             count = int(counted[0]["cnt"])
         async with self._graph.atransaction():
             if not named:
-                await self._graph.aquery(
-                    self._name_session_query(), {"sid": self.session_id}
-                )
-                await self._graph.aquery(
-                    self._mark_named_query(), {"sid": self.session_id}
-                )
+                await self._graph.aquery(self._name_session_query(), {"sid": self.session_id})
+                await self._graph.aquery(self._mark_named_query(), {"sid": self.session_id})
             if not numbered:
                 await self._graph.aquery(
                     self._number_query(), {"sid": self.session_id, "cnt": count}
@@ -399,9 +370,7 @@ class AgensChatMessageHistory(BaseChatMessageHistory):
         )
 
     async def aclear(self, delete_session_node: bool = False) -> None:
-        await self._graph.aquery(
-            self._clear_query(delete_session_node), {"sid": self.session_id}
-        )
+        await self._graph.aquery(self._clear_query(delete_session_node), {"sid": self.session_id})
 
 
 __all__ = ["AgensChatMessageHistory"]

@@ -49,7 +49,7 @@ class TestQuoteIdentifiers:
 
     def test_quotes_a_known_map_key(self):
         got = self.q("MATCH (n {Name: 'x', age: 3}) RETURN n")
-        assert got == 'MATCH (n {"Name": \'x\', age: 3}) RETURN n'
+        assert got == "MATCH (n {\"Name\": 'x', age: 3}) RETURN n"
 
     def test_leaves_a_name_the_graph_stores_folded_alone(self):
         query = "MATCH (n:person) RETURN n.firstname"
@@ -147,12 +147,12 @@ class TestPrompt:
     @pytest.mark.parametrize(
         "rule",
         [
-            'n:"Person"',      # quoting
+            'n:"Person"',  # quoting
             "fold to lower case",
-            "apoc",            # Neo4j-only constructs ruled out by name
+            "apoc",  # Neo4j-only constructs ruled out by name
             "COUNT { ... }",
             "EXISTS { ... }",
-            "count(*)",        # the performance rule
+            "count(*)",  # the performance rule
             "Read-only",
         ],
     )

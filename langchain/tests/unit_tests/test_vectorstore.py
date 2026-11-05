@@ -22,10 +22,7 @@ def test_escaping_lucene() -> None:
         remove_lucene_chars("It is the end of the world. Take shelter&&")
         == "It is the end of the world. Take shelter"
     )
-    assert (
-        remove_lucene_chars("Bill&&Melinda Gates Foundation")
-        == "Bill  Melinda Gates Foundation"
-    )
+    assert remove_lucene_chars("Bill&&Melinda Gates Foundation") == "Bill  Melinda Gates Foundation"
     assert (
         remove_lucene_chars("It is the end of the world. Take shelter(&&)")
         == "It is the end of the world. Take shelter"

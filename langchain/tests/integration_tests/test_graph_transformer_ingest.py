@@ -55,7 +55,7 @@ def test_transformer_output_ingests():
 
     counts = g.query("MATCH (n) RETURN count(n) AS c")
     assert counts[0]["c"] == 2
-    rels = g.query('MATCH ()-[r]->() RETURN type(r) AS t')
+    rels = g.query("MATCH ()-[r]->() RETURN type(r) AS t")
     assert any(r["t"].upper() == "WORKS_AT" for r in rels)
     g.query("MATCH (n) DETACH DELETE n")
     g.close()

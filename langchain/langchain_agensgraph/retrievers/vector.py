@@ -72,9 +72,7 @@ class AgensVectorRetriever(_AgensRetrieverBase):
     def _get_relevant_documents(
         self, query: str, *, run_manager: CallbackManagerForRetrieverRun, **kwargs: Any
     ) -> List[Document]:
-        hits = self.store.similarity_search_with_score(
-            query, **self._search_kwargs(kwargs)
-        )
+        hits = self.store.similarity_search_with_score(query, **self._search_kwargs(kwargs))
         return self._finalize(hits)
 
     async def _aget_relevant_documents(

@@ -28,8 +28,7 @@ def _conf():
 
 def _indexdefs(graph: AgensGraph, label: str):
     rows = graph.query(
-        "SELECT indexdef FROM pg_indexes "
-        "WHERE schemaname = %(g)s AND tablename = %(t)s",
+        "SELECT indexdef FROM pg_indexes WHERE schemaname = %(g)s AND tablename = %(t)s",
         {"g": graph.graph_name, "t": label},
     )
     return [r["indexdef"] for r in rows]

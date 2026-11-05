@@ -102,9 +102,7 @@ class TestWildcardMatching:
     def _ok(prefix, path, match_type):
         from langgraph.store.base import MatchCondition
 
-        return AgensStore._condition_ok(
-            prefix, MatchCondition(match_type=match_type, path=path)
-        )
+        return AgensStore._condition_ok(prefix, MatchCondition(match_type=match_type, path=path))
 
     def test_prefix_wildcard(self):
         assert self._ok("users.alice.memories", ("users", "*"), "prefix")
@@ -156,9 +154,7 @@ class TestPredicateBuilders:
     def test_key_predicate_is_or_of_equalities_not_an_in_list(self):
         # A bound IN list degrades to a jsonb containment filter and loses the index.
         params: dict = {}
-        out = AgensStore._key_predicate(
-            AgensStore, [("a", "k1"), ("b", "k2")], params
-        ).as_string()
+        out = AgensStore._key_predicate(AgensStore, [("a", "k1"), ("b", "k2")], params).as_string()
         assert " OR " in out
         assert "IN" not in out
         # Sent as text, not wrapped as jsonb: the property index is on the text, so a

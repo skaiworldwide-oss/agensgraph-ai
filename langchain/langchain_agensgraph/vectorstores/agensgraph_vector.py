@@ -91,6 +91,7 @@ SUPPORTED_OPERATORS = (
     .union(SPECIAL_CASED_OPERATORS)
 )
 
+
 class SearchType(str, enum.Enum):
     """Enumerator of the Distance strategies."""
 
@@ -100,11 +101,13 @@ class SearchType(str, enum.Enum):
 
 DEFAULT_SEARCH_TYPE = SearchType.VECTOR
 
+
 class IndexType(str, enum.Enum):
     """Enumerator of the index types."""
 
     NODE = "NODE"
     RELATIONSHIP = "RELATIONSHIP"
+
 
 class VectorIndexAM(str, enum.Enum):
     """Enumerator of the vector index access methods."""
@@ -112,11 +115,13 @@ class VectorIndexAM(str, enum.Enum):
     HNSW = "HNSW"
     IVFFLAT = "ivfflat"
 
+
 class FullTextIndexAM(str, enum.Enum):
     """Enumerator of the full text index access methods."""
 
     GIN = "GIN"
     GIST = "GIST"
+
 
 DEFAULT_INDEX_TYPE = IndexType.NODE
 DEFAULT_VECTOR_INDEX_AM = VectorIndexAM.HNSW
@@ -200,17 +205,18 @@ class HybridSearchConfig:
 DEFAULT_HYBRID_CONFIG = HybridSearchConfig()
 DEFAULT_FULLTEXT_INDEX_AM = FullTextIndexAM.GIN
 
+
 def check_if_not_null(props: List[str], values: List[Any]) -> None:
     """Check if the values are not None or empty string"""
     for prop, value in zip(props, values):
         if not value:
             raise ValueError(f"Parameter `{prop}` must not be None or empty string")
 
-def sort_by_index_name(
-    lst: List[Dict[str, Any]], index_name: str
-) -> List[Dict[str, Any]]:
+
+def sort_by_index_name(lst: List[Dict[str, Any]], index_name: str) -> List[Dict[str, Any]]:
     """Sort first element to match the index_name if exists"""
     return sorted(lst, key=lambda x: x.get("name") != index_name)
+
 
 def remove_lucene_chars(text: str) -> str:
     """Remove Lucene special characters"""
@@ -239,6 +245,7 @@ def remove_lucene_chars(text: str) -> str:
             text = text.replace(char, " ")
     return text.strip()
 
+
 def dict_to_yaml_str(input_dict: Dict, indent: int = 0) -> str:
     """
     Convert a dictionary to a YAML-like string without using external libraries.
@@ -262,6 +269,7 @@ def dict_to_yaml_str(input_dict: Dict, indent: int = 0) -> str:
         else:
             yaml_str += f"{padding}{key}: {value}\n"
     return yaml_str
+
 
 def combine_queries(
     input_queries: List[Tuple[str, Dict[str, Any]]], operator: str
@@ -296,6 +304,7 @@ def combine_queries(
 
     return combined_query, combined_params
 
+
 def collect_params(
     input_data: List[Tuple[str, Dict[str, str]]],
 ) -> Tuple[List[str], Dict[str, Any]]:
@@ -322,6 +331,7 @@ def collect_params(
     # Return the transformed data
     return (query_parts, params)
 
+
 def like_to_regex(pattern: str, *, ignore_case: bool = False) -> str:
     """A SQL ``LIKE`` pattern as the regular expression Cypher's ``=~`` takes.
 
@@ -342,9 +352,7 @@ def like_to_regex(pattern: str, *, ignore_case: bool = False) -> str:
     return "".join(out)
 
 
-def _handle_field_filter(
-    field: str, value: Any, param_number: int = 1
-) -> Tuple[str, Dict]:
+def _handle_field_filter(field: str, value: Any, param_number: int = 1) -> Tuple[str, Dict]:
     """Create a filter for a specific field.
 
     Args:
@@ -360,14 +368,10 @@ def _handle_field_filter(
         - Dictionary with parameters used in filter snippet
     """
     if not isinstance(field, str):
-        raise ValueError(
-            f"field should be a string but got: {type(field)} with value: {field}"
-        )
+        raise ValueError(f"field should be a string but got: {type(field)} with value: {field}")
 
     if field.startswith("$"):
-        raise ValueError(
-            f"Invalid filter condition. Expected a field but got an operator: {field}"
-        )
+        raise ValueError(f"Invalid filter condition. Expected a field but got an operator: {field}")
 
     # Allow [a-zA-Z0-9_], disallow $ for now until we support escape characters
     if not field.isidentifier():
@@ -385,9 +389,7 @@ def _handle_field_filter(
         operator, filter_value = list(value.items())[0]
         # Verify that that operator is an operator
         if operator not in SUPPORTED_OPERATORS:
-            raise ValueError(
-                f"Invalid operator: {operator}. Expected one of {SUPPORTED_OPERATORS}"
-            )
+            raise ValueError(f"Invalid operator: {operator}. Expected one of {SUPPORTED_OPERATORS}")
     else:  # Then we assume an equality operator
         operator = "$eq"
         filter_value = value
@@ -409,9 +411,7 @@ def _handle_field_filter(
         # A property that is absent is unequal to anything, so it satisfies the test --
         # the same answer `$nin` gives for the same element. A comparison against null is
         # null rather than true, so the absence is named.
-        query_snippet = (
-            f'(n."{field}" IS NULL OR n."{field}" <> %(param_{param_number})s)'
-        )
+        query_snippet = f'(n."{field}" IS NULL OR n."{field}" <> %(param_{param_number})s)'
         return (query_snippet, {f"param_{param_number}": filter_value})
     if operator in COMPARISONS_TO_NATIVE:
         # Then we implement an equality filter native is trusted input
@@ -422,7 +422,8 @@ def _handle_field_filter(
     elif operator == "$between":
         low, high = filter_value
         query_snippet = (
-            f'%(param_{param_number}_low)s <= n."{field}" AND n."{field}" <= %(param_{param_number}_high)s'
+            f'%(param_{param_number}_low)s <= n."{field}" '
+            f'AND n."{field}" <= %(param_{param_number}_high)s'
         )
         query_param = {
             f"param_{param_number}_low": low,
@@ -435,9 +436,7 @@ def _handle_field_filter(
         if operator in {"$in", "$nin"}:
             for val in filter_value:
                 if not isinstance(val, (str, int, float)):
-                    raise NotImplementedError(
-                        f"Unsupported type: {type(val)} for value: {val}"
-                    )
+                    raise NotImplementedError(f"Unsupported type: {type(val)} for value: {val}")
         if operator == "$in":
             # One equality per value rather than `<@` over a list. Containment is not a
             # comparison an index answers, so a bound list costs a read of the whole
@@ -445,12 +444,9 @@ def _handle_field_filter(
             # it.
             values = list(filter_value)
             terms = " OR ".join(
-                f'n."{field}" = %(param_{param_number}_in{i})s'
-                for i in range(len(values))
+                f'n."{field}" = %(param_{param_number}_in{i})s' for i in range(len(values))
             )
-            params = {
-                f"param_{param_number}_in{i}": val for i, val in enumerate(values)
-            }
+            params = {f"param_{param_number}_in{i}": val for i, val in enumerate(values)}
             return (f"({terms})" if values else "false", params)
         if operator == "$nin":
             # One inequality per value, for the reason `$in` is one equality per value.
@@ -458,12 +454,9 @@ def _handle_field_filter(
             # null rather than true, so it is named separately.
             values = list(filter_value)
             terms = " AND ".join(
-                f'n."{field}" <> %(param_{param_number}_nin{i})s'
-                for i in range(len(values))
+                f'n."{field}" <> %(param_{param_number}_nin{i})s' for i in range(len(values))
             )
-            params = {
-                f"param_{param_number}_nin{i}": val for i, val in enumerate(values)
-            }
+            params = {f"param_{param_number}_nin{i}": val for i, val in enumerate(values)}
             if not values:
                 return ("true", {})
             return (f'(n."{field}" IS NULL OR ({terms}))', params)
@@ -477,6 +470,7 @@ def _handle_field_filter(
         raise NotImplementedError(f"Unsupported operator: {operator}")
     else:
         raise NotImplementedError()
+
 
 def construct_metadata_filter(filter: Dict[str, Any]) -> Tuple[str, Dict]:
     """Construct a metadata filter.
@@ -505,13 +499,9 @@ def construct_metadata_filter(filter: Dict[str, Any]) -> Tuple[str, Dict]:
 
             # Here we handle the $and and $or operators
             if not isinstance(value, list):
-                raise ValueError(
-                    f"Expected a list, but got {type(value)} for value: {value}"
-                )
+                raise ValueError(f"Expected a list, but got {type(value)} for value: {value}")
             if key.lower() == "$and":
-                and_ = combine_queries(
-                    [construct_metadata_filter(el) for el in value], "AND"
-                )
+                and_ = combine_queries([construct_metadata_filter(el) for el in value], "AND")
                 if len(and_) >= 1:
                     return and_
                 else:
@@ -520,9 +510,7 @@ def construct_metadata_filter(filter: Dict[str, Any]) -> Tuple[str, Dict]:
                         "but got an empty dictionary"
                     )
             elif key.lower() == "$or":
-                or_ = combine_queries(
-                    [construct_metadata_filter(el) for el in value], "OR"
-                )
+                or_ = combine_queries([construct_metadata_filter(el) for el in value], "OR")
                 if len(or_) >= 1:
                     return or_
                 else:
@@ -531,36 +519,27 @@ def construct_metadata_filter(filter: Dict[str, Any]) -> Tuple[str, Dict]:
                         "but got an empty dictionary"
                     )
             else:
-                raise ValueError(
-                    f"Invalid filter condition. Expected $and or $or but got: {key}"
-                )
+                raise ValueError(f"Invalid filter condition. Expected $and or $or but got: {key}")
         elif len(filter) > 1:
             # Then all keys have to be fields (they cannot be operators)
             for key in filter.keys():
                 if key.startswith("$"):
-                    raise ValueError(
-                        f"Invalid filter condition. Expected a field but got: {key}"
-                    )
+                    raise ValueError(f"Invalid filter condition. Expected a field but got: {key}")
             # These should all be fields and combined using an $and operator
             and_multiple = collect_params(
-                [
-                    _handle_field_filter(k, v, index)
-                    for index, (k, v) in enumerate(filter.items())
-                ]
+                [_handle_field_filter(k, v, index) for index, (k, v) in enumerate(filter.items())]
             )
             if len(and_multiple) >= 1:
                 return " AND ".join(and_multiple[0]), and_multiple[1]
             else:
                 raise ValueError(
-                    "Invalid filter condition. Expected a dictionary "
-                    "but got an empty dictionary"
+                    "Invalid filter condition. Expected a dictionary but got an empty dictionary"
                 )
         else:
             raise ValueError("Got an empty dictionary for filters.")
-    raise ValueError(
-        f"Expected a dictionary of filter conditions, got {type(filter).__name__}."
-    )
-        
+    raise ValueError(f"Expected a dictionary of filter conditions, got {type(filter).__name__}.")
+
+
 class AgensgraphVector(VectorStore):
     """`AgensGraph` vector index.
 
@@ -636,9 +615,7 @@ class AgensgraphVector(VectorStore):
         # anything else against it sorts a sequential scan instead of using it.
         self._distance = distance_of(distance_strategy)
         if vector_type not in VECTOR_TYPES:
-            raise ValueError(
-                f"vector_type is one of {VECTOR_TYPES}, not {vector_type!r}"
-            )
+            raise ValueError(f"vector_type is one of {VECTOR_TYPES}, not {vector_type!r}")
         # Hamming and Jaccard measure bit strings. Refused against any other storage
         # type here rather than at the server, where it arrives as a missing operator.
         wants_bits = distance_strategy in BIT_ONLY
@@ -671,9 +648,7 @@ class AgensgraphVector(VectorStore):
             self.graph_name = graph_name
             self.connection = engine.open_connection()
             self.connection.execute(
-                sql.SQL("CREATE GRAPH IF NOT EXISTS {}").format(
-                    sql.Identifier(graph_name)
-                )
+                sql.SQL("CREATE GRAPH IF NOT EXISTS {}").format(sql.Identifier(graph_name))
             )
             self.connection.graph(graph_name)
             self._graph = None
@@ -768,20 +743,22 @@ class AgensgraphVector(VectorStore):
         # statement changing the selection behind its back leaves it unable to trust that
         # table -- so it forgets which graph is selected, and every method that reads the
         # catalogs refuses until one is named again.
-        self.query(sql.SQL("CREATE GRAPH IF NOT EXISTS {}").format(
-            sql.Identifier(self.graph_name)
-        ))
+        self.query(sql.SQL("CREATE GRAPH IF NOT EXISTS {}").format(sql.Identifier(self.graph_name)))
         self.connection.graph(self.graph_name)
 
         # Delete existing data if flagged
         if pre_delete_collection:
-            self.query(sql.SQL(
-                "MATCH (n: {label}) DETACH DELETE n"
-            ).format(label=sql.Identifier(self.node_label)))
+            self.query(
+                sql.SQL("MATCH (n: {label}) DETACH DELETE n").format(
+                    label=sql.Identifier(self.node_label)
+                )
+            )
             # Delete index
-            self.query(sql.SQL(
-                "DROP PROPERTY INDEX IF EXISTS {index}"
-            ).format(index=sql.Identifier(self.index_name)))
+            self.query(
+                sql.SQL("DROP PROPERTY INDEX IF EXISTS {index}").format(
+                    index=sql.Identifier(self.index_name)
+                )
+            )
 
     def retrieve_existing_index(self) -> Tuple[Optional[int], Optional[str]]:
         """
@@ -992,15 +969,11 @@ class AgensgraphVector(VectorStore):
         """Create label if it does not exist."""
         if self._index_type == IndexType.RELATIONSHIP:
             self.query(
-                sql.SQL("CREATE ELABEL IF NOT EXISTS {}").format(
-                    sql.Identifier(self.node_label)
-                )
+                sql.SQL("CREATE ELABEL IF NOT EXISTS {}").format(sql.Identifier(self.node_label))
             )
         else:
             self.query(
-                sql.SQL("CREATE VLABEL IF NOT EXISTS {}").format(
-                    sql.Identifier(self.node_label)
-                )
+                sql.SQL("CREATE VLABEL IF NOT EXISTS {}").format(sql.Identifier(self.node_label))
             )
 
     def _id_index_ddl(self):
@@ -1012,8 +985,7 @@ class AgensgraphVector(VectorStore):
         key-indexes, so we only create it for node stores.
         """
         return sql.SQL(
-            "CREATE UNIQUE PROPERTY INDEX IF NOT EXISTS {name} "
-            "ON {label} (__id__)"
+            "CREATE UNIQUE PROPERTY INDEX IF NOT EXISTS {name} ON {label} (__id__)"
         ).format(
             name=sql.Identifier(f"{self.node_label}_id_index"),
             label=sql.Identifier(self.node_label),
@@ -1038,13 +1010,10 @@ class AgensgraphVector(VectorStore):
         ):
             return
         await self.aquery(
-            sql.SQL("CREATE VLABEL IF NOT EXISTS {}").format(
-                sql.Identifier(self.node_label)
-            )
+            sql.SQL("CREATE VLABEL IF NOT EXISTS {}").format(sql.Identifier(self.node_label))
         )
         await self.aquery(self._id_index_ddl())
         self._id_index_ready = True
-
 
     def create_new_index(
         self,
@@ -1069,7 +1038,7 @@ class AgensgraphVector(VectorStore):
         self.verify_label_existence()
         index_query = """CREATE PROPERTY INDEX IF NOT EXISTS {index_name}
             ON {node_label} USING {vector_index_am}
-            (({embedding_node_property}::{vector_type}({embedding_dimension})) {similarity_metric}){with_options}"""
+            (({embedding_node_property}::{vector_type}({embedding_dimension})) {similarity_metric}){with_options}"""  # noqa: E501
 
         # Composed here rather than taken from the driver's `vector_index()`, which builds
         # the same statement for the same shape and quotes its identifiers at least as
@@ -1187,12 +1156,8 @@ class AgensgraphVector(VectorStore):
             sql.SQL("to_tsvector('english', n.{p})").format(p=sql.Identifier(name))
             for name in self._text_properties()
         ]
-        match = sql.SQL(" OR ").join(
-            sql.SQL("{v} @@ {q}").format(v=v, q=question) for v in vectors
-        )
-        rank = sql.SQL("ts_rank_cd({v}, {q})").format(
-            v=sql.SQL(" || ").join(vectors), q=question
-        )
+        match = sql.SQL(" OR ").join(sql.SQL("{v} @@ {q}").format(v=v, q=question) for v in vectors)
+        rank = sql.SQL("ts_rank_cd({v}, {q})").format(v=sql.SQL(" || ").join(vectors), q=question)
         return match, rank
 
     def _stored_embedding(self, vector: Sequence[float]) -> Any:
@@ -1280,7 +1245,9 @@ class AgensgraphVector(VectorStore):
         self.verify_label_existence()
         node_props = self._text_properties()
 
-        fts_parts = [sql.SQL('(to_tsvector(\'english\', {}))').format(sql.Identifier(el)) for el in node_props]
+        fts_parts = [
+            sql.SQL("(to_tsvector('english', {}))").format(sql.Identifier(el)) for el in node_props
+        ]
         fts_index_query = """CREATE PROPERTY INDEX IF NOT EXISTS {index_name}
                              ON {node_label} USING {fulltext_index_am} ({expr})"""
 
@@ -1289,7 +1256,7 @@ class AgensgraphVector(VectorStore):
                 index_name=sql.Identifier(self.keyword_index_name),
                 node_label=sql.Identifier(self.node_label),
                 fulltext_index_am=sql.SQL(fulltext_index_am.value),
-                expr=sql.SQL(", ").join(fts_parts)
+                expr=sql.SQL(", ").join(fts_parts),
             )
         )
 
@@ -1325,9 +1292,7 @@ class AgensgraphVector(VectorStore):
 
         # Raise error if relationship index type
         if index_type == "RELATIONSHIP":
-            raise ValueError(
-                "Data ingestion is not supported with relationship vector index."
-            )
+            raise ValueError("Data ingestion is not supported with relationship vector index.")
 
         # If the vector index doesn't exist yet
         if not index_type:
@@ -1348,9 +1313,7 @@ class AgensgraphVector(VectorStore):
                 store.create_new_keyword_index()
             else:  # Validate that FTS and Vector index use the same information
                 if not fts_node_label == store.node_label:
-                    raise ValueError(
-                        "Vector and keyword index don't index the same node label"
-                    )
+                    raise ValueError("Vector and keyword index don't index the same node label")
 
         # The unique index that makes ingest fast is created lazily by
         # ``add_embeddings`` on the actual MERGE key (``__id__``); honor the caller's
@@ -1402,8 +1365,7 @@ class AgensgraphVector(VectorStore):
 
         if not (len(texts_list) == len(embeddings) == len(metadatas) == len(ids)):
             raise ValueError(
-                "add_embeddings: texts, embeddings, metadatas, ids must have "
-                "the same length"
+                "add_embeddings: texts, embeddings, metadatas, ids must have the same length"
             )
 
         # Index __id__ before the MERGE loop so each MERGE is an index lookup rather
@@ -1411,7 +1373,7 @@ class AgensgraphVector(VectorStore):
         self._ensure_id_index()
 
         import_query = sql.SQL(
-             """UNWIND %(data)s AS row
+            """UNWIND %(data)s AS row
                 MERGE (c:{label} {{__id__: row.id}}) WITH c, row
                 SET c += row.metadata
                 SET c.{text_property} = row.text
@@ -1428,8 +1390,7 @@ class AgensgraphVector(VectorStore):
         for start in range(0, n, step):
             end = min(start + step, n)
             batch_rows = [
-                {"text": t, "metadata": m,
-                 "embedding": self._stored_embedding(e), "id": i}
+                {"text": t, "metadata": m, "embedding": self._stored_embedding(e), "id": i}
                 for t, m, e, i in zip(
                     texts_list[start:end],
                     metadatas[start:end],
@@ -1470,9 +1431,7 @@ class AgensgraphVector(VectorStore):
             embeddings: List[List[float]] = []
             for start in range(0, len(texts_list), embed_batch_size):
                 embeddings.extend(
-                    self.embedding.embed_documents(
-                        texts_list[start : start + embed_batch_size]
-                    )
+                    self.embedding.embed_documents(texts_list[start : start + embed_batch_size])
                 )
         else:
             embeddings = self.embedding.embed_documents(texts_list)
@@ -1601,9 +1560,7 @@ class AgensgraphVector(VectorStore):
             results, trim, retrieval_query=retrieval_query, **kwargs
         )
 
-    def _options(
-        self, kwargs: Dict[str, Any], fetch_k: Optional[int] = None
-    ) -> Dict[str, Any]:
+    def _options(self, kwargs: Dict[str, Any], fetch_k: Optional[int] = None) -> Dict[str, Any]:
         """The search settings for one call: the store's, with this call's laid over.
 
         An HNSW index returns at most ``hnsw.ef_search`` candidates, forty by default, so
@@ -1688,8 +1645,7 @@ class AgensgraphVector(VectorStore):
             # Metadata filtering and hybrid doesn't work
             if self.search_type == SearchType.HYBRID:
                 raise ValueError(
-                    "Metadata filtering can't be use in combination with "
-                    "a hybrid search approach"
+                    "Metadata filtering can't be use in combination with a hybrid search approach"
                 )
 
             filter_snippets, filter_params = construct_metadata_filter(filter)
@@ -1710,9 +1666,9 @@ class AgensgraphVector(VectorStore):
                                 WITH semantic_search AS (
                                     SELECT eid, n,
                                            RANK () OVER (ORDER BY inv_score) AS rank
-                                    FROM (""" +
-                                        base_index_query +
-                                     """RETURN id(n) AS eid, properties(n) as n,
+                                    FROM ("""
+                    + base_index_query
+                    + """RETURN id(n) AS eid, properties(n) as n,
                                                n.{embedding_property}::{vector_type}({embedding_dimension})
                                                {distance_op}
                                                %(embedding)s::{vector_type}({embedding_dimension})
@@ -1754,9 +1710,7 @@ class AgensgraphVector(VectorStore):
             index_query = index_query + " WITH *, n as node "
 
         # A per-call query wins over the store's; either silences the default tail.
-        wanted_query = (
-            retrieval_query if retrieval_query is not None else self.retrieval_query
-        )
+        wanted_query = retrieval_query if retrieval_query is not None else self.retrieval_query
         if not wanted_query:
             if kwargs.get("return_embeddings"):
                 wanted_query = (
@@ -1845,8 +1799,7 @@ class AgensgraphVector(VectorStore):
         # caller that wants one reads it from the store instead. A null one is, since it
         # says the element has no embedding stored.
         if kwargs.get("return_embeddings") and any(
-            "_embedding_" in result["metadata"]
-            and result["metadata"]["_embedding_"] is None
+            "_embedding_" in result["metadata"] and result["metadata"]["_embedding_"] is None
             for result in results
         ):
             if not custom_query:
@@ -2046,9 +1999,7 @@ class AgensgraphVector(VectorStore):
                 )
             else:  # Validate that FTS and Vector index use the same information
                 if not fts_node_label == store.node_label:
-                    raise ValueError(
-                        "Vector and keyword index don't index the same node label"
-                    )
+                    raise ValueError("Vector and keyword index don't index the same node label")
 
         return store
 
@@ -2070,8 +2021,7 @@ class AgensgraphVector(VectorStore):
 
         if search_type == SearchType.HYBRID:
             raise ValueError(
-                "Hybrid search is not supported in combination "
-                "with relationship vector index"
+                "Hybrid search is not supported in combination with relationship vector index"
             )
 
         store = cls(
@@ -2175,9 +2125,7 @@ class AgensgraphVector(VectorStore):
         """
         # Validate the list is not empty
         if not text_node_properties:
-            raise ValueError(
-                "Parameter `text_node_properties` must not be an empty list"
-            )
+            raise ValueError("Parameter `text_node_properties` must not be an empty list")
         # Prefer retrieval query from params, otherwise construct it
         if not retrieval_query:
             retrieval_query = (
@@ -2186,8 +2134,9 @@ class AgensgraphVector(VectorStore):
                           '') FROM jsonb_array_elements_text(%(text_node_properties)s)
                           AS k
                         ) AS text, n.__id__ AS doc_id,
-                        n || jsonb_build_object({embedding_property_literal}, NULL, '__id__', Null,"""
-                     + ",".join([f"'{prop}', Null" for prop in text_node_properties]) + """) AS metadata, score
+                        n || jsonb_build_object({embedding_property_literal}, NULL, '__id__', Null,"""  # noqa: E501
+                + ",".join([f"'{prop}', Null" for prop in text_node_properties])
+                + """) AS metadata, score
                 """
             )
         store = cls(
@@ -2198,7 +2147,7 @@ class AgensgraphVector(VectorStore):
             retrieval_query=retrieval_query,
             node_label=node_label,
             embedding_node_property=embedding_node_property,
-            text_node_properties= text_node_properties,
+            text_node_properties=text_node_properties,
             **kwargs,
         )
 
@@ -2232,14 +2181,11 @@ class AgensgraphVector(VectorStore):
                 store.create_new_keyword_index()
             else:  # Validate that FTS and Vector index use the same information
                 if not fts_node_label == store.node_label:
-                    raise ValueError(
-                        "Vector and keyword index don't index the same node label"
-                    )
+                    raise ValueError("Vector and keyword index don't index the same node label")
 
         # Populate embeddings
         while True:
-            fetch_query = (
-                 """MATCH (n:{label}) 
+            fetch_query = """MATCH (n:{label}) 
                     WHERE n.{embedding_property} IS null AND any(k IN
                     %(text_node_properties)s WHERE n[k] IS NOT NULL) RETURN
                     toString(id(n)) AS id, (
@@ -2249,36 +2195,37 @@ class AgensgraphVector(VectorStore):
                            ) AS text
                     LIMIT 1000
                 """
+            data = store.query(
+                sql.SQL(fetch_query).format(
+                    label=sql.Identifier(store.node_label),
+                    embedding_property=sql.Identifier(store.embedding_node_property),
+                ),
+                params={"text_node_properties": Jsonb(text_node_properties)},
             )
-            data = store.query(sql.SQL(fetch_query).format(
-                label=sql.Identifier(store.node_label),
-                embedding_property=sql.Identifier(store.embedding_node_property)
-            ), params={"text_node_properties": Jsonb(text_node_properties)})
 
             if not data:
                 break
             text_embeddings = embedding.embed_documents([el["text"] for el in data])
             rows = [
-                    {"id": el["id"], "embedding": store._stored_embedding(embedding)}
-                    for el, embedding in zip(data, text_embeddings)
-                ]
-            params = {
-                "data": Jsonb(rows)
-            }
+                {"id": el["id"], "embedding": store._stored_embedding(embedding)}
+                for el, embedding in zip(data, text_embeddings)
+            ]
+            params = {"data": Jsonb(rows)}
 
             # `__id__` is written as well, and it is the element's own identity in text
             # because a graph that was already here had no id of ours to carry. Without
             # one a document came back with no id, and `delete` and `get_by_ids`, which
             # name an element by it, could not reach anything in the store.
-            store.query(sql.SQL(
-                 """UNWIND %(data)s AS row
+            store.query(
+                sql.SQL(
+                    """UNWIND %(data)s AS row
                     MATCH (n:{node_label}) WHERE id(n) = (row.id)::graphid SET
                     n.{embedding_node_property} = row.embedding,
                     n.__id__ = row.id
                     RETURN count(*)"""
                 ).format(
                     node_label=sql.Identifier(store.node_label),
-                    embedding_node_property=sql.Identifier(store.embedding_node_property)
+                    embedding_node_property=sql.Identifier(store.embedding_node_property),
                 ),
                 params=params,
             )
@@ -2365,13 +2312,10 @@ class AgensgraphVector(VectorStore):
             )
         stored = self._read_embeddings(ids)  # type: ignore[arg-type]
         return [
-            carried[i] if carried[i] is not None else stored[doc_id]
-            for i, doc_id in enumerate(ids)
+            carried[i] if carried[i] is not None else stored[doc_id] for i, doc_id in enumerate(ids)
         ]
 
-    def _named_by_id(
-        self, ids: Sequence[str], params: Dict[str, Any]
-    ) -> sql.Composed:
+    def _named_by_id(self, ids: Sequence[str], params: Dict[str, Any]) -> sql.Composed:
         """The elements carrying these ids, as the opening of a statement.
 
         Each id is an equality the unique index over it answers. A bound list would be
@@ -2388,18 +2332,14 @@ class AgensgraphVector(VectorStore):
         """
         params["wanted_ids"] = Jsonb(list(ids))
         return sql.SQL(
-            "UNWIND %(wanted_ids)s AS wanted "
-            "MATCH (n:{label}) WHERE n.__id__ = wanted "
+            "UNWIND %(wanted_ids)s AS wanted MATCH (n:{label}) WHERE n.__id__ = wanted "
         ).format(label=sql.Identifier(self.node_label))
 
-    def _read_embeddings_query(
-        self, ids: List[str]
-    ) -> Tuple[sql.Composed, Dict[str, Any]]:
+    def _read_embeddings_query(self, ids: List[str]) -> Tuple[sql.Composed, Dict[str, Any]]:
         """Read the stored embedding of each named element."""
         params: Dict[str, Any] = {}
         statement = sql.SQL(
-            "{by} "
-            "RETURN n.__id__ AS id, n.{embedding_property} AS embedding"
+            "{by} RETURN n.__id__ AS id, n.{embedding_property} AS embedding"
         ).format(
             by=self._named_by_id(ids, params),
             embedding_property=sql.Identifier(self.embedding_node_property),
@@ -2415,10 +2355,7 @@ class AgensgraphVector(VectorStore):
         parsed back.
         """
         statement, params = self._read_embeddings_query(ids)
-        return {
-            row["id"]: row["embedding"]
-            for row in self.query(statement, params, binary_=True)
-        }
+        return {row["id"]: row["embedding"] for row in self.query(statement, params, binary_=True)}
 
     def _select_relevance_score_fn(self) -> Callable[[float], float]:
         """
@@ -2556,13 +2493,9 @@ class AgensgraphVector(VectorStore):
                     # connection and tune every later borrower's search instead.
                     with conn.transaction():
                         conn.vector_search_options(search_options)
-                        result = conn.execute_query(
-                            query, params, row_=dict_row, binary_=binary_
-                        )
+                        result = conn.execute_query(query, params, row_=dict_row, binary_=binary_)
                 else:
-                    result = conn.execute_query(
-                        query, params, row_=dict_row, binary_=binary_
-                    )
+                    result = conn.execute_query(query, params, row_=dict_row, binary_=binary_)
                 if not in_txn and not conn.autocommit:
                     conn.commit()
             except Exception as e:
@@ -2591,9 +2524,9 @@ class AgensgraphVector(VectorStore):
         if not ids:
             return None
         params: Dict[str, Any] = {}
-        delete_query = sql.SQL(
-            "{by} DETACH DELETE n"
-        ).format(by=self._named_by_id(list(ids), params))
+        delete_query = sql.SQL("{by} DETACH DELETE n").format(
+            by=self._named_by_id(list(ids), params)
+        )
         self.query(delete_query, params=params)
         return True
 
@@ -2607,8 +2540,7 @@ class AgensgraphVector(VectorStore):
             return []
         params: Dict[str, Any] = {}
         fetch_query = sql.SQL(
-            "{by} "
-            "RETURN n.__id__ AS id, n.{text_property} AS text, properties(n) AS meta"
+            "{by} RETURN n.__id__ AS id, n.{text_property} AS text, properties(n) AS meta"
         ).format(
             by=self._named_by_id(list(ids), params),
             text_property=sql.Identifier(self.text_node_property),
@@ -2636,9 +2568,7 @@ class AgensgraphVector(VectorStore):
         if self._graph is not None:
             return await self._graph._aconn_get()
         if self._aconn is None or self._aconn.closed:
-            self._aconn = await agensgraph.AsyncConnection.connect(
-                self._url, autocommit=True
-            )
+            self._aconn = await agensgraph.AsyncConnection.connect(self._url, autocommit=True)
             await self._aconn.register_vectors()
             # Selects the graph and fills the label table in one call.
             await self._aconn.graph(self.graph_name)
@@ -2664,9 +2594,7 @@ class AgensgraphVector(VectorStore):
                             query, params, row_=dict_row, binary_=binary_
                         )
                 else:
-                    result = await conn.execute_query(
-                        query, params, row_=dict_row, binary_=binary_
-                    )
+                    result = await conn.execute_query(query, params, row_=dict_row, binary_=binary_)
                 if not in_txn and not conn.autocommit:
                     await conn.commit()
             except Exception as e:
@@ -2705,8 +2633,7 @@ class AgensgraphVector(VectorStore):
 
         if not (len(texts_list) == len(embeddings) == len(metadatas) == len(ids)):
             raise ValueError(
-                "aadd_embeddings: texts, embeddings, metadatas, ids must have "
-                "the same length"
+                "aadd_embeddings: texts, embeddings, metadatas, ids must have the same length"
             )
         await self._aensure_id_index()
         import_query = sql.SQL(
@@ -2726,8 +2653,7 @@ class AgensgraphVector(VectorStore):
         for start in range(0, n, step):
             end = min(start + step, n)
             batch_rows = [
-                {"text": t, "metadata": m,
-                 "embedding": self._stored_embedding(e), "id": i}
+                {"text": t, "metadata": m, "embedding": self._stored_embedding(e), "id": i}
                 for t, m, e, i in zip(
                     texts_list[start:end],
                     metadatas[start:end],
@@ -2760,9 +2686,7 @@ class AgensgraphVector(VectorStore):
             embeddings: List[List[float]] = []
             for start in range(0, len(texts_list), embed_batch_size):
                 embeddings.extend(
-                    self.embedding.embed_documents(
-                        texts_list[start : start + embed_batch_size]
-                    )
+                    self.embedding.embed_documents(texts_list[start : start + embed_batch_size])
                 )
         else:
             embeddings = self.embedding.embed_documents(texts_list)
@@ -2857,9 +2781,7 @@ class AgensgraphVector(VectorStore):
             results, trim, retrieval_query=retrieval_query, **kwargs
         )
 
-    async def asearch(
-        self, query: str, search_type: str, **kwargs: Any
-    ) -> List[Document]:
+    async def asearch(self, query: str, search_type: str, **kwargs: Any) -> List[Document]:
         """Async sibling of ``search``, which is what a retriever calls.
 
         The base class's default runs the blocking ``search`` in an executor, so a
@@ -2895,9 +2817,7 @@ class AgensgraphVector(VectorStore):
         )
         return [doc for doc, _ in pairs]
 
-    async def aadd_documents(
-        self, documents: List[Document], **kwargs: Any
-    ) -> List[str]:
+    async def aadd_documents(self, documents: List[Document], **kwargs: Any) -> List[str]:
         """Async sibling of ``add_documents``.
 
         The base class's default runs the blocking path in an executor even though an
@@ -2942,9 +2862,7 @@ class AgensgraphVector(VectorStore):
             doc.metadata.pop("_embedding_", None)
         return docs
 
-    async def _acandidate_embeddings(
-        self, docs: List[Document]
-    ) -> List[List[float]]:
+    async def _acandidate_embeddings(self, docs: List[Document]) -> List[List[float]]:
         """Async sibling of :meth:`_candidate_embeddings`."""
         carried = [doc.metadata.get("_embedding_") for doc in docs]
         if all(vector is not None for vector in carried):
@@ -2962,20 +2880,17 @@ class AgensgraphVector(VectorStore):
         rows = await self.aquery(statement, params, binary_=True)
         stored = {row["id"]: row["embedding"] for row in rows}
         return [
-            carried[i] if carried[i] is not None else stored[doc_id]
-            for i, doc_id in enumerate(ids)
+            carried[i] if carried[i] is not None else stored[doc_id] for i, doc_id in enumerate(ids)
         ]
 
-    async def adelete(
-        self, ids: Optional[List[str]] = None, **kwargs: Any
-    ) -> Optional[bool]:
+    async def adelete(self, ids: Optional[List[str]] = None, **kwargs: Any) -> Optional[bool]:
         """Async sibling of :meth:`delete`."""
         if not ids:
             return None
         params: Dict[str, Any] = {}
-        delete_query = sql.SQL(
-            "{by} DETACH DELETE n"
-        ).format(by=self._named_by_id(list(ids), params))
+        delete_query = sql.SQL("{by} DETACH DELETE n").format(
+            by=self._named_by_id(list(ids), params)
+        )
         await self.aquery(delete_query, params=params)
         return True
 
@@ -2985,8 +2900,7 @@ class AgensgraphVector(VectorStore):
             return []
         params: Dict[str, Any] = {}
         fetch_query = sql.SQL(
-            "{by} "
-            "RETURN n.__id__ AS id, n.{text_property} AS text, properties(n) AS meta"
+            "{by} RETURN n.__id__ AS id, n.{text_property} AS text, properties(n) AS meta"
         ).format(
             by=self._named_by_id(list(ids), params),
             text_property=sql.Identifier(self.text_node_property),

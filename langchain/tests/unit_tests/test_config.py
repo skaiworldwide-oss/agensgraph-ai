@@ -43,9 +43,10 @@ def test_a_build_parameter_for_the_other_access_method_is_refused():
 
 
 def test_each_method_still_takes_its_own():
-    assert IndexConfig(
-        am=VectorIndexAM.HNSW, m=16, ef_construction=64
-    ).with_options_clause() == " WITH (m = 16, ef_construction = 64)"
+    assert (
+        IndexConfig(am=VectorIndexAM.HNSW, m=16, ef_construction=64).with_options_clause()
+        == " WITH (m = 16, ef_construction = 64)"
+    )
     assert (
         IndexConfig(am=VectorIndexAM.IVFFLAT, lists=10).with_options_clause()
         == " WITH (lists = 10)"

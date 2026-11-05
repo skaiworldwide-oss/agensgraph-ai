@@ -46,9 +46,7 @@ GRAPH = "retriever_it"
 texts = ["foo", "bar", "baz", "It is the end of the world. Take shelter!"]
 
 
-def make_store(
-    metadatas: Optional[List[Dict[str, Any]]] = None, **kwargs: Any
-) -> AgensgraphVector:
+def make_store(metadatas: Optional[List[Dict[str, Any]]] = None, **kwargs: Any) -> AgensgraphVector:
     return AgensgraphVector.from_texts(
         texts=texts,
         metadatas=metadatas,
@@ -112,7 +110,7 @@ def make_context_store(**kwargs: Any) -> AgensgraphVector:
         store.query(f"CREATE ELABEL IF NOT EXISTS {elabel}")
     for start, end, elabel in EDGES:
         store.query(
-            "MATCH (a:\"Chunk\"), (b:\"Chunk\") "
+            'MATCH (a:"Chunk"), (b:"Chunk") '
             "WHERE a.__id__ = %(a)s AND b.__id__ = %(b)s "
             f"CREATE (a)-[:{elabel}]->(b)",
             params={"a": _id(start), "b": _id(end)},
@@ -187,9 +185,7 @@ class TestAgensVectorRetriever:
         store = make_store()
 
         def shout(doc: Document) -> Document:
-            return Document(
-                page_content=doc.page_content.upper(), metadata=doc.metadata
-            )
+            return Document(page_content=doc.page_content.upper(), metadata=doc.metadata)
 
         retriever = AgensVectorRetriever(store=store, k=1, document_formatter=shout)
         docs = retriever.invoke("foo")
@@ -203,9 +199,7 @@ class TestAgensVectorRetriever:
         wanted = retriever.invoke("foo")
         got = await retriever.ainvoke("foo")
         assert [d.page_content for d in got] == [d.page_content for d in wanted]
-        assert [d.metadata["score"] for d in got] == [
-            d.metadata["score"] for d in wanted
-        ]
+        assert [d.metadata["score"] for d in got] == [d.metadata["score"] for d in wanted]
         await store.aclose()
         cleanup(store)
 
@@ -318,8 +312,7 @@ class TestAgensGraphContextRetriever:
             params={"ids": Jsonb(list(range(1000)))},
         )
         store.query(
-            'MATCH (a:"Chunk"), (s:sat) WHERE a.__id__ = %(h)s '
-            "CREATE (a)-[:spoke]->(s)",
+            'MATCH (a:"Chunk"), (s:sat) WHERE a.__id__ = %(h)s CREATE (a)-[:spoke]->(s)',
             params={"h": _id("hub")},
         )
         retriever = AgensGraphContextRetriever(store=store, k=1, expand_by_hops=2)
@@ -437,18 +430,14 @@ class TestAgensText2CypherRetriever:
         )
         docs = retriever.invoke("who is here?")
         assert len(docs) == 2
-        messages = retriever._chain.cypher_prompt.format_messages(
-            schema="s", question="q"
-        )
+        messages = retriever._chain.cypher_prompt.format_messages(schema="s", question="q")
         assert [m.type for m in messages] == ["system", "human", "ai", "human"]
         graph.close()
 
     def test_no_correction_happens_unasked(self) -> None:
         graph = make_qa_graph()
         llm = fake_llm(BROKEN, READ_PEOPLE)
-        retriever = AgensText2CypherRetriever(
-            graph=graph, llm=llm, allow_server_programs=True
-        )
+        retriever = AgensText2CypherRetriever(graph=graph, llm=llm, allow_server_programs=True)
         with pytest.raises(ValueError, match="not runnable"):
             retriever.invoke("who is here?")
         # Only the generation call happened; no correction round was paid for.

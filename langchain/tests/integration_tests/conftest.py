@@ -1,0 +1,29 @@
+"""The integration suite.
+
+``collect_ignore`` names the modules of the 0.3 suite. They test the 0.3 API with connection
+settings of their own and are not run; each leaves the list when it is rewritten (PLAN.md
+Appendix D).
+"""
+
+collect_ignore = [
+    "test_async.py",
+    "test_chat_history.py",
+    "test_checkpoint.py",
+    "test_composition.py",
+    "test_cypher_qa.py",
+    "test_engine.py",
+    "test_enhanced_schema.py",
+    "test_graph_transformer_ingest.py",
+    "test_graphstore.py",
+    "test_index_config.py",
+    "test_indexes.py",
+    "test_lifecycle.py",
+    "test_retrievers.py",
+    "test_retrievers_standard.py",
+    "test_shared_state.py",
+    "test_store.py",
+    "test_text2cypher_dataset.py",
+    "test_vectorstore.py",
+    "test_vectorstore_standard.py",
+    "test_vectorstore_v02.py",
+]

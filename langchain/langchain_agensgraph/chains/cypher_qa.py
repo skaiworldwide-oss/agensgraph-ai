@@ -118,7 +118,7 @@ _FENCE = re.compile(r"```(?:cypher|sql)?", re.IGNORECASE)
 # lower case needs quoting, since AgensGraph folds an unquoted one: firstName becomes
 # firstname and matches nothing. ":" after ":" is a type cast, not a label.
 _LABEL = re.compile(r'(?<!:):(?!")([A-Za-z_][A-Za-z0-9_]*)')
-_PROP_KEY = re.compile(r'([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)')
+_PROP_KEY = re.compile(r"([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)")
 _PROP_ACCESS = re.compile(r'\.(?!")([A-Za-z_][A-Za-z0-9_]*)\b')
 _STRING = re.compile(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"", re.DOTALL)
 
@@ -227,9 +227,7 @@ def quote_identifiers(cypher: str, known: Optional[set] = None) -> str:
     return "".join(out)
 
 
-GQL_RULE = (
-    "- No COUNT { ... }, no EXISTS { ... }, no CALL { ... } subqueries, no apoc.*.\n"
-)
+GQL_RULE = "- No COUNT { ... }, no EXISTS { ... }, no CALL { ... } subqueries, no apoc.*.\n"
 """The line that forbids the GQL clause set, dropped on a server that has it."""
 
 
@@ -254,8 +252,7 @@ DIALECT_EXAMPLES: Tuple[Tuple[str, str], ...] = (
     ),
     (
         "Which titles contain the word graph?",
-        'MATCH (b:"Book") WHERE b.title CONTAINS \'graph\' '
-        "RETURN b.title AS title LIMIT 10",
+        "MATCH (b:\"Book\") WHERE b.title CONTAINS 'graph' RETURN b.title AS title LIMIT 10",
     ),
     (
         "Who is older than 30?",
@@ -279,8 +276,7 @@ DIALECT_EXAMPLES: Tuple[Tuple[str, str], ...] = (
     ),
     (
         "Which customers placed at least one order?",
-        'MATCH (c:"Customer") WHERE EXISTS((c)-[:"ORDERED"]->()) '
-        "RETURN c.name AS name LIMIT 10",
+        'MATCH (c:"Customer") WHERE EXISTS((c)-[:"ORDERED"]->()) RETURN c.name AS name LIMIT 10',
     ),
     (
         "Return the first three characters of every name.",
@@ -304,23 +300,19 @@ DIALECT_EXAMPLES: Tuple[Tuple[str, str], ...] = (
     ),
     (
         "Which people are named Ada or Bob?",
-        "MATCH (p:\"Person\") WHERE p.name IN ['Ada', 'Bob'] "
-        "RETURN p.name AS name LIMIT 10",
+        "MATCH (p:\"Person\") WHERE p.name IN ['Ada', 'Bob'] RETURN p.name AS name LIMIT 10",
     ),
     (
         "Find the person named ada, whatever the letter case.",
-        "MATCH (p:\"Person\") WHERE tolower(p.name) = 'ada' "
-        "RETURN p.name AS name LIMIT 10",
+        "MATCH (p:\"Person\") WHERE tolower(p.name) = 'ada' RETURN p.name AS name LIMIT 10",
     ),
     (
         "The five cheapest items with their prices.",
-        'MATCH (i:"Item") RETURN i.name AS name, i.price AS price '
-        "ORDER BY price LIMIT 5",
+        'MATCH (i:"Item") RETURN i.name AS name, i.price AS price ORDER BY price LIMIT 5',
     ),
     (
         "Which codes are exactly three digits? Use a pattern.",
-        "MATCH (c:\"Code\") WHERE c.value =~ '^[0-9]{3}$' "
-        "RETURN c.value AS value LIMIT 10",
+        "MATCH (c:\"Code\") WHERE c.value =~ '^[0-9]{3}$' RETURN c.value AS value LIMIT 10",
     ),
 )
 """Question-and-query pairs that teach the dialect's sharpest edges.
@@ -342,9 +334,7 @@ Pass to :class:`AgensCypherQAChain` or ``AgensText2CypherRetriever`` as
 """
 
 
-def render_cypher_system(
-    template: str, top_k: int, graph: Optional[AgensGraph] = None
-) -> str:
+def render_cypher_system(template: str, top_k: int, graph: Optional[AgensGraph] = None) -> str:
     """Fill in the row limit and escape the braces that are part of the prose.
 
     The dialect rules name constructs like ``COUNT { ... }``, whose braces a prompt
@@ -454,9 +444,7 @@ class AgensCypherQAChain(Runnable[Dict[str, Any], Dict[str, Any]]):
         cypher_llm = cypher_llm or llm
         qa_llm = qa_llm or llm
         if cypher_llm is None or qa_llm is None:
-            raise ValueError(
-                "Provide `llm`, or both `cypher_llm` and `qa_llm`."
-            )
+            raise ValueError("Provide `llm`, or both `cypher_llm` and `qa_llm`.")
         return cls(graph=graph, cypher_llm=cypher_llm, qa_llm=qa_llm, **kwargs)
 
     # ---- pipeline steps ----
@@ -486,9 +474,7 @@ class AgensCypherQAChain(Runnable[Dict[str, Any], Dict[str, Any]]):
             yield
             return
         held = _DEADLINE.get()
-        token = _DEADLINE.set(
-            {**held, id(self): time.monotonic() + self.timeout}
-        )
+        token = _DEADLINE.set({**held, id(self): time.monotonic() + self.timeout})
         try:
             yield
         finally:
@@ -526,9 +512,7 @@ class AgensCypherQAChain(Runnable[Dict[str, Any], Dict[str, Any]]):
         if self.validate_cypher:
             with self._boundary():
                 try:
-                    self.graph.query(
-                        f"EXPLAIN (COSTS OFF) {cypher}", timeout=self._remaining
-                    )
+                    self.graph.query(f"EXPLAIN (COSTS OFF) {cypher}", timeout=self._remaining)
                 except Exception as exc:
                     raise _not_runnable(exc) from exc
 
@@ -557,9 +541,7 @@ class AgensCypherQAChain(Runnable[Dict[str, Any], Dict[str, Any]]):
         if self.allow_dangerous_requests:
             yield
             return
-        async with self.graph.aread_only(
-            allow_server_programs=self.allow_server_programs
-        ):
+        async with self.graph.aread_only(allow_server_programs=self.allow_server_programs):
             yield
 
     def run_cypher(self, cypher: str) -> List[Dict[str, Any]]:
@@ -620,9 +602,7 @@ class AgensCypherQAChain(Runnable[Dict[str, Any], Dict[str, Any]]):
         """The same pipeline as :meth:`invoke`, awaited."""
         question = input["query"] if "query" in input else input["question"]
         chain = self.cypher_prompt | self.cypher_llm | StrOutputParser()
-        raw = await chain.ainvoke(
-            {"schema": self._schema(), "question": question}, config=config
-        )
+        raw = await chain.ainvoke({"schema": self._schema(), "question": question}, config=config)
         cypher = quote_identifiers(strip_fences(raw), self._known_names())
         with self._budget():
             await self.acheck(cypher)

@@ -62,9 +62,7 @@ def test_basic_extraction():
 
 def test_allowed_nodes_filtering():
     # Only keep Person/Company; City node and the rel referencing it must drop.
-    t = LLMGraphTransformer(
-        FakeStructuredLLM(CANNED), allowed_nodes=["Person", "Company"]
-    )
+    t = LLMGraphTransformer(FakeStructuredLLM(CANNED), allowed_nodes=["Person", "Company"])
     gd = t.convert_to_graph_documents([Document(page_content="x")])[0]
     assert {n.id for n in gd.nodes} == {"Alice", "Acme"}
     rels = {(r.source.id, r.type, r.target.id) for r in gd.relationships}
@@ -72,9 +70,7 @@ def test_allowed_nodes_filtering():
 
 
 def test_allowed_relationships_filtering():
-    t = LLMGraphTransformer(
-        FakeStructuredLLM(CANNED), allowed_relationships=["WORKS_AT"]
-    )
+    t = LLMGraphTransformer(FakeStructuredLLM(CANNED), allowed_relationships=["WORKS_AT"])
     gd = t.convert_to_graph_documents([Document(page_content="x")])[0]
     rels = {r.type for r in gd.relationships}
     assert rels == {"WORKS_AT"}
@@ -206,12 +202,8 @@ class TestCancellationIsNotAFailedDocument:
                 async def answer(_messages):
                     raise RuntimeError("the answer hit the output-token limit")
 
-                return RunnableLambda(
-                    func=lambda m: dict(self._payload), afunc=answer
-                )
+                return RunnableLambda(func=lambda m: dict(self._payload), afunc=answer)
 
         transformer = LLMGraphTransformer(FailingLLM(CANNED))
-        out = await transformer.aconvert_to_graph_documents(
-            [Document(page_content="doc")]
-        )
+        out = await transformer.aconvert_to_graph_documents([Document(page_content="doc")])
         assert out == []

@@ -108,10 +108,10 @@ class TestAppendingDoesNotGetDearerWithDepth:
         """A session written without the number is counted once and carries on."""
         from psycopg.types.json import Jsonb
 
-        graph.query('CREATE (s:"Session" {id: \'legacy\'})')
+        graph.query("CREATE (s:\"Session\" {id: 'legacy'})")
         for i in range(5):
             graph.query(
-                'MATCH (s:"Session" {id: \'legacy\'}) '
+                "MATCH (s:\"Session\" {id: 'legacy'}) "
                 'CREATE (s)-[:"HAS_MESSAGE"]->(:"Message" {seq: %(i)s, data: %(d)s})',
                 {
                     "i": i,
@@ -142,9 +142,7 @@ class TestAppendingDoesNotGetDearerWithDepth:
 
         from agensgraph.observability import add_query_logger
 
-        add_query_logger(
-            lambda r: counts.append(r) if "count(" in str(r.statement or "") else None
-        )
+        add_query_logger(lambda r: counts.append(r) if "count(" in str(r.statement or "") else None)
         history.add_user_message("second")
         history.add_user_message("third")
         assert counts == []

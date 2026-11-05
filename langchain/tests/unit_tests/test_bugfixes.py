@@ -146,9 +146,7 @@ class TestSanitizeSeesAVector:
     def test_a_narrow_one_is_kept_as_its_numbers(self):
         from agensgraph import Vector
 
-        assert _sanitize_value({"embedding": Vector([1.0, 2.0])}) == {
-            "embedding": [1.0, 2.0]
-        }
+        assert _sanitize_value({"embedding": Vector([1.0, 2.0])}) == {"embedding": [1.0, 2.0]}
 
     def test_a_sparse_vector_is_measured_by_what_it_holds(self):
         from agensgraph import SparseVector
@@ -168,10 +166,11 @@ class TestSanitizeSeesAVector:
         assert held == [1.0] * 1536
 
 
+@pytest.mark.server
 class TestSeeingWhatWasSent:
     """The usual question about a slow chain is which part of it was slow."""
 
-    def test_a_block_collects_the_statements_it_ran(self):
+    def test_a_block_collects_the_statements_it_ran(self, graph_name):
         import os
 
         from langchain_agensgraph import AgensGraph, log_queries
@@ -183,7 +182,7 @@ class TestSeeingWhatWasSent:
             "host": os.getenv("AGENSGRAPH_HOST", "localhost"),
             "port": int(os.getenv("AGENSGRAPH_PORT", 5432)),
         }
-        graph = AgensGraph("observe_it", conf, create=True, refresh_schema=False)
+        graph = AgensGraph(graph_name, conf, create=True, refresh_schema=False)
         try:
             with log_queries() as statements:
                 graph.query("RETURN 1 AS x")
@@ -198,7 +197,7 @@ class TestSeeingWhatWasSent:
         finally:
             graph.close()
 
-    def test_each_one_is_handed_over_as_it_finishes(self):
+    def test_each_one_is_handed_over_as_it_finishes(self, graph_name):
         import os
 
         from langchain_agensgraph import AgensGraph, log_queries
@@ -210,7 +209,7 @@ class TestSeeingWhatWasSent:
             "host": os.getenv("AGENSGRAPH_HOST", "localhost"),
             "port": int(os.getenv("AGENSGRAPH_PORT", 5432)),
         }
-        graph = AgensGraph("observe_it", conf, create=True, refresh_schema=False)
+        graph = AgensGraph(graph_name, conf, create=True, refresh_schema=False)
         seen: list = []
         try:
             with log_queries(seen.append):
@@ -228,10 +227,9 @@ class TestANameThatWouldNotArriveIntactIsRefused:
     about a different label than the caller named.
     """
 
-    def test_a_null_byte_in_a_label_is_refused(self):
+    @pytest.mark.server
+    def test_a_null_byte_in_a_label_is_refused(self, graph_name):
         import os
-
-        import pytest
 
         from langchain_agensgraph import AgensChatMessageHistory, AgensGraph
 
@@ -242,7 +240,7 @@ class TestANameThatWouldNotArriveIntactIsRefused:
             "host": os.getenv("AGENSGRAPH_HOST", "localhost"),
             "port": int(os.getenv("AGENSGRAPH_PORT", 5432)),
         }
-        graph = AgensGraph("nullname_it", conf, create=True, refresh_schema=False)
+        graph = AgensGraph(graph_name, conf, create=True, refresh_schema=False)
         try:
             with pytest.raises(ValueError, match="null byte"):
                 AgensChatMessageHistory(

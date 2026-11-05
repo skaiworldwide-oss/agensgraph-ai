@@ -232,8 +232,7 @@ def build_traps(graph: Any) -> None:
         ("Dan", "Seoul"),
     ):
         graph.query(
-            'MATCH (p:"Person" {name: %(p)s}), (c:city {name: %(c)s}) '
-            "CREATE (p)-[:lives_in]->(c)",
+            'MATCH (p:"Person" {name: %(p)s}), (c:city {name: %(c)s}) CREATE (p)-[:lives_in]->(c)',
             params={"p": person, "c": town},
         )
     for a, b, km in (
@@ -258,10 +257,7 @@ def build_traps(graph: Any) -> None:
             ("scores", "(scores)"),
             ("lower", "((tolower(name)))"),
         ):
-            graph.query(
-                f"CREATE PROPERTY INDEX IF NOT EXISTS {prefix}_{suffix} "
-                f"ON {label} {keys}"
-            )
+            graph.query(f"CREATE PROPERTY INDEX IF NOT EXISTS {prefix}_{suffix} ON {label} {keys}")
     graph.query("CREATE PROPERTY INDEX IF NOT EXISTS t2ct_city_name ON city (name)")
 
 

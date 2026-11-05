@@ -48,9 +48,7 @@ class TestAgensgraphVectorStandard(VectorStoreIntegrationTests):
             pre_delete_collection=True,
         )
         # `from_texts` seeds one row; the suite expects an empty store.
-        store.query(
-            "MATCH (n) DETACH DELETE n"
-        )
+        store.query("MATCH (n) DETACH DELETE n")
         try:
             yield store
         finally:

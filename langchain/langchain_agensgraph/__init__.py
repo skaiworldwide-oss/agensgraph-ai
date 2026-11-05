@@ -1,24 +1,19 @@
 """LangChain integration for AgensGraph."""
 
+from langchain_agensgraph._core.engine import AgensEngine, package_version
 from langchain_agensgraph.chains import AgensCypherQAChain, create_cypher_tool
 from langchain_agensgraph.chat_message_histories import AgensChatMessageHistory
-from langchain_agensgraph.engine import AgensEngine
 from langchain_agensgraph.graph_transformers import LLMGraphTransformer
-from langchain_agensgraph.graphs.agensgraph import AgensGraph
-from langchain_agensgraph.graphs.graph_document import (
-    GraphDocument,
-    Node,
-    Relationship,
-)
+from langchain_agensgraph.graphs import AgensGraph, GraphDocument, Node, Relationship
 from langchain_agensgraph.observability import log_queries
 from langchain_agensgraph.retrievers import (
     AgensGraphContextRetriever,
     AgensText2CypherRetriever,
     AgensVectorRetriever,
 )
-from langchain_agensgraph.vectorstores.agensgraph_vector import AgensgraphVector
+from langchain_agensgraph.vectorstores import AgensgraphVector
 
-__version__ = "0.3.1"
+__version__ = package_version()
 
 __all__ = [
     "AgensChatMessageHistory",
@@ -38,12 +33,11 @@ __all__ = [
     "__version__",
 ]
 
-# The LangGraph checkpointer and store are re-exported lazily so the package still
-# imports if langgraph is not installed.
-try:  # pragma: no cover - import guard
+# The LangGraph checkpointer and stores need the langgraph extra; the rest imports without it.
+try:
     from langchain_agensgraph.checkpoint import AgensSaver
-    from langchain_agensgraph.store import AgensStore
-
-    __all__ += ["AgensSaver", "AgensStore"]
+    from langchain_agensgraph.store import AgensStore, AsyncAgensStore
 except ImportError:  # pragma: no cover
     pass
+else:
+    __all__ += ["AgensSaver", "AgensStore", "AsyncAgensStore"]

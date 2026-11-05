@@ -9,12 +9,10 @@ collect_ignore = [
     "test_async.py",
     "test_checkpoint.py",
     "test_composition.py",
-    "test_cypher_qa.py",
     "test_enhanced_schema.py",
     "test_index_config.py",
     "test_indexes.py",
     "test_lifecycle.py",
     "test_retrievers.py",
     "test_shared_state.py",
-    "test_text2cypher_dataset.py",
 ]

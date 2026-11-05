@@ -1,242 +1,248 @@
-"""Answer a natural-language question by generating and running Cypher.
+"""Answer a question from the graph with Cypher a model writes.
 
-Two entry points over the same pipeline:
+:class:`AgensCypherQAChain` asks a model for one Cypher statement, runs it with
+:meth:`~langchain_agensgraph.AgensGraph.query_untrusted`, and asks a model to answer from the rows;
+:func:`create_cypher_tool` is the same as a tool an agent can call.
 
-* :class:`AgensCypherQAChain` — ``from_llm(...)`` then ``invoke({"query": ...})``,
-  the shape a graph question-answering chain conventionally has.
-* :func:`create_cypher_tool` — the same thing as a tool an agent can call.
+Before the statement is sent it is taken out of any fences, the names the graph stores with
+capitals are quoted, an edge written against its schema direction is turned round
+(``validate_cypher``), and :func:`~langchain_agensgraph.chains.prepass.prepare` makes the
+rewrites the server needs. ``query_untrusted`` then reads it again and runs it as a role made for
+model-written Cypher, in a transaction that is read-only and rolled back, reading at most
+``top_k`` rows. A refusal at any step, or a server error about the statement, goes back to the
+model with the statement it wrote, up to ``max_retries`` times.
 
-The pipeline reads the graph's schema, asks the model for a query, repairs and checks
-it, runs it read-only, and asks the model to answer from the rows it got back.
-
-Two things about AgensGraph shape the prompt more than anything else. Unquoted
-identifiers fold to lower case, so ``(n:Person)`` matches nothing and every label has to
-be written ``(n:"Person")``. And AgensGraph is not Neo4j: constructs a model reaches for
-out of habit — pattern expressions, ``COUNT { }``, ``EXISTS { }``, ``apoc.*`` — are not
-available, so the prompt rules them out by name rather than leaving the model to
-discover it.
+The prompt is composed from the server's capabilities: the rules for every release, then those
+only the releases in use need.
 """
 
 from __future__ import annotations
 
-import contextvars
-import re
-import time
-from contextlib import asynccontextmanager, contextmanager
-from typing import (
-    Any,
-    AsyncIterator,
-    Dict,
-    Iterator,
-    List,
-    Mapping,
-    Optional,
-    Sequence,
-    Tuple,
-)
+from collections.abc import Mapping, Sequence
+from typing import Any, Literal, cast
 
-import agensgraph
-import psycopg
-from langchain_core.language_models import BaseLanguageModel
+from agensgraph import Capabilities, to_json
+from agensgraph.untrusted import ALLOWED_FUNCTIONS
+from langchain_core.callbacks import (
+    AsyncCallbackManagerForChainRun,
+    CallbackManagerForChainRun,
+)
+from langchain_core.messages import (
+    AIMessage,
+    BaseMessage,
+    HumanMessage,
+    SystemMessage,
+    ToolMessage,
+)
 from langchain_core.output_parsers import StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.runnables import Runnable, RunnableConfig
-from langchain_core.tools import StructuredTool
-from pydantic import BaseModel, Field
-
-from langchain_agensgraph.graphs.agensgraph import AgensGraph
-
-_DEADLINE: contextvars.ContextVar[Mapping[int, float]] = contextvars.ContextVar(
-    "agens_qa_deadline", default={}
+from langchain_core.prompts import (
+    BasePromptTemplate,
+    ChatPromptTemplate,
+    MessagesPlaceholder,
 )
-"""When each chain's question in hand runs out of time.
+from langchain_core.runnables import Runnable, RunnableConfig, RunnableSerializable
+from langchain_core.runnables.config import patch_config
+from langchain_core.tools import BaseTool, StructuredTool
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, model_validator
+from typing_extensions import Self
 
-Per question rather than per chain, because one chain answers many at once: a chain is
-built once and handed to an agent, or shared across the conversations of a served
-application, and a deadline held on the chain would be overwritten by whichever question
-started last.
+from ..errors import AgensQueryError, UnsafeCypherError
+from ..graphs.agensgraph import AgensGraph, _rendered
+from .prepass import (
+    case_sensitive_names,
+    correct_directions,
+    prepare,
+    quote_identifiers,
+    strip_fences,
+)
 
-Keyed by chain so that two chains in one request do not read each other's, and a context
-variable so that it is per thread and per task at once -- a task inherits a copy of the
-context, so an awaited question carries its own.
-"""
+_ALL_RELEASES = """\
+AgensGraph dialect; these differ from Neo4j and matter:
+- Quote every label and relationship type: (n:"Person"), (a)-[r:"WORKS_AT"]->(b). Unquoted names \
+fold to lower case and match nothing. No backticks.
+- Quote mixed-case property names the same way: n."firstName". All-lowercase names need no \
+quotes: n.name.
+- Strings take single quotes only: n.name = 'Ada' ("Ada" is a name, not a string). Escape a quote \
+by doubling it: 'O''Brien'.
+- Always write relationships with brackets: (a)-[]->(b), (a)<-[]-(b), (a)-[]-(b). Never -->, <-- \
+or --.
+- One label per node and one type per relationship: no (n:"A":"B"), (n:"A"|"B") or \
+[:"R1"|"R2"]; write WHERE label(n) IN ['A', 'B'] or WHERE type(r) IN ['R1', 'R2']. In WHERE use \
+label(n) = 'A', not n:"A".
+- A pattern used as a condition goes inside exists(): WHERE exists((a)-[:"R"]->()), WHERE NOT \
+exists(...). No pattern comprehensions, no map projections (write {name: n.name}), no reduce(), \
+FOREACH or elementId() (use id(n)).
+- MATCH cannot follow OPTIONAL MATCH directly: put the MATCH first or a WITH between them.
+- Name every variable-length relationship and bound it, at most 5 steps: \
+(a)-[r:"KNOWS"*1..3]->(b). Inside shortestpath() and allshortestpaths() leave it unnamed: \
+MATCH p = shortestpath((a)-[:"KNOWS"*1..5]->(b)).
+- Convert with casts, not toInteger() or toFloat(): n.x::int8, n.x::float8, n.x::text, \
+n.x::bool, n.x::date. A decimal must go to float8 (int8 refuses 9.5). No CAST(x AS t).
+- left(), right() and reverse() on a string need ::text: left(n.name::text, 2).
+- Do not name a path variable path: MATCH p = ...
+- Use count(*) rather than count(n) over a node variable: count(n) reads every property of every \
+node, embeddings included, and is far slower.
+- Prefer an untyped relationship (a)-[r]->(b) and read type(r) unless the exact relationship type \
+appears in the schema."""
 
-CYPHER_SYSTEM = """\
-Generate one read-only AgensGraph (openCypher) query answering the user's question.
+_BEFORE_GQL = """\
+- No GQL: ORDER BY, SKIP and LIMIT only after WITH or RETURN; no LET, FILTER, NEXT, FINISH, \
+OFFSET (use SKIP), COUNT { }, EXISTS { }, CALL { }, XOR, IS [NOT] UNKNOWN, nullif(), count(ALL x) \
+or current_date.
+- An aggregate other than count(*) must be a whole RETURN or WITH item. Aggregate in a WITH, \
+compute in the next clause: WITH avg(n.age) AS a RETURN round(a) AS a. Never round(avg(..)), \
+sum(..) / count(*), max(..) - min(..), collect(..)[0..3], length(collect(..)), \
+head(collect(..)), CASE WHEN avg(..) > ...
+- min() and max() over a property must cast it: min(n.age::int4), max(n.score::float8), \
+min(n.name::text).
+- length() for lists and strings, never size(list); n.prop IS NOT NULL, never exists(n.prop); \
+last(nodes(p)) or last(r) for the last node or relationship (nodes(p)[-1] is null).
+- Cast only to int4, int8, float8, text, bool, date, timestamptz (int, integer, bigint, float, \
+numeric, boolean and varchar are syntax errors).
+- id(n) IN [...] fails: write id(n) = '3.1' OR id(n) = '3.2'. UNWIND a list literal, not \
+range(...).
+- [x IN list WHERE x IS NOT NULL] does not remove nulls."""
 
-AgensGraph dialect — these differ from Neo4j and matter:
-- Quote every label and relationship type: (n:"Person"), (a)-[r:"WORKS_AT"]->(b).
-  Unquoted identifiers fold to lower case and match nothing.
-- Quote mixed-case property names the same way: n."firstName". All-lowercase names
-  need no quotes: n.name.
-- No pattern expressions inside expressions: no size((n)--()), no [(n)-->(m) | m].
-- No COUNT { ... }, no EXISTS { ... }, no CALL { ... } subqueries, no apoc.*.
-  To count a node's relationships, MATCH them and use count(*).
-- Use count(*) rather than count(n) over a node variable: count(n) materializes every
-  property of every node, including any embeddings, and is far slower.
-- Prefer an untyped relationship (a)-[r]->(b) and read type(r) unless the exact
-  relationship type appears in the schema.
+_TEXT_CAST_SORT = """\
+- Do not ORDER BY, DISTINCT or group on a ::text cast inside WITH; use the property itself."""
 
-Indexes — the schema lists them; write predicates they can serve:
-- Compare the raw property. A cast (n.x::int4), arithmetic (n.x + 1) or coalesce()
-  around an indexed property forces a full label read; jsonb already compares
-  numbers numerically, so n.age > 30 is right when age holds numbers.
-- Match the stored type exactly: a number property compares to 30, not '30' — the
-  wrong type returns zero rows without an error.
-- Prefix match as a half-open range: n.name >= 'Al' AND n.name < 'Am'.
-  STARTS WITH, CONTAINS, ENDS WITH and =~ never use an index.
-- Case-insensitive equality: tolower(n.prop) = 'x', when the schema lists an index
-  ON ((tolower(prop))).
-- Avoid <>: enumerate the values you DO want with IN [...].
-- ORDER BY an indexed property with LIMIT is served by the index, and
-  id(n) = 'N.M' is the fastest lookup of all.
+_PROJECTED_ORDER = """\
+- ORDER BY may name only what the RETURN or WITH it follows outputs, by alias: RETURN n.name AS \
+name ORDER BY name. Alias aggregates and sort by the alias: count(*) AS n ... ORDER BY n. To sort \
+by something you do not return, sort in a WITH first: WITH n ORDER BY n.age DESC LIMIT 10 RETURN \
+n.name AS name. To sort nodes, sort by id(n) in a WITH."""
 
-Hard rules:
-- Read-only: MATCH / OPTIONAL MATCH / WHERE / WITH / RETURN / ORDER BY / SKIP / LIMIT.
-  Never CREATE / MERGE / SET / DELETE / REMOVE / DROP / DETACH / LOAD.
-- Use only the labels, relationship types and properties shown in the schema.
-- Always end with a LIMIT of at most {top_k}.
-- Return only the query. No prose, no markdown fences, no trailing semicolon.
+_COLLECT_NULLS = """\
+- collect() gives null over no rows and keeps nulls: filter WHERE x.p IS NOT NULL before \
+collecting; after OPTIONAL MATCH write WITH k, collect(x.p) AS xs, count(x) AS c RETURN k, CASE \
+WHEN c = 0 THEN [] ELSE xs END; where no row may match, WITH collect(..) AS xs RETURN \
+coalesce(xs, [])."""
+
+_MISSING_LABELS = """\
+- A label that is not in the schema is an error. Do not repeat a label on a variable bound \
+earlier: MATCH (a:"P") ... MATCH (a)-[]->(b), not MATCH (a:"P")-[]->(b). Do not reuse a \
+relationship variable in a second MATCH. Do not name a variable _."""
+
+_RELEASE_RULES: tuple[tuple[str, str], ...] = (
+    ("gql_clauses", _BEFORE_GQL),
+    ("text_cast_sort_in_with", _TEXT_CAST_SORT),
+    ("order_by_unprojected", _PROJECTED_ORDER),
+    ("collect_drops_nulls", _COLLECT_NULLS),
+    ("missing_label_read_empty", _MISSING_LABELS),
+)
+"""Each rule, and the capability whose absence makes it needed."""
+
+_INDEXES = """\
+Indexes (the schema lists them); write conditions they can serve:
+- Compare the raw property. A cast (n.x::int4), arithmetic (n.x + 1) or coalesce() around an \
+indexed property reads the whole label; numbers compare as numbers, so n.age > 30 is right when \
+age holds numbers.
+- Match the stored type exactly: a number property compares to 30, not '30'; the wrong type \
+returns no rows and no error.
+- Prefix match as a half-open range: n.name >= 'Al' AND n.name < 'Am'. STARTS WITH, CONTAINS, \
+ENDS WITH and =~ never use an index.
+- Case-insensitive equality: tolower(n.prop) = 'x', when the schema lists an index ON \
+((tolower(prop))).
+- Avoid <>: list the values you want with IN [...].
+- An indexed property sorted under a LIMIT is read from the index: RETURN n.prop AS prop ORDER BY \
+prop LIMIT 10. id(n) = '3.1' is the fastest lookup of all."""
+
+_READS = "- Read only: never CREATE, MERGE, SET, DELETE, REMOVE or DETACH."
+_WRITES = (
+    "- Write with CREATE, MERGE, SET, DELETE or REMOVE only when the question asks for a change; "
+    "otherwise read."
+)
+
+_RULES = """\
+Rules for the statement:
+{access}
+- One statement, starting with {starts}. No SQL (SELECT, FROM, JOIN, UNION), no CALL, no \
+comments, no parameters.
+- Only these functions: {functions}.
+- Use only the labels, relationship types and properties the schema shows.
+- End with a LIMIT of at most {top_k}.
+- Return only the statement: no prose, no markdown fences, no semicolon.
 
 Examples:
-  Q: How many of each kind of node are there? MATCH (n) RETURN label(n) AS label,
-  count(*) AS n ORDER BY n DESC LIMIT {top_k}
+  Q: How many of each kind of node are there?
+  MATCH (n) RETURN label(n) AS kind, count(*) AS cnt ORDER BY cnt DESC LIMIT {top_k}
+  Q: Who does Alice work with?
+  MATCH (a:"Person")-[r]->(b:"Person") WHERE a.name = 'Alice' RETURN b.name AS name, type(r) AS \
+relationship LIMIT {top_k}"""
 
-  Q: Who does Alice work with? MATCH (a:"Person")-[r]->(b:"Person") WHERE a.name =
-  'Alice' RETURN b.name AS name, type(r) AS relationship LIMIT {top_k}\
-"""
+_NOT_OFFERED = frozenset({"tointeger", "tofloat"})
+_SQL_FUNCTIONS = frozenset({"range", "split"})
+
+
+def render_cypher_system(
+    capabilities: Capabilities, *, top_k: int = 10, allow_writes: bool = False
+) -> str:
+    """The system prompt for writing Cypher for a server with these capabilities."""
+    rules = [_ALL_RELEASES]
+    rules += [text for name, text in _RELEASE_RULES if not capabilities.has(name)]
+    functions = ALLOWED_FUNCTIONS - _NOT_OFFERED
+    if not capabilities.has("cypher_sql_functions"):
+        functions -= _SQL_FUNCTIONS
+    starts = "MATCH, OPTIONAL MATCH, UNWIND or RETURN"
+    if allow_writes:
+        starts = "MATCH, OPTIONAL MATCH, UNWIND, RETURN, CREATE or MERGE"
+    header = "Write one Cypher statement for AgensGraph that answers the user's question" + (
+        ", or makes the change it asks for." if allow_writes else "."
+    )
+    return "\n\n".join(
+        [
+            header,
+            "\n".join(rules),
+            _INDEXES,
+            _RULES.format(
+                access=_WRITES if allow_writes else _READS,
+                starts=starts,
+                functions=", ".join(sorted(functions)),
+                top_k=top_k,
+            ),
+        ]
+    )
+
 
 QA_SYSTEM = """\
-Answer the question using only the query results provided. If they are empty, say the
-graph does not contain that information. Do not invent detail the results do not show.
-Be concise.\
-"""
+Answer the question using only the query results provided. If they are empty, say the graph does \
+not contain that information. Do not invent detail the results do not show. Be concise."""
 
-_FENCE = re.compile(r"```(?:cypher|sql)?", re.IGNORECASE)
+FUNCTION_RESPONSE_SYSTEM = """\
+Answer the question using only what the tool returned. If it returned nothing, say the graph does \
+not contain that information. Do not invent detail it does not show. Be concise."""
 
-# Identifiers the model may have left unquoted. Any identifier that is not already all
-# lower case needs quoting, since AgensGraph folds an unquoted one: firstName becomes
-# firstname and matches nothing. ":" after ":" is a type cast, not a label.
-_LABEL = re.compile(r'(?<!:):(?!")([A-Za-z_][A-Za-z0-9_]*)')
-_PROP_KEY = re.compile(r"([{,]\s*)([A-Za-z_][A-Za-z0-9_]*)(\s*:)")
-_PROP_ACCESS = re.compile(r'\.(?!")([A-Za-z_][A-Za-z0-9_]*)\b')
-_STRING = re.compile(r"'(?:\\.|[^'\\])*'|\"(?:\\.|[^\"\\])*\"", re.DOTALL)
+CYPHER_PROMPT = ChatPromptTemplate.from_messages(
+    [
+        ("system", "{system}"),
+        MessagesPlaceholder("examples", optional=True),
+        ("human", "Schema:\n{schema}\n\nQuestion: {question}"),
+    ]
+)
+"""The prompt for writing the statement: ``system`` is :func:`render_cypher_system`'s text,
+``examples`` the few-shot turns, then ``schema`` and ``question``."""
 
+QA_PROMPT = ChatPromptTemplate.from_messages(
+    [("system", QA_SYSTEM), ("human", "Question: {question}\n\nResults:\n{context}")]
+)
+"""The prompt for answering: ``question``, and ``context``, the rows as JSON."""
 
-def strip_fences(text: str) -> str:
-    """Take the query out of whatever the model wrapped it in."""
-    return _FENCE.sub("", text).strip().rstrip(";").strip()
+_CORRECTION = (
+    "Running that statement failed: {error}\n\nWrite a corrected statement that answers the same "
+    "question. Return only the statement."
+)
+_EMPTY_FEEDBACK = (
+    "That statement ran without error and returned no rows. Check each relationship's direction "
+    "and each label's spelling against the schema; the schema's directions are authoritative."
+)
+_DANGER = (
+    "AgensCypherQAChain runs Cypher a model wrote. It runs it as the engine's untrusted role "
+    "(untrusted_conninfo), in a transaction that is read-only and rolled back, after reading it "
+    "for anything that is not plainly one Cypher read; that role decides what the model can read. "
+    "Pass allow_dangerous_requests=True to acknowledge this."
+)
 
-
-def is_write_query(query: str) -> bool:
-    """Does the query hold a write clause?
-
-    The driver reads it, blanking what the server's lexer does not read as syntax --
-    strings, quoted identifiers, dollar-quoted bodies, ``--`` and ``/* */`` comments --
-    so a property named ``set`` is a name and a string saying ``delete`` is a string. On
-    this server ``//`` does not begin a comment, so nothing hides behind one.
-
-    A first opinion, not the boundary; see :meth:`AgensCypherQAChain.check`.
-    """
-    try:
-        agensgraph.cypher.check_can_wrap(query)
-    except ValueError:
-        return True
-    return False
-
-
-def _not_runnable(exc: Exception) -> Exception:
-    """Say what went wrong with a statement, or say what actually went wrong.
-
-    Only the server refusing the statement means the model wrote something unrunnable. A
-    pool with no connection to give, a server that is not there, a role the boundary
-    cannot be opened for -- none of those are about the Cypher, and reporting them as a
-    query problem sends whoever reads it to look at the query.
-    """
-    cause = exc
-    while cause.__cause__ is not None and cause.__cause__ is not cause:
-        cause = cause.__cause__  # type: ignore[assignment]
-    if isinstance(cause, (psycopg.ProgrammingError, psycopg.DataError)):
-        return ValueError(f"Generated Cypher is not runnable: {exc}")
-    return exc
-
-
-def case_sensitive_names(structured_schema: Dict[str, Any]) -> set:
-    """Identifiers in the graph whose spelling is not all lower case.
-
-    Folding runs both ways: a label or key written unquoted is *stored* folded, so
-    ``n.firstName`` is right for data created as ``{"firstName": ...}`` and wrong for
-    data created as ``{firstName: ...}``, which is stored as ``firstname``. Only the
-    schema knows which exists, so it decides what may be quoted.
-    """
-    names: set = set()
-
-    def add(value: Any) -> None:
-        if isinstance(value, str) and value != value.lower():
-            names.add(value)
-
-    for section in ("node_props", "rel_props"):
-        for label, props in (structured_schema.get(section) or {}).items():
-            add(label)
-            for prop in props or []:
-                add(prop.get("property") if isinstance(prop, dict) else prop)
-    for rel in structured_schema.get("relationships") or []:
-        if isinstance(rel, dict):
-            for key in ("type", "relationship_type", "start", "end", "label"):
-                add(rel.get(key))
-    return names
-
-
-def quote_identifiers(cypher: str, known: Optional[set] = None) -> str:
-    """Quote the identifiers the model left bare that the graph stores case-sensitively.
-
-    An identifier is quoted only when the graph actually holds that exact spelling —
-    quoting one the graph stores folded would turn a working query into one that matches
-    nothing, which is the failure this is meant to prevent. Text inside string literals
-    is left alone. With no ``known`` set, nothing is quoted.
-    """
-    allowed = known or set()
-
-    def needs_quoting(name: str) -> bool:
-        return name in allowed
-
-    def repair(fragment: str) -> str:
-        fragment = _LABEL.sub(
-            lambda m: f':"{m.group(1)}"' if needs_quoting(m.group(1)) else m.group(0),
-            fragment,
-        )
-        fragment = _PROP_KEY.sub(
-            lambda m: (
-                f'{m.group(1)}"{m.group(2)}"{m.group(3)}'
-                if needs_quoting(m.group(2))
-                else m.group(0)
-            ),
-            fragment,
-        )
-        return _PROP_ACCESS.sub(
-            lambda m: f'."{m.group(1)}"' if needs_quoting(m.group(1)) else m.group(0),
-            fragment,
-        )
-
-    out, last = [], 0
-    for match in _STRING.finditer(cypher):
-        out.append(repair(cypher[last : match.start()]))
-        out.append(match.group(0))
-        last = match.end()
-    out.append(repair(cypher[last:]))
-    return "".join(out)
-
-
-GQL_RULE = "- No COUNT { ... }, no EXISTS { ... }, no CALL { ... } subqueries, no apoc.*.\n"
-"""The line that forbids the GQL clause set, dropped on a server that has it."""
-
-
-def _example_text(text: str) -> str:
-    """A few-shot text made safe for a prompt template: braces doubled."""
-    return text.replace("{", "{{").replace("}", "}}")
-
-
-DIALECT_EXAMPLES: Tuple[Tuple[str, str], ...] = (
+DIALECT_EXAMPLES: tuple[tuple[str, str], ...] = (
     (
         "How many Product nodes are there?",
         'MATCH (p:"Product") RETURN count(*) AS n LIMIT 1',
@@ -261,7 +267,7 @@ DIALECT_EXAMPLES: Tuple[Tuple[str, str], ...] = (
     ),
     (
         "Return the vertex whose graph id is 3.1.",
-        "MATCH (n) WHERE id(n) = 3.1 RETURN n LIMIT 1",
+        "MATCH (n) WHERE id(n) = '3.1' RETURN n LIMIT 1",
     ),
     (
         "Which people are friends, in either direction?",
@@ -276,7 +282,7 @@ DIALECT_EXAMPLES: Tuple[Tuple[str, str], ...] = (
     ),
     (
         "Which customers placed at least one order?",
-        'MATCH (c:"Customer") WHERE EXISTS((c)-[:"ORDERED"]->()) RETURN c.name AS name LIMIT 10',
+        'MATCH (c:"Customer") WHERE exists((c)-[:"ORDERED"]->()) RETURN c.name AS name LIMIT 10',
     ),
     (
         "Return the first three characters of every name.",
@@ -315,385 +321,458 @@ DIALECT_EXAMPLES: Tuple[Tuple[str, str], ...] = (
         "MATCH (c:\"Code\") WHERE c.value =~ '^[0-9]{3}$' RETURN c.value AS value LIMIT 10",
     ),
 )
-"""Question-and-query pairs that teach the dialect's sharpest edges.
+"""Question-and-statement pairs that teach the dialect's sharpest edges.
 
-Each pair exists because a model reaching for its habits gets that case wrong
-here — wrong rows, or right rows off a full label read. Unquoted labels fold to
-lower case; ``count()`` takes an argument or ``*``; a graph id is
-``labid.locid``; ``substring`` starts at zero. And the index-serving spellings:
-compare the raw property (a cast or arithmetic around it reads the whole
-label), write a prefix match as a half-open range, use ``tolower(prop) =``
-against its expression index for case-insensitive lookups, enumerate values
-with ``IN``, and let ``ORDER BY prop LIMIT k`` ride the index. A regex is for
-questions that genuinely need a pattern; ``CONTAINS`` is correct dialect for
-infix matching and has no index-served form at all. The LET/FILTER pair needs
-a 2.18 server.
+Each pair is a case a model reaching for its habits gets wrong here, with wrong rows or with right
+rows off a full label read: unquoted labels fold to lower case; ``count()`` takes an argument or
+``*``; a graph id is ``'labid.locid'``; ``substring`` starts at zero; a condition on a pattern goes
+in ``exists()``. And the spellings an index serves: compare the raw property, write a prefix match
+as a half-open range, use ``tolower(prop) =`` against its expression index, list values with
+``IN``, and let ``ORDER BY prop LIMIT k`` ride the index.
 
-Pass to :class:`AgensCypherQAChain` or ``AgensText2CypherRetriever`` as
-``examples=DIALECT_EXAMPLES``.
+Pass as ``examples=DIALECT_EXAMPLES``; a pair the server cannot run is left out of the prompt.
 """
 
+_EXAMPLE_NEEDS = {DIALECT_EXAMPLES[11][1]: "gql_clauses"}
 
-def render_cypher_system(template: str, top_k: int, graph: Optional[AgensGraph] = None) -> str:
-    """Fill in the row limit and escape the braces that are part of the prose.
 
-    The dialect rules name constructs like ``COUNT { ... }``, whose braces a prompt
-    template would otherwise read as variables.
+def _statement_fault(exc: BaseException) -> bool:
+    """Whether a failure is the statement's, so the model may be asked to correct it.
 
-    The rule forbidding the GQL clause set is dropped where the server understands it.
-    Telling a model a construct is unavailable when it is available costs a worse query
-    for no reason, and the version arrives with the connection, so asking is free.
+    The pre-pass and the driver's reading refuse with :class:`UnsafeCypherError`; of the server's
+    errors, those about the statement: syntax, names, types, data, limits, a write refused, the
+    untrusted role's budgets (``statement_timeout``, and ``temp_file_limit`` for a statement that
+    sorts or hashes too much), and AgensGraph's internal errors, most of which a statement causes.
     """
-    filled = template.replace("{top_k}", str(top_k))
-    if graph is not None:
-        try:
-            if graph.capabilities.has_gql_clauses():
-                filled = filled.replace(GQL_RULE, "")
-        except Exception:
-            # A server that will not say keeps the conservative wording.
-            pass
-    return filled.replace("{", "{{").replace("}", "}}")
+    if isinstance(exc, UnsafeCypherError):
+        return True
+    if isinstance(exc, AgensQueryError):
+        state = exc.sqlstate or ""
+        return state[:2] in ("0A", "21", "22", "42", "54") or state in (
+            "25006",
+            "53400",
+            "57014",
+            "XX000",
+        )
+    return False
 
 
-class _Question(BaseModel):
-    question: str = Field(description="A question to answer from the graph.")
+def _text(output: Any) -> str:
+    return _PARSER.invoke(output)
 
 
-class AgensCypherQAChain(Runnable[Dict[str, Any], Dict[str, Any]]):
-    """Question answering over an AgensGraph graph by generated Cypher.
+_PARSER = StrOutputParser()
 
-    Build with :meth:`from_llm` and call ``invoke({"query": "..."})``. The result
-    carries ``query`` and ``result``; ask for ``return_intermediate_steps`` to also get
-    the generated Cypher and the rows it returned.
 
-    Generated Cypher is not trusted: writes are refused, the query is checked with
-    ``EXPLAIN`` before it runs, and execution carries a timeout.
+class CypherRun(BaseModel):
+    """What answering took: the statement that ran, its rows, and each attempt before it."""
 
-    A read-only transaction is what refuses the write, and it is not one for a role that
-    may run a command on the server's host through ``COPY ... TO PROGRAM`` -- a superuser,
-    or a member of ``pg_execute_server_program``. Connecting as such a role is refused
-    rather than quietly given a boundary that does not hold; ``allow_server_programs=True``
-    accepts it, and is for a deployment that has decided the role is acceptable.
+    cypher: str
+    rows: list[dict[str, Any]]
+    attempts: list[dict[str, str]] = Field(default_factory=list)
+
+
+class AgensCypherQAChain(RunnableSerializable[dict[str, Any] | str, dict[str, Any]]):
+    """Question answering over an AgensGraph graph with Cypher a model writes.
+
+    Build it with :meth:`from_llm` and call ``invoke({"query": "..."})``. The result holds
+    ``query`` and ``result``, the answer or with ``return_direct`` the rows, and with
+    ``return_intermediate_steps`` the ``intermediate_steps``: each failed attempt, the statement
+    that ran and the rows it returned.
+
+    The graph's engine needs ``untrusted_conninfo``, a role made for model-written Cypher (see
+    :func:`~langchain_agensgraph.roles.render_grants`), and ``writer_conninfo`` for
+    ``allow_writes``. ``top_k`` is how many rows are read; ``timeout`` the seconds each statement
+    may take. ``schema_refresh="ttl"`` reads the schema again when the graph's cache has expired,
+    ``"frozen"`` once. ``include_types`` and ``exclude_types`` limit the labels the prompt shows.
+    ``use_function_response`` hands the rows to the answering model as a tool's response.
     """
 
-    def __init__(
-        self,
-        *,
-        graph: AgensGraph,
-        cypher_llm: BaseLanguageModel,
-        qa_llm: BaseLanguageModel,
-        top_k: int = 10,
-        timeout: Optional[float] = 30.0,
-        validate_cypher: bool = True,
-        allow_dangerous_requests: bool = False,
-        allow_server_programs: bool = False,
-        cypher_prompt: Optional[ChatPromptTemplate] = None,
-        qa_prompt: Optional[ChatPromptTemplate] = None,
-        examples: Optional[Sequence[Tuple[str, str]]] = None,
-        return_intermediate_steps: bool = False,
-    ) -> None:
-        if cypher_prompt is not None and examples:
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    graph: AgensGraph
+    cypher_llm: Runnable[Any, Any]
+    qa_llm: Runnable[Any, Any]
+    # Unparametrized: pydantic validates against the class named, and BasePromptTemplate[Any] is
+    # a subclass no prompt is an instance of.
+    cypher_prompt: BasePromptTemplate | None = None  # type: ignore[type-arg]
+    qa_prompt: BasePromptTemplate | None = None  # type: ignore[type-arg]
+    examples: tuple[tuple[str, str], ...] = ()
+    input_key: str = "query"
+    output_key: str = "result"
+    top_k: int = Field(default=10, ge=1)
+    timeout: float = Field(default=10.0, gt=0)
+    max_retries: int = Field(default=2, ge=0)
+    allow_dangerous_requests: bool = False
+    allow_writes: bool = False
+    unsafe_shared_role: bool = False
+    validate_cypher: bool = True
+    return_direct: bool = False
+    return_intermediate_steps: bool = False
+    include_types: tuple[str, ...] = ()
+    exclude_types: tuple[str, ...] = ()
+    schema_refresh: Literal["ttl", "frozen"] = "ttl"
+    use_function_response: bool = False
+
+    _frozen: tuple[str, dict[str, Any]] | None = PrivateAttr(default=None)
+
+    @model_validator(mode="after")
+    def _acknowledged(self) -> Self:
+        if not self.allow_dangerous_requests:
+            raise ValueError(_DANGER)
+        if self.include_types and self.exclude_types:
+            raise ValueError("pass include_types or exclude_types, not both")
+        if self.examples and self.cypher_prompt is not None:
             raise ValueError(
-                "Pass examples or a custom cypher_prompt, not both; a custom "
-                "prompt carries its own examples as messages."
+                "pass examples or a cypher_prompt, not both; a prompt of your own carries its "
+                "own examples"
             )
-        self.graph = graph
-        self.cypher_llm = cypher_llm
-        self.qa_llm = qa_llm
-        self.top_k = top_k
-        self.timeout = timeout
-        self.validate_cypher = validate_cypher
-        self.allow_dangerous_requests = allow_dangerous_requests
-        self.allow_server_programs = allow_server_programs
-        self.return_intermediate_steps = return_intermediate_steps
-        self.examples = tuple(examples or ())
-        # Few-shot pairs become real conversation turns, not prompt text: the
-        # model sees each question answered with the query alone, which is the
-        # shape it is being asked to produce. The texts are escaped because
-        # from_messages reads every string as a template, and a Cypher map
-        # literal's braces would otherwise be taken for variables.
-        shots: List[Any] = []
-        for shown_question, shown_cypher in self.examples:
-            shots.append(("human", _example_text(shown_question)))
-            shots.append(("ai", _example_text(shown_cypher)))
-        self.cypher_prompt = cypher_prompt or ChatPromptTemplate.from_messages(
-            [
-                ("system", render_cypher_system(CYPHER_SYSTEM, top_k, graph=graph)),
-                *shots,
-                ("human", "Schema:\n{schema}\n\nQuestion: {question}"),
-            ]
-        )
-        self.qa_prompt = qa_prompt or ChatPromptTemplate.from_messages(
-            [
-                ("system", QA_SYSTEM),
-                ("human", "Question: {question}\n\nResults:\n{results}"),
-            ]
-        )
+        return self
 
     @classmethod
     def from_llm(
         cls,
-        llm: Optional[BaseLanguageModel] = None,
+        llm: Runnable[Any, Any] | None = None,
         *,
         graph: AgensGraph,
-        cypher_llm: Optional[BaseLanguageModel] = None,
-        qa_llm: Optional[BaseLanguageModel] = None,
+        cypher_llm: Runnable[Any, Any] | None = None,
+        qa_llm: Runnable[Any, Any] | None = None,
+        cypher_prompt: BasePromptTemplate[Any] | None = None,
+        qa_prompt: BasePromptTemplate[Any] | None = None,
+        cypher_llm_kwargs: Mapping[str, Any] | None = None,
+        qa_llm_kwargs: Mapping[str, Any] | None = None,
+        examples: Sequence[tuple[str, str]] | None = None,
+        include_types: Sequence[str] | None = None,
+        exclude_types: Sequence[str] | None = None,
+        schema: Literal["ttl", "frozen"] = "ttl",
         **kwargs: Any,
-    ) -> "AgensCypherQAChain":
-        """Build from one model, or from a separate model for each step."""
-        cypher_llm = cypher_llm or llm
-        qa_llm = qa_llm or llm
-        if cypher_llm is None or qa_llm is None:
-            raise ValueError("Provide `llm`, or both `cypher_llm` and `qa_llm`.")
-        return cls(graph=graph, cypher_llm=cypher_llm, qa_llm=qa_llm, **kwargs)
+    ) -> AgensCypherQAChain:
+        """Build from one model, or a model for each step.
 
-    # ---- pipeline steps ----
-
-    def _schema(self) -> str:
-        """The schema for the prompt, cached per the graph's ``schema_cache_ttl``."""
-        return self.graph.get_schema
-
-    def _known_names(self) -> set:
-        """Which identifiers the graph stores case-sensitively."""
-        return case_sensitive_names(self.graph.get_structured_schema)
-
-    def generate_cypher(self, question: str) -> str:
-        chain = self.cypher_prompt | self.cypher_llm | StrOutputParser()
-        raw = chain.invoke({"schema": self._schema(), "question": question})
-        return quote_identifiers(strip_fences(raw), self._known_names())
-
-    @contextmanager
-    def _budget(self) -> Iterator[None]:
-        """One time budget for a question, spent across every statement it takes.
-
-        `EXPLAIN` and the statement itself are two round trips, and giving each the whole
-        timeout means a caller who asked for thirty seconds can wait sixty. A timeout that
-        starts again at each round trip is not one anybody can hold this to.
+        ``cypher_llm_kwargs`` and ``qa_llm_kwargs`` may hold a ``prompt``; anything else in them
+        is bound to that step's model.
         """
-        if self.timeout is None:
-            yield
-            return
-        held = _DEADLINE.get()
-        token = _DEADLINE.set({**held, id(self): time.monotonic() + self.timeout})
-        try:
-            yield
-        finally:
-            _DEADLINE.reset(token)
+        cypher_kwargs = dict(cypher_llm_kwargs or {})
+        qa_kwargs = dict(qa_llm_kwargs or {})
+        writer = cypher_llm or llm
+        answerer = qa_llm or llm
+        if writer is None or answerer is None:
+            raise ValueError("pass llm, or both cypher_llm and qa_llm")
+        cypher_prompt = cypher_kwargs.pop("prompt", cypher_prompt)
+        qa_prompt = qa_kwargs.pop("prompt", qa_prompt)
+        if cypher_kwargs:
+            writer = writer.bind(**cypher_kwargs)
+        if qa_kwargs:
+            answerer = answerer.bind(**qa_kwargs)
+        return cls(
+            graph=graph,
+            cypher_llm=writer,
+            qa_llm=answerer,
+            cypher_prompt=cypher_prompt,
+            qa_prompt=qa_prompt,
+            examples=tuple(examples or ()),
+            include_types=tuple(include_types or ()),
+            exclude_types=tuple(exclude_types or ()),
+            schema_refresh=schema,
+            **kwargs,
+        )
 
-    @property
-    def _remaining(self) -> Optional[float]:
-        """What is left of the budget, or the whole timeout outside one."""
-        deadline = _DEADLINE.get().get(id(self))
-        if deadline is None:
-            return self.timeout
-        left = deadline - time.monotonic()
-        # Not zero or below: the server reads that as no timeout at all, which is the
-        # opposite of what a spent budget means.
-        return max(left, 0.001)
-
-    def check(self, cypher: str) -> None:
-        """Refuse a write, then let the planner reject anything malformed.
-
-        The reading of the text is a fast first opinion and **not** the boundary. It
-        cannot be one: this is PostgreSQL underneath, so ``INSERT``, ``TRUNCATE`` and
-        ``COPY ... TO PROGRAM`` are all available and none of them is Cypher, so none of
-        them matches. What actually stops a write is :meth:`run_cypher` running the
-        statement inside a transaction the server will not let write.
-
-        ``EXPLAIN`` plans without executing, so an unrunnable query is caught here
-        rather than part-way through running.
-        """
-        if not self.allow_dangerous_requests and is_write_query(cypher):
-            raise ValueError(
-                "Refusing to run a generated query that writes. Pass "
-                "allow_dangerous_requests=True only if the model is trusted to modify "
-                "this graph."
-            )
-        if self.validate_cypher:
-            with self._boundary():
-                try:
-                    self.graph.query(f"EXPLAIN (COSTS OFF) {cypher}", timeout=self._remaining)
-                except Exception as exc:
-                    raise _not_runnable(exc) from exc
-
-    @contextmanager
-    def _boundary(self) -> Iterator[None]:
-        """The transaction a generated statement runs inside.
-
-        Both the ``EXPLAIN`` and the statement itself run in one, because planning is not
-        the only thing an ``EXPLAIN`` can cause: a statement carrying no parameters goes
-        to the server over the simple query protocol, which runs every statement in it,
-        and ``strip_fences`` removes only a trailing semicolon.
-
-        With ``allow_dangerous_requests`` the model is trusted to modify the graph, so
-        there is nothing to enforce and the statement runs ordinarily. Opening one anyway
-        would refuse the write the caller just permitted.
-        """
-        if self.allow_dangerous_requests:
-            yield
-            return
-        with self.graph.read_only(allow_server_programs=self.allow_server_programs):
-            yield
-
-    @asynccontextmanager
-    async def _aboundary(self) -> AsyncIterator[None]:
-        """Async sibling of :meth:`_boundary`."""
-        if self.allow_dangerous_requests:
-            yield
-            return
-        async with self.graph.aread_only(allow_server_programs=self.allow_server_programs):
-            yield
-
-    def run_cypher(self, cypher: str) -> List[Dict[str, Any]]:
-        """Run the generated statement, inside a boundary the server enforces.
-
-        A read-only transaction refuses a write however the statement is spelled, so the
-        chain holds no opinion about what writing looks like -- which is the only way to
-        be right about it, because every reading of the text misses.
-
-        Every row comes back and ``top_k`` is taken from them here. Cutting at the server
-        would mean appending a limit to a statement somebody else wrote, which changes what
-        it means whenever it already has one or ends in anything that a limit cannot follow.
-        What bounds this instead is the timeout, which is why one is applied: a statement
-        that would return more than a chain can hold does not get the time to.
-        """
-        with self._boundary():
-            return self.graph.query(cypher, timeout=self._remaining)[: self.top_k]
-
-    @staticmethod
-    def _for_prompt(rows: List[Dict[str, Any]]) -> str:
-        """The rows as JSON, for the model to read.
-
-        A vertex arrives as its label, its identity and its properties.
-        """
-        return agensgraph.to_json(rows).decode()
-
-    def answer(self, question: str, rows: List[Dict[str, Any]]) -> str:
-        chain = self.qa_prompt | self.qa_llm | StrOutputParser()
-        return chain.invoke({"question": question, "results": self._for_prompt(rows)})
-
-    # ---- Runnable ----
+    # -- Runnable --------------------------------------------------------------------------------
 
     def invoke(
-        self,
-        input: Dict[str, Any],
-        config: Optional[RunnableConfig] = None,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        question = input["query"] if "query" in input else input["question"]
-        cypher = self.generate_cypher(question)
-        with self._budget():
-            self.check(cypher)
-            rows = self.run_cypher(cypher)
-        out: Dict[str, Any] = {
-            "query": question,
-            "result": self.answer(question, rows),
-        }
-        if self.return_intermediate_steps:
-            out["intermediate_steps"] = [{"query": cypher}, {"context": rows}]
-        return out
+        self, input: dict[str, Any] | str, config: RunnableConfig | None = None, **kwargs: Any
+    ) -> dict[str, Any]:
+        return self._call_with_config(self._call, input, config, run_type="chain", **kwargs)
 
     async def ainvoke(
+        self, input: dict[str, Any] | str, config: RunnableConfig | None = None, **kwargs: Any
+    ) -> dict[str, Any]:
+        return await self._acall_with_config(self._acall, input, config, run_type="chain", **kwargs)
+
+    def _question(self, input: dict[str, Any] | str) -> str:
+        if isinstance(input, str):
+            return input
+        if self.input_key in input:
+            return str(input[self.input_key])
+        if "question" in input:
+            return str(input["question"])
+        raise KeyError(f"the input needs {self.input_key!r}")
+
+    def _call(
         self,
-        input: Dict[str, Any],
-        config: Optional[RunnableConfig] = None,
-        **kwargs: Any,
-    ) -> Dict[str, Any]:
-        """The same pipeline as :meth:`invoke`, awaited."""
-        question = input["query"] if "query" in input else input["question"]
-        chain = self.cypher_prompt | self.cypher_llm | StrOutputParser()
-        raw = await chain.ainvoke({"schema": self._schema(), "question": question}, config=config)
-        cypher = quote_identifiers(strip_fences(raw), self._known_names())
-        with self._budget():
-            await self.acheck(cypher)
-            rows = await self.arun_cypher(cypher)
-        qa = self.qa_prompt | self.qa_llm | StrOutputParser()
-        out: Dict[str, Any] = {
-            "query": question,
-            "result": await qa.ainvoke(
-                {"question": question, "results": self._for_prompt(rows)}, config=config
-            ),
-        }
+        input: dict[str, Any] | str,
+        run_manager: CallbackManagerForChainRun,
+        config: RunnableConfig,
+    ) -> dict[str, Any]:
+        question = self._question(input)
+        child = patch_config(config, callbacks=run_manager.get_child())
+        run = self.run_cypher(question, config=child)
+        if self.return_direct:
+            return self._output(question, run.rows, run)
+        return self._output(question, self._answer(question, run.rows, child), run)
+
+    async def _acall(
+        self,
+        input: dict[str, Any] | str,
+        run_manager: AsyncCallbackManagerForChainRun,
+        config: RunnableConfig,
+    ) -> dict[str, Any]:
+        question = self._question(input)
+        child = patch_config(config, callbacks=run_manager.get_child())
+        run = await self.arun_cypher(question, config=child)
+        if self.return_direct:
+            return self._output(question, run.rows, run)
+        return self._output(question, await self._aanswer(question, run.rows, child), run)
+
+    def _output(self, question: str, result: Any, run: CypherRun) -> dict[str, Any]:
+        out: dict[str, Any] = {"query": question, self.output_key: result}
         if self.return_intermediate_steps:
-            out["intermediate_steps"] = [{"query": cypher}, {"context": rows}]
+            out["intermediate_steps"] = [
+                *run.attempts,
+                {"query": run.cypher},
+                {"context": run.rows},
+            ]
         return out
 
-    async def acheck(self, cypher: str) -> None:
-        """Async sibling of :meth:`check`."""
-        if not self.allow_dangerous_requests and is_write_query(cypher):
-            raise ValueError(
-                "Refusing to run a generated query that writes. Pass "
-                "allow_dangerous_requests=True only if the model is trusted to modify "
-                "this graph."
-            )
-        if self.validate_cypher:
-            async with self._aboundary():
-                try:
-                    await self.graph.aquery(
-                        f"EXPLAIN (COSTS OFF) {cypher}", timeout=self._remaining
-                    )
-                except Exception as exc:
-                    raise _not_runnable(exc) from exc
+    # -- writing and running the statement -------------------------------------------------------
 
-    async def arun_cypher(self, cypher: str) -> List[Dict[str, Any]]:
-        """Async sibling of :meth:`run_cypher`."""
-        async with self._aboundary():
-            rows = await self.graph.aquery(cypher, timeout=self._remaining)
-            return rows[: self.top_k]
+    def run_cypher(
+        self, question: str, *, config: RunnableConfig | None = None, retry_on_empty: bool = False
+    ) -> CypherRun:
+        """Have the model write a statement for the question and run it, correcting it as the
+        refusals and errors it meets come back; ``retry_on_empty`` treats no rows as one."""
+        caps = self.graph.capabilities
+        schema, structured = self._schema()
+        messages = self._messages(question, caps, schema, config)
+        attempts: list[dict[str, str]] = []
+        while True:
+            written = _text(self.cypher_llm.invoke(messages, config=config))
+            cypher = written
+            outcome: list[dict[str, Any]] | Exception
+            try:
+                cypher = self._prepared(written, caps, structured)
+                outcome = self.graph.query_untrusted(
+                    cypher,
+                    max_rows=self.top_k,
+                    timeout=self.timeout,
+                    allow_writes=self.allow_writes,
+                    unsafe_shared_role=self.unsafe_shared_role,
+                )
+            except (UnsafeCypherError, AgensQueryError) as exc:
+                outcome = exc
+            settled = self._settled(cypher, outcome, attempts, messages, retry_on_empty)
+            if isinstance(settled, CypherRun):
+                return settled
+            messages = settled
+
+    async def arun_cypher(
+        self, question: str, *, config: RunnableConfig | None = None, retry_on_empty: bool = False
+    ) -> CypherRun:
+        caps = await self.graph.acapabilities()
+        schema, structured = await self._aschema()
+        messages = self._messages(question, caps, schema, config)
+        attempts: list[dict[str, str]] = []
+        while True:
+            written = _text(await self.cypher_llm.ainvoke(messages, config=config))
+            cypher = written
+            outcome: list[dict[str, Any]] | Exception
+            try:
+                cypher = self._prepared(written, caps, structured)
+                outcome = await self.graph.aquery_untrusted(
+                    cypher,
+                    max_rows=self.top_k,
+                    timeout=self.timeout,
+                    allow_writes=self.allow_writes,
+                    unsafe_shared_role=self.unsafe_shared_role,
+                )
+            except (UnsafeCypherError, AgensQueryError) as exc:
+                outcome = exc
+            settled = self._settled(cypher, outcome, attempts, messages, retry_on_empty)
+            if isinstance(settled, CypherRun):
+                return settled
+            messages = settled
+
+    def _settled(
+        self,
+        cypher: str,
+        outcome: list[dict[str, Any]] | Exception,
+        attempts: list[dict[str, str]],
+        messages: list[BaseMessage],
+        retry_on_empty: bool,
+    ) -> CypherRun | list[BaseMessage]:
+        """The run, when an attempt settles it; otherwise the conversation asking for another,
+        after the attempt is recorded. A failure that is not the statement's is raised."""
+        if isinstance(outcome, Exception):
+            if not _statement_fault(outcome) or len(attempts) >= self.max_retries:
+                raise outcome
+            error = str(outcome)[:500]
+            feedback = _CORRECTION.format(error=error)
+        elif outcome or not retry_on_empty or len(attempts) >= self.max_retries:
+            return CypherRun(cypher=cypher, rows=outcome, attempts=attempts)
+        else:
+            error, feedback = "the statement returned no rows", _EMPTY_FEEDBACK
+        attempts.append({"query": cypher, "error": error})
+        return [*messages, AIMessage(content=cypher), HumanMessage(content=feedback)]
+
+    def _messages(
+        self, question: str, caps: Capabilities, schema: str, config: RunnableConfig | None
+    ) -> list[BaseMessage]:
+        shots: list[BaseMessage] = []
+        for shown, cypher in self.examples:
+            needs = _EXAMPLE_NEEDS.get(cypher)
+            if needs is None or caps.has(needs):
+                shots += [HumanMessage(content=shown), AIMessage(content=cypher)]
+        system = render_cypher_system(caps, top_k=self.top_k, allow_writes=self.allow_writes)
+        prompt = (self.cypher_prompt or CYPHER_PROMPT).invoke(
+            {
+                "system": system,
+                "examples": shots,
+                "schema": schema,
+                "question": question,
+                "top_k": self.top_k,
+            },
+            config=config,
+        )
+        return prompt.to_messages()
+
+    def _prepared(self, written: str, caps: Capabilities, structured: dict[str, Any]) -> str:
+        cypher = quote_identifiers(strip_fences(written), case_sensitive_names(structured))
+        if self.validate_cypher:
+            cypher = correct_directions(cypher, structured.get("relationships") or ())
+        return prepare(cypher, caps)
+
+    # -- the schema ------------------------------------------------------------------------------
+
+    def _schema(self) -> tuple[str, dict[str, Any]]:
+        if self._frozen is not None:
+            return self._frozen
+        self.graph.refresh_schema()
+        return self._kept(self.graph.schema, self.graph.structured_schema)
+
+    async def _aschema(self) -> tuple[str, dict[str, Any]]:
+        if self._frozen is not None:
+            return self._frozen
+        await self.graph.arefresh_schema()
+        return self._kept(self.graph.schema, self.graph.structured_schema)
+
+    def _kept(self, text: str, structured: dict[str, Any]) -> tuple[str, dict[str, Any]]:
+        if self.include_types or self.exclude_types:
+            structured = _limited(structured, self.include_types, self.exclude_types)
+            text = _rendered(structured)
+        if self.schema_refresh == "frozen":
+            self._frozen = (text, structured)
+        return text, structured
+
+    # -- answering -------------------------------------------------------------------------------
+
+    def _answer_messages(self, question: str, rows: list[dict[str, Any]]) -> Any:
+        context = to_json(rows).decode()
+        if self.use_function_response:
+            return [
+                SystemMessage(content=FUNCTION_RESPONSE_SYSTEM),
+                HumanMessage(content=question),
+                AIMessage(
+                    content="",
+                    tool_calls=[{"name": "query_graph", "args": {}, "id": "query_graph"}],
+                ),
+                ToolMessage(content=context, tool_call_id="query_graph"),
+            ]
+        return (self.qa_prompt or QA_PROMPT).invoke({"question": question, "context": context})
+
+    def _answer(self, question: str, rows: list[dict[str, Any]], config: RunnableConfig) -> str:
+        return _text(self.qa_llm.invoke(self._answer_messages(question, rows), config=config))
+
+    async def _aanswer(
+        self, question: str, rows: list[dict[str, Any]], config: RunnableConfig
+    ) -> str:
+        messages = self._answer_messages(question, rows)
+        return _text(await self.qa_llm.ainvoke(messages, config=config))
+
+
+def _limited(
+    structured: dict[str, Any], include: Sequence[str], exclude: Sequence[str]
+) -> dict[str, Any]:
+    """The schema with only the labels and types a prompt is to see."""
+
+    def kept(name: str) -> bool:
+        return name in include if include else name not in exclude
+
+    relationships = [
+        rel
+        for rel in structured.get("relationships", [])
+        if kept(rel["start"]) and kept(rel["type"]) and kept(rel["end"])
+    ]
+    return {
+        **structured,
+        "node_props": {k: v for k, v in structured.get("node_props", {}).items() if kept(k)},
+        "rel_props": {k: v for k, v in structured.get("rel_props", {}).items() if kept(k)},
+        "relationships": relationships,
+        "counts": {k: v for k, v in structured.get("counts", {}).items() if kept(k)},
+        "indexes": [i for i in structured.get("indexes", []) if kept(i["label"])],
+    }
+
+
+class _Question(BaseModel):
+    question: str = Field(description="A question to answer from the graph, in plain language.")
 
 
 def create_cypher_tool(
     graph: AgensGraph,
-    llm: BaseLanguageModel,
+    llm: Runnable[Any, Any],
     *,
     name: str = "query_graph",
-    description: Optional[str] = None,
+    description: str | None = None,
     answer: bool = True,
+    allow_dangerous_requests: bool = False,
+    allow_writes: bool = False,
     **kwargs: Any,
-) -> StructuredTool:
-    """A tool that answers a question from the graph, for use with an agent.
+) -> BaseTool:
+    """A tool that answers a question from the graph, for an agent.
 
-    With ``answer=False`` the tool returns the rows instead of prose, leaving the agent
-    to interpret them — useful when it is combining the graph with other sources.
+    With ``answer=False`` it returns the rows as JSON instead of an answer, for an agent that
+    combines the graph with other sources. Other arguments go to
+    :meth:`AgensCypherQAChain.from_llm`.
     """
-    chain = AgensCypherQAChain.from_llm(llm, graph=graph, **kwargs)
+    chain = AgensCypherQAChain.from_llm(
+        llm,
+        graph=graph,
+        allow_dangerous_requests=allow_dangerous_requests,
+        allow_writes=allow_writes,
+        **kwargs,
+    )
 
-    def _run(question: str) -> Any:
+    def run(question: str, config: RunnableConfig) -> str:
         if answer:
-            return chain.invoke({"query": question})["result"]
-        cypher = chain.generate_cypher(question)
-        chain.check(cypher)
-        return chain.run_cypher(cypher)
+            return cast(str, chain.invoke({"query": question}, config=config)[chain.output_key])
+        return to_json(chain.run_cypher(question, config=config).rows).decode()
 
-    async def _arun(question: str) -> Any:
+    async def arun(question: str, config: RunnableConfig) -> str:
         if answer:
-            return (await chain.ainvoke({"query": question}))["result"]
-        cypher = chain.generate_cypher(question)
-        await chain.acheck(cypher)
-        return await chain.arun_cypher(cypher)
+            out = await chain.ainvoke({"query": question}, config=config)
+            return cast(str, out[chain.output_key])
+        return to_json((await chain.arun_cypher(question, config=config)).rows).decode()
 
     return StructuredTool.from_function(
-        func=_run,
-        coroutine=_arun,
+        func=run,
+        coroutine=arun,
         name=name,
         description=description
         or (
-            "Answer a question about the data in the graph. Give the question in plain "
-            "language; it is turned into a read-only graph query."
+            "Answer a question about the data in the graph. Give the question in plain language; "
+            "it is turned into a graph query."
         ),
         args_schema=_Question,
     )
 
 
-__all__: List[str] = [
-    "AgensCypherQAChain",
-    "CYPHER_SYSTEM",
+__all__ = [
+    "CYPHER_PROMPT",
     "DIALECT_EXAMPLES",
+    "FUNCTION_RESPONSE_SYSTEM",
+    "QA_PROMPT",
     "QA_SYSTEM",
+    "AgensCypherQAChain",
+    "CypherRun",
     "create_cypher_tool",
-    "case_sensitive_names",
-    "is_write_query",
-    "quote_identifiers",
     "render_cypher_system",
-    "strip_fences",
 ]

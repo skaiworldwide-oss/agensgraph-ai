@@ -3,3 +3,37 @@
 
 [all]
 reasons = []
+
+# The text2cypher dataset's entries that need a later release (requires).
+["2.14"]
+reasons = [
+    "the release lacks boolean_condition",
+    "the release lacks cypher_sql_functions",
+    "the release lacks element_array_negative_index",
+    "the release lacks element_ordering",
+    "the release lacks gql_clauses",
+]
+
+["2.15"]
+reasons = [
+    "the release lacks boolean_condition",
+    "the release lacks element_array_negative_index",
+    "the release lacks element_ordering",
+    "the release lacks gql_clauses",
+]
+
+["2.16"]
+reasons = [
+    "the release lacks boolean_condition",
+    "the release lacks element_array_negative_index",
+    "the release lacks element_ordering",
+    "the release lacks gql_clauses",
+]
+
+["2.17"]
+reasons = [
+    "the release lacks boolean_condition",
+    "the release lacks element_array_negative_index",
+    "the release lacks element_ordering",
+    "the release lacks gql_clauses",
+]

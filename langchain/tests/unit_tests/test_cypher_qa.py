@@ -1,235 +1,372 @@
-"""Unit tests for the text2cypher pipeline — no database, no real model."""
+"""The QA chain, its tool and the text2cypher retriever, with a scripted model and graph."""
+
+from __future__ import annotations
+
+import json
+from typing import Any
 
 import pytest
+from agensgraph import Capabilities
+from langchain_core.messages import AIMessage, BaseMessage, ToolMessage
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.runnables import RunnableLambda
+from langchain_core.tools import BaseTool
+from langchain_core.tracers.context import collect_runs
+from langchain_tests.unit_tests import ToolsUnitTests
 
-from langchain_agensgraph.chains.cypher_qa import (
-    CYPHER_SYSTEM,
-    case_sensitive_names,
-    is_write_query,
-    quote_identifiers,
-    strip_fences,
+from langchain_agensgraph.chains import (
+    DIALECT_EXAMPLES,
+    AgensCypherQAChain,
+    create_cypher_tool,
+    render_cypher_system,
 )
+from langchain_agensgraph.errors import AgensQueryError, UnsafeCypherError
+from langchain_agensgraph.graphs.agensgraph import AgensGraph, _readable, _rendered
+from langchain_agensgraph.retrievers import AgensText2CypherRetriever
+
+SCHEMA: dict[str, Any] = {
+    "node_props": {
+        "Person": [{"property": "name", "type": "STRING"}],
+        "Company": [{"property": "name", "type": "STRING"}],
+        "Secret": [{"property": "code", "type": "STRING"}],
+    },
+    "rel_props": {"WORKS_AT": []},
+    "relationships": [{"start": "Person", "type": "WORKS_AT", "end": "Company"}],
+    "counts": {"Person": 2, "Company": 1, "Secret": 1, "WORKS_AT": 2},
+    "indexes": [],
+}
 
 
-class TestStripFences:
-    def test_removes_markdown_fences(self):
-        assert strip_fences("```cypher\nMATCH (n) RETURN n\n```") == "MATCH (n) RETURN n"
+class Graph(AgensGraph):
+    """A graph that answers from a script: each call to ``query_untrusted`` takes the next
+    outcome, rows or an error, after the same reading the real one does."""
 
-    def test_removes_a_bare_fence(self):
-        assert strip_fences("```\nMATCH (n) RETURN n\n```") == "MATCH (n) RETURN n"
+    def __init__(self, release: str = "2.18.6.1", *outcomes: Any) -> None:
+        super().__init__("host=nowhere dbname=none", graph_name="g")
+        self.release = Capabilities(release)
+        self.outcomes = list(outcomes)
+        self.sent: list[tuple[str, dict[str, Any]]] = []
+        self.refreshes = 0
+        self.structured_schema = SCHEMA
+        self.schema = _rendered(SCHEMA)
 
-    def test_removes_a_trailing_semicolon(self):
-        assert strip_fences("MATCH (n) RETURN n;") == "MATCH (n) RETURN n"
+    @property
+    def capabilities(self) -> Capabilities:
+        return self.release
 
-    def test_leaves_a_clean_query_alone(self):
-        assert strip_fences("MATCH (n) RETURN n") == "MATCH (n) RETURN n"
+    async def acapabilities(self) -> Capabilities:
+        return self.release
 
+    def refresh_schema(self, *, force: bool = False) -> None:
+        self.refreshes += 1
 
-class TestQuoteIdentifiers:
-    """Folding runs both ways, so only the schema can say what may be quoted.
+    async def arefresh_schema(self, *, force: bool = False) -> None:
+        self.refreshes += 1
 
-    A name the graph stores folded must be left bare; quoting it would turn a working
-    query into one that silently matches nothing — the very failure this guards against.
-    """
+    def query_untrusted(self, text: str, **kwargs: Any) -> list[dict[str, Any]]:
+        _readable(text, kwargs["max_rows"], kwargs["allow_writes"])
+        self.sent.append((text, kwargs))
+        outcome = self.outcomes.pop(0) if self.outcomes else []
+        if isinstance(outcome, Exception):
+            raise outcome
+        return list(outcome)
 
-    KNOWN = {"Person", "firstName", "WORKS_AT", "Name"}
-
-    def q(self, cypher):
-        return quote_identifiers(cypher, self.KNOWN)
-
-    def test_quotes_a_known_label(self):
-        assert self.q("MATCH (n:Person) RETURN n") == 'MATCH (n:"Person") RETURN n'
-
-    def test_quotes_a_known_relationship_type(self):
-        got = self.q("MATCH (a)-[r:WORKS_AT]->(b) RETURN r")
-        assert got == 'MATCH (a)-[r:"WORKS_AT"]->(b) RETURN r'
-
-    def test_quotes_a_known_property_that_starts_lower_case(self):
-        assert self.q("MATCH (n) RETURN n.firstName") == 'MATCH (n) RETURN n."firstName"'
-
-    def test_quotes_a_known_map_key(self):
-        got = self.q("MATCH (n {Name: 'x', age: 3}) RETURN n")
-        assert got == "MATCH (n {\"Name\": 'x', age: 3}) RETURN n"
-
-    def test_leaves_a_name_the_graph_stores_folded_alone(self):
-        query = "MATCH (n:person) RETURN n.firstname"
-        assert self.q(query) == query
-
-    def test_leaves_an_unknown_name_alone(self):
-        query = "MATCH (n:Unknown) RETURN n.nope"
-        assert self.q(query) == query
-
-    def test_quotes_nothing_without_a_schema(self):
-        query = "MATCH (n:Person) RETURN n.firstName"
-        assert quote_identifiers(query) == query
-
-    def test_leaves_already_quoted_alone(self):
-        query = 'MATCH (n:"Person") RETURN n."firstName"'
-        assert self.q(query) == query
-
-    def test_does_not_touch_string_literals(self):
-        query = "MATCH (n) WHERE n.x = 'has:Person and .firstName' RETURN n"
-        assert self.q(query) == query
-
-    def test_does_not_mistake_a_cast_for_a_label(self):
-        query = "MATCH (n) RETURN n.emb::vector(3)"
-        assert self.q(query) == query
+    async def aquery_untrusted(self, text: str, **kwargs: Any) -> list[dict[str, Any]]:
+        return self.query_untrusted(text, **kwargs)
 
 
-class TestCaseSensitiveNames:
-    def test_collects_labels_and_properties_that_are_not_lower_case(self):
-        schema = {
-            "node_props": {
-                "Person": [{"property": "firstName"}, {"property": "name"}],
-                "city": [{"property": "pop"}],
-            },
-            "rel_props": {},
-            "relationships": [{"type": "WORKS_AT", "start": "Person", "end": "city"}],
-        }
-        assert case_sensitive_names(schema) == {"Person", "firstName", "WORKS_AT"}
+class Model:
+    """A model that replies from a script and keeps what it was shown."""
 
-    def test_an_empty_schema_yields_nothing(self):
-        assert case_sensitive_names({}) == set()
+    def __init__(self, *replies: str) -> None:
+        self.replies = list(replies)
+        self.seen: list[list[BaseMessage]] = []
+        self.kwargs: list[dict[str, Any]] = []
+
+    def __call__(self, prompt: Any, **kwargs: Any) -> AIMessage:
+        self.seen.append(prompt.to_messages() if hasattr(prompt, "to_messages") else list(prompt))
+        self.kwargs.append(kwargs)
+        return AIMessage(content=self.replies.pop(0))
+
+    @property
+    def runnable(self) -> RunnableLambda[Any, AIMessage]:
+        return RunnableLambda(self)
 
 
-class TestIsWriteQuery:
-    @pytest.mark.parametrize(
-        "query",
-        [
-            "CREATE (n:Person)",
-            "MATCH (n) SET n.x = 1",
-            "MATCH (n) DETACH DELETE n",
-            "MERGE (n:Person {name: 'a'})",
-            "MATCH (n) REMOVE n.x",
-        ],
+@pytest.fixture
+def graph() -> Any:
+    made: list[Graph] = []
+
+    def make(*outcomes: Any, release: str = "2.18.6.1") -> Graph:
+        made.append(Graph(release, *outcomes))
+        return made[-1]
+
+    yield make
+    for each in made:
+        each.close()
+
+
+def qa(graph: Graph, writer: Model, answerer: Model | None = None, **kwargs: Any) -> Any:
+    return AgensCypherQAChain.from_llm(
+        graph=graph,
+        cypher_llm=writer.runnable,
+        qa_llm=(answerer or Model(*["An answer."] * 4)).runnable,
+        allow_dangerous_requests=True,
+        **kwargs,
     )
-    def test_detects_writes(self, query):
-        assert is_write_query(query)
 
-    @pytest.mark.parametrize(
-        "query",
-        [
-            "MATCH (n) RETURN n",
-            "MATCH (n) WHERE n.name = 'CREATE' RETURN n",
-            'MATCH (n:"Person") WHERE n."deleted" IS NULL RETURN n',
-            "MATCH (n) RETURN n -- CREATE was mentioned in a comment",
-            "MATCH (n) RETURN n /* CREATE was mentioned in a comment */",
-        ],
+
+def scripted(*replies: str) -> RunnableLambda[Any, AIMessage]:
+    return Model(*replies).runnable
+
+
+def test_the_chain_asks_for_the_acknowledgement(graph: Any) -> None:
+    with pytest.raises(ValueError, match="allow_dangerous_requests=True"):
+        AgensCypherQAChain.from_llm(scripted(), graph=graph())
+
+
+def test_a_question_is_answered_from_the_rows_of_the_statement_it_became(graph: Any) -> None:
+    g = graph([{"name": "Ada"}])
+    writer = Model("```cypher\nMATCH (p:Person) RETURN p.name AS name LIMIT 5\n```")
+    answerer = Model("Ada.")
+    out = qa(g, writer, answerer, top_k=5).invoke({"query": "Who is there?"})
+    assert out == {"query": "Who is there?", "result": "Ada."}
+    (text, kwargs) = g.sent[0]
+    assert text == 'MATCH (p:"Person") RETURN p.name AS name LIMIT 5'
+    assert kwargs == {
+        "max_rows": 5,
+        "timeout": 10.0,
+        "allow_writes": False,
+        "unsafe_shared_role": False,
+    }
+    shown = answerer.seen[0][-1].content
+    assert "Who is there?" in shown and '"name":"Ada"' in shown.replace(" ", "")
+
+
+@pytest.mark.parametrize(
+    ("refused", "reason"),
+    [
+        ("MATCH (p:Person) RETURN toFloat(p.age) AS a LIMIT 5", "cast instead"),
+        ("MATCH (p:Person) DETACH DELETE p", "a write"),
+        ("MATCH (p:Person) RETURN p -- every one", "comment"),
+    ],
+)
+def test_a_refused_statement_goes_back_to_the_model(graph: Any, refused: str, reason: str) -> None:
+    g = graph([{"a": 1.0}])
+    writer = Model(refused, "MATCH (p:Person) RETURN p.age::float8 AS a LIMIT 5")
+    out = qa(g, writer, Model("one"), return_intermediate_steps=True).invoke("Ages?")
+    assert [text for text, _ in g.sent] == ['MATCH (p:"Person") RETURN p.age::float8 AS a LIMIT 5']
+    failed, ran, context = out["intermediate_steps"]
+    assert reason in failed["error"] and ran == {"query": g.sent[0][0]}
+    assert context == {"context": [{"a": 1.0}]}
+    second = writer.seen[1]
+    assert second[-2].content == failed["query"] and reason in second[-1].content
+
+
+def test_the_server_rejecting_the_statement_goes_back_to_the_model(graph: Any) -> None:
+    g = graph(AgensQueryError('syntax error at or near "RETURN"', sqlstate="42601"), [{"n": 2}])
+    writer = Model("MATCH (n) RETUR n", "MATCH (n) RETURN count(*) AS n")
+    out = qa(g, writer, return_direct=True).invoke("How many?")
+    assert out["result"] == [{"n": 2}] and len(g.sent) == 2
+    assert "syntax error" in writer.seen[1][-1].content
+
+
+def test_a_statement_over_the_roles_temp_file_budget_goes_back_to_the_model(graph: Any) -> None:
+    budget = AgensQueryError(
+        "temporary file size exceeds temp_file_limit (262144kB)", sqlstate="53400"
     )
-    def test_a_keyword_in_a_string_or_comment_is_not_a_write(self, query):
-        assert not is_write_query(query)
-
-    @pytest.mark.parametrize(
-        "query",
-        [
-            "MATCH (n) RETURN n.set",
-            "MATCH (n) RETURN n.create AS created",
-            "MATCH (n) RETURN n.remove",
-        ],
+    g = graph(budget, [{"n": 84}])
+    writer = Model(
+        "MATCH (p)-->(a) WITH a, count(DISTINCT p) AS n RETURN n",
+        "MATCH (p)-->(a) WITH a, count(*) AS n RETURN n",
     )
-    def test_a_property_named_after_a_clause_is_not_a_write(self, query):
-        """A read that a first opinion must not refuse.
-
-        The name follows a dot, so it is a key rather than a clause, and a chain that
-        refuses this answers nothing for a graph whose data happens to use the word.
-        """
-        assert not is_write_query(query)
-
-    def test_a_second_statement_after_a_semicolon_is_read(self):
-        """A parameterless statement goes over the simple query protocol, which runs
-        every statement in it, so the write in the second one is a write in the text."""
-        assert is_write_query("MATCH (n) RETURN n; CREATE (m:Evil)")
+    out = qa(g, writer, return_direct=True).invoke("Most papers?")
+    assert out["result"] == [{"n": 84}] and len(g.sent) == 2
+    assert "temp_file_limit" in writer.seen[1][-1].content
 
 
-class TestPrompt:
-    """The prompt is the feature: these rules are what make the Cypher runnable."""
+def test_a_failure_that_is_not_the_statement_is_raised_at_once(graph: Any) -> None:
+    g = graph(AgensQueryError("terminating connection", sqlstate="57P01"))
+    writer = Model("MATCH (n) RETURN n LIMIT 1", "never asked")
+    with pytest.raises(AgensQueryError, match="terminating"):
+        qa(g, writer).invoke("Anything?")
+    assert len(writer.seen) == 1
 
-    @pytest.mark.parametrize(
-        "rule",
-        [
-            'n:"Person"',  # quoting
-            "fold to lower case",
-            "apoc",  # Neo4j-only constructs ruled out by name
-            "COUNT { ... }",
-            "EXISTS { ... }",
-            "count(*)",  # the performance rule
-            "Read-only",
-        ],
+
+def test_attempts_stop_after_max_retries(graph: Any) -> None:
+    writer = Model("RETURN toFloat(1) AS x", "RETURN toInteger(1) AS x")
+    with pytest.raises(UnsafeCypherError, match="toInteger"):
+        qa(graph(), writer, max_retries=1).invoke("x?")
+    assert len(writer.seen) == 2
+
+
+def test_no_rows_is_an_answer_unless_retry_on_empty(graph: Any) -> None:
+    g = graph([], [{"name": "Ada"}])
+    writer = Model(
+        'MATCH (c:"Company")-[:"KNOWS"]->(p:"Person") RETURN p.name AS name',
+        'MATCH (p:"Person") RETURN p.name AS name',
     )
-    def test_prompt_states_the_dialect_rule(self, rule):
-        assert rule in CYPHER_SYSTEM
+    run = qa(g, writer).run_cypher("Who?", retry_on_empty=True)
+    assert run.rows == [{"name": "Ada"}] and "no rows" in run.attempts[0]["error"]
 
-    def test_prompt_parameterizes_the_row_limit(self):
-        assert "{top_k}" in CYPHER_SYSTEM
 
-    @pytest.mark.parametrize(
-        "rule",
-        [
-            "Compare the raw property",
-            "Match the stored type exactly",
-            "half-open range",
-            "tolower(n.prop)",
-            "ORDER BY an indexed property with LIMIT",
-        ],
+def test_an_edge_against_the_schema_is_turned_unless_validation_is_off(graph: Any) -> None:
+    written = 'MATCH (c:"Company")-[:"WORKS_AT"]->(p:"Person") RETURN p.name AS name'
+    g = graph()
+    qa(g, Model(written), return_direct=True).invoke("Who works where?")
+    assert g.sent[0][0] == 'MATCH (c:"Company")<-[:"WORKS_AT"]-(p:"Person") RETURN p.name AS name'
+    g = graph()
+    qa(g, Model(written), return_direct=True, validate_cypher=False).invoke("Who works where?")
+    assert g.sent[0][0] == written
+
+
+@pytest.mark.parametrize(("release", "count"), [("2.17.0", 16), ("2.18.4.0", 17)])
+def test_examples_the_server_cannot_run_are_left_out(graph: Any, release: str, count: int) -> None:
+    writer = Model("RETURN 1 AS one")
+    qa(graph(release=release), writer, examples=DIALECT_EXAMPLES).invoke("q")
+    shown = writer.seen[0]
+    taught = [m.content for m in shown if m.type == "ai"]
+    assert len(taught) == count and shown[0].type == "system" and shown[-1].type == "human"
+    assert ("LET doubled" in " ".join(map(str, taught))) == (count == 17)
+    assert taught[0] == DIALECT_EXAMPLES[0][1] and shown[1].content == DIALECT_EXAMPLES[0][0]
+
+
+def test_examples_and_a_prompt_of_ones_own_refuse_each_other(graph: Any) -> None:
+    prompt = ChatPromptTemplate.from_messages([("human", "{schema} {question}")])
+    with pytest.raises(ValueError, match="not both"):
+        qa(graph(), Model(), examples=[("q", "c")], cypher_prompt=prompt)
+
+
+def test_cypher_llm_kwargs_carry_a_prompt_and_bind_the_rest(graph: Any) -> None:
+    prompt = ChatPromptTemplate.from_messages([("human", "S={schema} Q={question}")])
+    writer = Model("RETURN 1 AS one")
+    qa(graph(), writer, cypher_llm_kwargs={"prompt": prompt, "stop": ["\n\n"]}).invoke("q")
+    assert writer.seen[0][0].content.startswith("S=Node properties")
+    assert writer.kwargs[0] == {"stop": ["\n\n"]}
+
+
+@pytest.mark.parametrize(
+    ("limit", "shown", "hidden"),
+    [
+        ({"include_types": ["Person", "Company", "WORKS_AT"]}, "WORKS_AT", "Secret"),
+        ({"exclude_types": ["Secret"]}, "Company", "Secret"),
+        ({"include_types": ["Person"]}, "Person", "WORKS_AT"),
+    ],
+)
+def test_the_schema_shown_can_be_limited(
+    graph: Any, limit: dict[str, Any], shown: str, hidden: str
+) -> None:
+    writer = Model("RETURN 1 AS one")
+    qa(graph(), writer, **limit).invoke("q")
+    schema = writer.seen[0][-1].content
+    assert shown in schema and hidden not in schema
+
+
+@pytest.mark.parametrize(("mode", "reads"), [("ttl", 2), ("frozen", 1)])
+def test_a_frozen_schema_is_read_once(graph: Any, mode: str, reads: int) -> None:
+    g = graph()
+    chain = qa(g, Model("RETURN 1 AS one", "RETURN 1 AS one"), return_direct=True, schema=mode)
+    chain.invoke("q")
+    chain.invoke("q")
+    assert g.refreshes == reads
+
+
+def test_the_rows_can_reach_the_answer_as_a_tool_response(graph: Any) -> None:
+    answerer = Model("Ada.")
+    qa(
+        graph([{"name": "Ada"}]),
+        Model("MATCH (p:Person) RETURN p.name AS name"),
+        answerer,
+        use_function_response=True,
+    ).invoke("Who?")
+    _system, question, call, response = answerer.seen[0]
+    assert question.content == "Who?" and isinstance(response, ToolMessage)
+    assert json.loads(str(response.content)) == [{"name": "Ada"}]
+    assert isinstance(call, AIMessage) and call.tool_calls[0]["id"] == response.tool_call_id
+
+
+async def test_awaiting_gives_what_invoking_gives(graph: Any) -> None:
+    g = graph(AgensQueryError("bad", sqlstate="42703"), [{"name": "Ada"}])
+    writer = Model(
+        "MATCH (p:Person) RETURN p.nme AS name", "MATCH (p:Person) RETURN p.name AS name"
     )
-    def test_prompt_states_the_index_rules(self, rule):
-        assert rule in CYPHER_SYSTEM
-
-    def test_the_pack_teaches_no_property_wrapping(self):
-        # The two forms the sargability measurements ruled out: a cast or
-        # arithmetic around an indexed property has no index path at all.
-        from langchain_agensgraph.chains.cypher_qa import DIALECT_EXAMPLES
-
-        taught = " ".join(cypher for _q, cypher in DIALECT_EXAMPLES)
-        assert "::int4" not in taught
-        assert "::float8" not in taught
+    out = await qa(g, writer, Model("Ada."), return_intermediate_steps=True).ainvoke("Who?")
+    assert out["result"] == "Ada." and len(out["intermediate_steps"]) == 3
+    assert [text for text, _ in g.sent][-1] == 'MATCH (p:"Person") RETURN p.name AS name'
 
 
-class TestFewShotExamples:
-    """Example pairs become real conversation turns ahead of the question."""
+def test_the_models_run_inside_the_chain_run(graph: Any) -> None:
+    with collect_runs() as runs:
+        qa(graph(), Model("RETURN 1 AS one"), Model("one")).invoke("q")
+    (root,) = runs.traced_runs
+    assert root.name == "AgensCypherQAChain" and len(root.child_runs) >= 3
 
-    def _chain(self, **kwargs):
-        from langchain_core.language_models import FakeListChatModel
 
-        from langchain_agensgraph.chains.cypher_qa import AgensCypherQAChain
+def test_batch_answers_each_question(graph: Any) -> None:
+    g = graph()
+    chain = qa(g, Model(*["RETURN 1 AS one"] * 3), return_direct=True)
+    outs = chain.batch(["a", "b", "c"], config={"max_concurrency": 2})
+    assert sorted(out["query"] for out in outs) == ["a", "b", "c"] and len(g.sent) == 3
 
-        llm = FakeListChatModel(responses=["MATCH (n) RETURN n"])
-        return AgensCypherQAChain.from_llm(llm, graph=object(), **kwargs)
 
-    def test_examples_become_alternating_turns(self):
-        chain = self._chain(examples=[("q1", "c1"), ("q2", "c2")])
-        messages = chain.cypher_prompt.format_messages(schema="S", question="Q")
-        assert [m.type for m in messages] == [
-            "system",
-            "human",
-            "ai",
-            "human",
-            "ai",
-            "human",
-        ]
-        assert messages[1].content == "q1"
-        assert messages[2].content == "c1"
-        assert messages[-1].content.endswith("Question: Q")
+@pytest.mark.parametrize(
+    "release", ["2.14.1", "2.15.0", "2.16.0", "2.17.0", "2.18.4.0", "2.18.6.1"]
+)
+def test_the_prompt_carries_the_rules_this_release_needs(release: str) -> None:
+    text = render_cypher_system(Capabilities(release), top_k=7)
+    assert "Quote every label" in text and "LIMIT of at most 7" in text
+    assert "Read only" in text and "tointeger" not in text and "tofloat" not in text
+    assert ("No GQL" in text) == (release < "2.18")
+    assert ("on a ::text cast inside WITH" in text) == (release < "2.18.6")
+    assert ("ORDER BY may name only" in text) == (release < "2.17")
+    assert ("collect() gives null" in text) == (release < "2.15")
+    assert ("A label that is not in the schema is an error" in text) == (release < "2.15")
+    assert (", split" in text) == (release >= "2.15")
 
-    def test_braces_in_an_example_survive_templating(self):
-        chain = self._chain(examples=[("map?", "RETURN {a: 1} AS m")])
-        messages = chain.cypher_prompt.format_messages(schema="S", question="Q")
-        assert messages[2].content == "RETURN {a: 1} AS m"
 
-    def test_examples_and_a_custom_prompt_refuse_each_other(self):
-        from langchain_core.prompts import ChatPromptTemplate
+def test_a_prompt_for_writes_says_so() -> None:
+    text = render_cypher_system(Capabilities("2.17.0"), allow_writes=True)
+    assert "Read only" not in text and "CREATE or MERGE" in text
 
-        prompt = ChatPromptTemplate.from_messages([("human", "{schema} {question}")])
-        with pytest.raises(ValueError, match="not both"):
-            self._chain(examples=[("q", "c")], cypher_prompt=prompt)
 
-    def test_the_dialect_pack_renders_whole(self):
-        from langchain_agensgraph.chains.cypher_qa import DIALECT_EXAMPLES
+def test_the_tool_answers_or_hands_back_the_rows(graph: Any) -> None:
+    rows = [{"name": "Ada"}]
+    tool = create_cypher_tool(
+        graph(rows), scripted("RETURN 'Ada' AS name", "Ada."), allow_dangerous_requests=True
+    )
+    assert tool.invoke({"question": "Who?"}) == "Ada."
+    tool = create_cypher_tool(
+        graph(rows), scripted("RETURN 'Ada' AS name"), answer=False, allow_dangerous_requests=True
+    )
+    assert json.loads(tool.invoke({"question": "Who?"})) == rows
 
-        assert len(DIALECT_EXAMPLES) >= 10
-        chain = self._chain(examples=DIALECT_EXAMPLES)
-        messages = chain.cypher_prompt.format_messages(schema="S", question="Q")
-        assert len(messages) == 2 + 2 * len(DIALECT_EXAMPLES)
-        # Every taught query is stated as the assistant's own turn, verbatim.
-        taught = [m.content for m in messages if m.type == "ai"]
-        assert taught == [cypher for _q, cypher in DIALECT_EXAMPLES]
+
+def test_the_retriever_makes_a_document_of_each_row(graph: Any) -> None:
+    g = graph([{"name": "Ada"}, {"name": "Bob"}])
+    retriever = AgensText2CypherRetriever(
+        graph=g,
+        llm=scripted("MATCH (p:Person) RETURN p.name AS name"),
+        allow_dangerous_requests=True,
+    )
+    documents = retriever.invoke("Who?", k=1)
+    assert [json.loads(d.page_content) for d in documents] == [{"name": "Ada"}]
+    assert documents[0].metadata == {"cypher": 'MATCH (p:"Person") RETURN p.name AS name'}
+    assert g.sent[0][1]["max_rows"] == 10
+
+
+class TestCypherToolStandard(ToolsUnitTests):
+    @pytest.fixture(autouse=True)
+    def _graph(self) -> Any:
+        self.graph = Graph()
+        yield
+        self.graph.close()
+
+    @property
+    def tool_constructor(self) -> BaseTool:
+        return create_cypher_tool(
+            self.graph, scripted("RETURN 1 AS one", "one"), allow_dangerous_requests=True
+        )
+
+    @property
+    def tool_invoke_params_example(self) -> dict[str, Any]:
+        return {"question": "How many people are there?"}

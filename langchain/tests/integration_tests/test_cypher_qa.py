@@ -1,278 +1,192 @@
-"""Integration tests for AgensCypherQAChain against a real graph.
+"""The QA chain, its tool and the text2cypher retriever against a server, with scripted models.
 
-The model is scripted rather than real, so the assertions are about the pipeline —
-repair, refusal, validation, execution — and not about a model's Cypher-writing ability.
+Model-written Cypher runs as ``llm_ro`` and, for writes, ``llm_rw``, after ``render_grants``; the
+assertions are about what the pipeline sends and what comes back, not about a model.
 """
 
-import os
+from __future__ import annotations
 
+import json
+from collections.abc import Iterator
+from typing import Any
+
+import psycopg
 import pytest
-from langchain_core.language_models.fake_chat_models import FakeListChatModel
+from agensgraph.errors import CapabilityError
+from langchain_core.messages import AIMessage
+from langchain_core.runnables import RunnableLambda
+from langchain_core.tools import BaseTool
+from langchain_tests.integration_tests import ToolsIntegrationTests
+from psycopg.conninfo import make_conninfo
 
-from langchain_agensgraph import AgensCypherQAChain, AgensGraph, create_cypher_tool
+from langchain_agensgraph._core.engine import AgensEngine
+from langchain_agensgraph.chains import (
+    DIALECT_EXAMPLES,
+    AgensCypherQAChain,
+    create_cypher_tool,
+    prepare,
+)
+from langchain_agensgraph.chains.cypher_qa import _EXAMPLE_NEEDS
+from langchain_agensgraph.errors import UnsafeCypherError
+from langchain_agensgraph.graphs import AgensGraph, GraphDocument, Node, Relationship
+from langchain_agensgraph.retrievers import AgensText2CypherRetriever
+from langchain_agensgraph.roles import render_grants
+
+pytestmark = pytest.mark.server
 
 
-def _conf():
-    return {
-        "dbname": os.getenv("AGENSGRAPH_DB"),
-        "user": os.getenv("AGENSGRAPH_USER"),
-        "password": os.getenv("AGENSGRAPH_PASSWORD"),
-        "host": os.getenv("AGENSGRAPH_HOST", "localhost"),
-        "port": int(os.getenv("AGENSGRAPH_PORT", 5432)),
-    }
+def _world() -> GraphDocument:
+    """One of everything the dialect examples ask about, so each of them finds a row."""
+
+    def node(key: str, label: str, **properties: Any) -> Node:
+        return Node(id=key, type=label, properties=properties)
+
+    ada, bob = node("ada", "Person", name="Ada", age=36), node("bob", "Person", name="Bob", age=25)
+    acme, prolog = node("acme", "Company", name="Acme"), node("prolog", "Product", name="Prolog")
+    author = node("knuth", "Author", name="Knuth")
+    papers = [node(f"p{i}", "Paper", title=f"Paper {i}") for i in range(6)]
+    customer, movie = node("c1", "Customer", name="Cy"), node("m1", "Movie", title="Heat")
+    genres = [node("crime", "Genre", name="Crime"), node("drama", "Genre", name="Drama")]
+    nodes = [ada, bob, acme, prolog, author, customer, movie, *papers, *genres]
+    nodes += [
+        node("b1", "Book", title="graph theory"),
+        node("i1", "Item", name="lamp", price=60),
+        node("i2", "Item", name="pen", price=10),
+        node("k1", "Code", value="123"),
+    ]
+    edges = [
+        Relationship(source=ada, target=acme, type="WORKS_AT"),
+        Relationship(source=ada, target=bob, type="FRIENDS_WITH"),
+        Relationship(source=customer, target=prolog, type="ORDERED"),
+        *(Relationship(source=paper, target=author, type="AUTHORED_BY") for paper in papers),
+        *(Relationship(source=movie, target=genre, type="IN_GENRE") for genre in genres),
+    ]
+    return GraphDocument(nodes=nodes, relationships=edges)
 
 
 @pytest.fixture
-def graph():
-    g = AgensGraph("cypher_qa_it", _conf(), create=True)
-    g.query("MATCH (n) DETACH DELETE n")
-    # the key is quoted so the graph stores "firstName" case-preserved; written bare it
-    # would be stored as "firstname" and the repair would rightly leave it alone
-    g.query("CREATE (:\"Person\" {name: 'Alice', \"firstName\": 'Alice'})")
-    g.query("CREATE (:\"Person\" {name: 'Bob', \"firstName\": 'Bob'})")
-    g.refresh_schema(force=True)
-    yield g
-    g.close()
+def graph(dsn: str, graph_name: str) -> Iterator[AgensGraph]:
+    """The world, readable by ``llm_ro`` and writable by ``llm_rw``, through an engine that runs
+    model-written Cypher as them."""
+    with AgensEngine(dsn) as owner:
+        AgensGraph(owner, graph_name=graph_name, create_graph=True).add_graph_documents([_world()])
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(render_grants(graph_name, writer_role="llm_rw"))
+    with AgensEngine(
+        dsn,
+        untrusted_conninfo=make_conninfo(dsn, user="llm_ro", password="agens"),
+        writer_conninfo=make_conninfo(dsn, user="llm_rw", password="agens"),
+    ) as engine:
+        yield AgensGraph(engine, graph_name=graph_name)
 
 
-def _chain(graph, cypher: str, answer: str = "An answer.", **kwargs):
-    """A chain whose model emits `cypher` first, then `answer`.
+def scripted(*replies: str) -> RunnableLambda[Any, AIMessage]:
+    queue = list(replies)
+    return RunnableLambda(lambda _prompt: AIMessage(content=queue.pop(0)))
 
-    The role these tests run as creates graphs, so it is privileged enough to run a
-    command on the server's host and a read-only transaction is not a boundary for it.
-    That is accepted here so the rest of the pipeline can be tested;
-    :class:`TestServerPrograms` covers the refusal itself.
-    """
-    kwargs.setdefault("allow_server_programs", True)
+
+def qa(graph: AgensGraph, *replies: str, **kwargs: Any) -> AgensCypherQAChain:
     return AgensCypherQAChain.from_llm(
-        FakeListChatModel(responses=[cypher, answer]), graph=graph, **kwargs
+        graph=graph,
+        cypher_llm=scripted(*replies),
+        qa_llm=scripted("An answer."),
+        allow_dangerous_requests=True,
+        **kwargs,
     )
 
 
-class TestHappyPath:
-    def test_generated_query_runs_and_is_answered(self, graph):
-        chain = _chain(graph, "MATCH (n:Person) RETURN n.name AS name LIMIT 10")
-        out = chain.invoke({"query": "Who is in the graph?"})
-        assert out["query"] == "Who is in the graph?"
-        assert out["result"] == "An answer."
-
-    def test_intermediate_steps_expose_the_query_and_rows(self, graph):
-        chain = _chain(
-            graph,
-            "MATCH (n:Person) RETURN n.name AS name LIMIT 10",
-            return_intermediate_steps=True,
-        )
-        out = chain.invoke({"query": "Who?"})
-        steps = out["intermediate_steps"]
-        assert steps[0]["query"].startswith("MATCH")
-        assert {r["name"] for r in steps[1]["context"]} == {"Alice", "Bob"}
-
-    def test_an_unquoted_label_is_repaired_and_still_matches(self, graph):
-        """Unrepaired, this is the failure the repair exists for: it runs and finds nothing."""
-        chain = _chain(
-            graph,
-            "MATCH (n:Person) RETURN n.name AS name LIMIT 10",
-            return_intermediate_steps=True,
-        )
-        out = chain.invoke({"query": "Who?"})
-        assert '"Person"' in out["intermediate_steps"][0]["query"]
-        assert len(out["intermediate_steps"][1]["context"]) == 2
-
-    def test_a_mixed_case_property_is_repaired(self, graph):
-        chain = _chain(
-            graph,
-            "MATCH (n:Person) RETURN n.firstName AS f LIMIT 10",
-            return_intermediate_steps=True,
-        )
-        out = chain.invoke({"query": "First names?"})
-        rows = out["intermediate_steps"][1]["context"]
-        assert {r["f"] for r in rows} == {"Alice", "Bob"}
-
-    def test_fences_are_stripped(self, graph):
-        chain = _chain(
-            graph,
-            "```cypher\nMATCH (n:Person) RETURN n.name AS name LIMIT 10\n```",
-            return_intermediate_steps=True,
-        )
-        out = chain.invoke({"query": "Who?"})
-        assert "```" not in out["intermediate_steps"][0]["query"]
-
-    def test_top_k_bounds_the_rows_handed_to_the_model(self, graph):
-        chain = _chain(
-            graph,
-            "MATCH (n:Person) RETURN n.name AS name LIMIT 10",
-            top_k=1,
-            return_intermediate_steps=True,
-        )
-        out = chain.invoke({"query": "Who?"})
-        assert len(out["intermediate_steps"][1]["context"]) == 1
+def test_each_dialect_example_offered_to_a_release_runs_on_it(graph: AgensGraph) -> None:
+    caps = graph.capabilities
+    for question, cypher in DIALECT_EXAMPLES:
+        needs = _EXAMPLE_NEEDS.get(cypher)
+        if needs is not None and not caps.has(needs):
+            continue
+        rows = graph.query_untrusted(prepare(cypher, caps), max_rows=10)
+        assert rows or "graph id" in question, question
 
 
-class TestRefusals:
-    def test_a_write_is_refused(self, graph):
-        chain = _chain(graph, "CREATE (:Person {name: 'Mallory'})")
-        with pytest.raises(ValueError, match="writes"):
-            chain.invoke({"query": "Add someone"})
-        # and nothing was written
-        assert graph.query('MATCH (n:"Person") RETURN count(*) AS c')[0]["c"] == 2
+def test_a_question_becomes_a_statement_run_as_the_untrusted_role(graph: AgensGraph) -> None:
+    chain = qa(graph, "MATCH (p:Person) RETURN p.name AS name ORDER BY name", return_direct=True)
+    out = chain.invoke("Who is there?")
+    assert out["result"] == [{"name": "Ada"}, {"name": "Bob"}]
 
-    def test_a_write_is_allowed_when_explicitly_permitted(self, graph):
-        chain = _chain(
-            graph,
-            "CREATE (:Person {name: 'Carol'})",
+
+def test_what_the_server_or_the_reading_refuses_goes_back_to_the_model(
+    graph: AgensGraph,
+) -> None:
+    chain = qa(
+        graph,
+        'MATCH (p:"Person") SET p.seen = true RETURN p.name AS name',
+        'MATCH (p:"Person") RETURN p.name AS name ORDER',
+        'MATCH (p:"Person") WHERE p.age > 30 RETURN p.name AS name',
+        return_direct=True,
+        return_intermediate_steps=True,
+    )
+    out = chain.invoke("Who is over thirty?")
+    assert out["result"] == [{"name": "Ada"}]
+    refused, failed = out["intermediate_steps"][:2]
+    assert "a write" in refused["error"] and "syntax error" in failed["error"]
+    assert graph.query('MATCH (p:"Person") WHERE p.seen IS NOT NULL RETURN p') == []
+
+
+def test_rows_are_read_up_to_top_k(graph: AgensGraph) -> None:
+    out = qa(graph, 'MATCH (p:"Paper") RETURN p.title AS t', top_k=4, return_direct=True).invoke(
+        "Papers?"
+    )
+    assert len(out["result"]) == 4
+
+
+def test_writes_run_as_the_writer_role_where_the_server_checks_them(graph: AgensGraph) -> None:
+    chain = qa(
+        graph,
+        "MATCH (p:\"Person\") WHERE p.name = 'Bob' SET p.retired = true RETURN p.name AS name",
+        allow_writes=True,
+        return_direct=True,
+    )
+    if not graph.capabilities.has("cypher_write_enforced"):
+        with pytest.raises(CapabilityError):
+            chain.invoke("Retire Bob.")
+        return
+    assert chain.invoke("Retire Bob.")["result"] == [{"name": "Bob"}]
+    assert graph.query('MATCH (p:"Person") WHERE p.retired = true RETURN p.name AS n') == [
+        {"n": "Bob"}
+    ]
+
+
+async def test_awaiting_the_chain_and_the_retriever(graph: AgensGraph) -> None:
+    out = await qa(graph, 'MATCH (c:"Company") RETURN c.name AS name').ainvoke("Companies?")
+    assert out == {"query": "Companies?", "result": "An answer."}
+    retriever = AgensText2CypherRetriever(
+        graph=graph,
+        llm=scripted("MATCH (p:\"Person\") WHERE p.name = 'Ada' RETURN p.age AS age"),
+        allow_dangerous_requests=True,
+    )
+    (document,) = await retriever.ainvoke("How old is Ada?")
+    assert json.loads(document.page_content) == {"age": 36}
+    await graph.engine.aclose()
+
+
+def test_text_the_reading_refuses_never_reaches_the_server(graph: AgensGraph) -> None:
+    with pytest.raises(UnsafeCypherError, match="more than one statement"):
+        graph.query_untrusted('MATCH (n) RETURN n; DROP GRAPH "x" CASCADE')
+
+
+class TestCypherToolStandard(ToolsIntegrationTests):
+    @pytest.fixture(autouse=True)
+    def _graph(self, graph: AgensGraph) -> None:
+        self.graph = graph
+
+    @property
+    def tool_constructor(self) -> BaseTool:
+        return create_cypher_tool(
+            self.graph,
+            RunnableLambda(
+                lambda _prompt: AIMessage(content='MATCH (p:"Person") RETURN count(*) AS n')
+            ),
+            answer=False,
             allow_dangerous_requests=True,
         )
-        chain.invoke({"query": "Add Carol"})
-        assert graph.query('MATCH (n:"Person") RETURN count(*) AS c')[0]["c"] == 3
 
-    def test_malformed_cypher_is_caught_before_it_runs(self, graph):
-        chain = _chain(graph, "MATCH (n:Person RETURN n")
-        with pytest.raises(ValueError, match="not runnable"):
-            chain.invoke({"query": "Broken"})
-
-    def test_validation_can_be_turned_off(self, graph):
-        chain = _chain(graph, "MATCH (n:Person RETURN n", validate_cypher=False)
-        # without EXPLAIN the failure surfaces from execution instead
-        with pytest.raises(Exception):
-            chain.invoke({"query": "Broken"})
-
-    @pytest.mark.parametrize(
-        "cypher",
-        [
-            'TRUNCATE "cypher_qa_it"."Person"',
-            'INSERT INTO "cypher_qa_it"."Person" VALUES (NULL)',
-            'DROP VLABEL "Person"',
-            "MATCH (n) RETURN count(*) AS c; CREATE (:Person {name: 'Mallory'})",
-        ],
-    )
-    def test_the_transaction_refuses_what_reading_the_text_misses(self, graph, cypher):
-        """The SQL forms of a write, which are not Cypher and so match no reading of it.
-
-        Checked with the text unread, so what refuses them is the transaction and
-        nothing else.
-        """
-        chain = _chain(graph, cypher, validate_cypher=False)
-        with pytest.raises(Exception):
-            chain.run_cypher(cypher)
-        assert graph.query('MATCH (n:"Person") RETURN count(*) AS c')[0]["c"] == 2
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "cypher",
-        [
-            'TRUNCATE "cypher_qa_it"."Person"',
-            'INSERT INTO "cypher_qa_it"."Person" VALUES (NULL)',
-            'DROP VLABEL "Person"',
-            "MATCH (n) RETURN count(*) AS c; CREATE (:Person {name: 'Mallory'})",
-        ],
-    )
-    async def test_the_async_path_holds_the_same_transaction(self, graph, cypher):
-        chain = _chain(graph, cypher, validate_cypher=False)
-        with pytest.raises(Exception):
-            await chain.arun_cypher(cypher)
-        assert graph.query('MATCH (n:"Person") RETURN count(*) AS c')[0]["c"] == 2
-
-
-class TestServerPrograms:
-    """A role that can run a command on the server's host has no boundary to give it."""
-
-    def test_a_privileged_role_is_refused_rather_than_given_a_boundary_that_is_not_one(self, graph):
-        chain = AgensCypherQAChain.from_llm(
-            FakeListChatModel(responses=["MATCH (n:Person) RETURN n.name AS name"]),
-            graph=graph,
-        )
-        with pytest.raises(Exception, match="server's host"):
-            chain.invoke({"query": "Who?"})
-
-    @pytest.mark.asyncio
-    async def test_the_async_path_refuses_it_too(self, graph):
-        chain = AgensCypherQAChain.from_llm(
-            FakeListChatModel(responses=["MATCH (n:Person) RETURN n.name AS name"]),
-            graph=graph,
-        )
-        with pytest.raises(Exception, match="server's host"):
-            await chain.ainvoke({"query": "Who?"})
-
-
-class TestTool:
-    def test_tool_answers_a_question(self, graph):
-        tool = create_cypher_tool(
-            graph,
-            FakeListChatModel(
-                responses=["MATCH (n:Person) RETURN n.name AS name LIMIT 10", "Two people."]
-            ),
-            allow_server_programs=True,
-        )
-        assert tool.invoke({"question": "Who?"}) == "Two people."
-
-    def test_tool_can_return_rows_instead_of_prose(self, graph):
-        tool = create_cypher_tool(
-            graph,
-            FakeListChatModel(responses=["MATCH (n:Person) RETURN n.name AS name LIMIT 10"]),
-            answer=False,
-            allow_server_programs=True,
-        )
-        rows = tool.invoke({"question": "Who?"})
-        assert {r["name"] for r in rows} == {"Alice", "Bob"}
-
-    def test_tool_refuses_a_write(self, graph):
-        tool = create_cypher_tool(
-            graph,
-            FakeListChatModel(responses=["CREATE (:Person {name: 'Mallory'})"]),
-            answer=False,
-            allow_server_programs=True,
-        )
-        with pytest.raises(ValueError, match="writes"):
-            tool.invoke({"question": "Add someone"})
-
-
-class TestAsync:
-    @pytest.mark.asyncio
-    async def test_async_matches_sync(self, graph):
-        chain = _chain(
-            graph,
-            "MATCH (n:Person) RETURN n.name AS name LIMIT 10",
-            return_intermediate_steps=True,
-        )
-        out = await chain.ainvoke({"query": "Who?"})
-        assert out["result"] == "An answer."
-        assert len(out["intermediate_steps"][1]["context"]) == 2
-
-    @pytest.mark.asyncio
-    async def test_async_refuses_a_write(self, graph):
-        chain = _chain(graph, "CREATE (:Person {name: 'Mallory'})")
-        with pytest.raises(ValueError, match="writes"):
-            await chain.ainvoke({"query": "Add someone"})
-
-
-class TestAFailureIsReportedAsWhatItIs:
-    """Only the server refusing the statement means the model wrote something unrunnable.
-
-    A server that is not there, or a role the boundary cannot be opened for, is not about
-    the Cypher -- and reporting it as a query problem sends whoever reads it to look at
-    the query.
-    """
-
-    def test_a_malformed_query_is_a_query_problem(self, graph):
-        chain = _chain(graph, "MATCH (n:Person RETURN n")
-        with pytest.raises(ValueError, match="not runnable"):
-            chain.invoke({"query": "Broken"})
-
-    def test_a_role_that_cannot_be_given_a_boundary_says_so(self, graph):
-        """Not 'your Cypher is wrong' -- the Cypher is fine."""
-        chain = AgensCypherQAChain.from_llm(
-            FakeListChatModel(responses=["MATCH (n:Person) RETURN n.name AS name"]),
-            graph=graph,
-        )
-        with pytest.raises(Exception) as caught:
-            chain.invoke({"query": "Who?"})
-        assert "not runnable" not in str(caught.value)
-        assert "server's host" in str(caught.value)
-
-    def test_a_server_that_is_not_there_says_so(self):
-        """A connection failure is not a query failure."""
-        unreachable = dict(_conf())
-        unreachable["port"] = 1  # nothing listens here
-        with pytest.raises(Exception) as caught:
-            AgensGraph("cypher_qa_it", unreachable, create=False)
-        assert "not runnable" not in str(caught.value)
+    @property
+    def tool_invoke_params_example(self) -> dict[str, Any]:
+        return {"question": "How many people are there?"}

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import pathlib
+import re
 from typing import Any, Dict, List, Optional
 
 import agensgraph
@@ -39,9 +40,10 @@ def canonical(rows: List[Dict[str, Any]], ordered: bool = False) -> List[List[st
     question fixed their order. Graph elements serialize through the driver
     (vertex -> id/label/properties), so two queries returning the same vertices
     agree; gold queries avoid returning raw ids where the comparison should
-    survive a re-ingest.
+    survive a re-ingest. A number is its value: ``32.0`` from a jsonb ``avg`` and
+    ``32`` from one over a cast agree.
     """
-    plain = json.loads(agensgraph.to_json(rows).decode())
+    plain = json.loads(agensgraph.to_json(rows).decode(), parse_float=_number)
     canon_rows = []
     for row in plain:
         canon_rows.append(sorted(json.dumps(v, sort_keys=True) for v in row.values()))
@@ -50,46 +52,49 @@ def canonical(rows: List[Dict[str, Any]], ordered: bool = False) -> List[List[st
     return canon_rows
 
 
+def _number(text: str) -> float | int:
+    value = float(text)
+    return int(value) if value.is_integer() else value
+
+
 def results_match(
     got: List[Dict[str, Any]], want: List[Dict[str, Any]], ordered: bool = False
 ) -> bool:
     return canonical(got, ordered) == canonical(want, ordered)
 
 
-def plan_has_index_path(conf: Dict[str, Any], graph: str, cypher: str) -> bool:
+def plan_has_index_path(dsn: str, graph: str, cypher: str) -> bool:
     """Whether any index can serve this statement at all.
 
     With ``enable_seqscan = off`` the planner still picks a sequential scan when
-    nothing else exists, and marks it ``Disabled: true`` -- its own statement
-    that no index path exists. That line, not which plan wins by cost, is what
-    separates "the index cannot serve this predicate" from "the table is small".
+    nothing else exists, and marks it disabled: ``Disabled: true`` from
+    PostgreSQL 18, a cost of at least 10^10 before it. That mark, not which plan
+    wins by cost, is what separates "the index cannot serve this predicate" from
+    "the table is small".
     """
     import psycopg
 
-    connect = {k: v for k, v in conf.items() if v is not None}
-    with psycopg.connect(**connect) as conn:
+    with psycopg.connect(dsn) as conn:
         cur = conn.cursor()
-        cur.execute(f"SET graph_path = {graph}")
+        cur.execute(f'SET graph_path = "{graph}"')
         cur.execute("SET enable_seqscan = off")
-        cur.execute("EXPLAIN (COSTS OFF) " + cypher)
+        cur.execute("EXPLAIN " + cypher)
         plan = "\n".join(row[0] for row in cur.fetchall())
-    return "Disabled: true" not in plan
+    return "Disabled: true" not in plan and not _DISABLED_COST.search(plan)
+
+
+_DISABLED_COST = re.compile(r"cost=\d{11,}")
+
+# Requirements named for what an entry needs, each read as the capability that
+# arrived with it: 2.18's grammar, which brought the GQL clauses, also takes
+# only a boolean as a condition.
+_CAPABILITY = {"element_ordering": "element_comparison", "boolean_condition": "gql_clauses"}
 
 
 def requires_met(entry: Dict[str, Any], capabilities: Any) -> Optional[str]:
     """None when the server can run this entry, else the unmet requirement."""
     for requirement in entry.get("requires", ()):
-        if requirement == "gql_clauses":
-            if not capabilities.has_gql_clauses():
-                return requirement
-        elif requirement == "element_ordering":
-            if not capabilities.has_element_ordering():
-                return requirement
-        elif requirement == "boolean_condition":
-            # From 2.18 a condition takes only a boolean; 2.17 reads a value as truthy.
-            if capabilities.version < (2, 18):
-                return requirement
-        else:
+        if not capabilities.has(_CAPABILITY.get(requirement, requirement)):
             return requirement
     return None
 

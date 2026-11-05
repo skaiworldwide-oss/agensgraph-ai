@@ -1141,6 +1141,7 @@ lint = [
 ]
 test = [
     { name = "langchain-tests" },
+    { name = "langgraph-checkpoint-conformance" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "pytest-cov" },
@@ -1173,6 +1174,7 @@ dev = [
 lint = [{ name = "ruff", specifier = "==0.16.1" }]
 test = [
     { name = "langchain-tests", specifier = ">=1.1.9" },
+    { name = "langgraph-checkpoint-conformance", specifier = "==0.0.2" },
     { name = "pytest", specifier = ">=8.3" },
     { name = "pytest-asyncio", specifier = ">=0.25" },
     { name = "pytest-cov", specifier = ">=5" },
@@ -1271,6 +1273,18 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/f0/c4/f4107f50dd07169d08d95766cd69104231e694f44a1b25b68ad8b393712d/langgraph_checkpoint-4.3.1.tar.gz", hash = "sha256:625e7c78a72b33e7c47f7e87ca051060fb90aa66f5fd551c472c08376fb669cb", size = 182679, upload-time = "2026-10-26T19:57:31.416Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/f3/40/4251d676b5c585d42175c901175d4bff56e22939625e18bcef781fc3e893/langgraph_checkpoint-4.3.1-py3-none-any.whl", hash = "sha256:215a826935c8db4d9676e79fd95943e5b3847d78604390898e1d98581cc594e5", size = 58093, upload-time = "2026-10-26T19:57:30.361Z" },
+]
+
+[[package]]
+name = "langgraph-checkpoint-conformance"
+version = "0.0.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "langgraph-checkpoint" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/81/da/93e4e31f1f64eb12eb9b1a721161708ed7cdcacf9a105d6f6c203f903721/langgraph_checkpoint_conformance-0.0.2.tar.gz", hash = "sha256:6718e00937bf2f04cdfd2cdfabea23e1dabb79a534ff4c127f305f6b40dad4e0", size = 93726, upload-time = "2026-04-08T23:02:08.74Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ff/ed/27dc4ce19f9c848521e45cbf778b1a8d8d774fa468bab67f5a5fd51e9fe0/langgraph_checkpoint_conformance-0.0.2-py3-none-any.whl", hash = "sha256:c112ddc0416b097c90a145fd1908ba570db4cba209e1ae0330205e9f466ad4f9", size = 28425, upload-time = "2026-04-08T23:02:07.668Z" },
 ]
 
 [[package]]

@@ -41,9 +41,9 @@ __all__ = [
 # The LangGraph checkpointer and store are re-exported lazily so the package still
 # imports if langgraph is not installed.
 try:  # pragma: no cover - import guard
-    from langchain_agensgraph.checkpoint import AgensSaver, AsyncAgensSaver
+    from langchain_agensgraph.checkpoint import AgensSaver
     from langchain_agensgraph.store import AgensStore
 
-    __all__ += ["AgensSaver", "AgensStore", "AsyncAgensSaver"]
+    __all__ += ["AgensSaver", "AgensStore"]
 except ImportError:  # pragma: no cover
     pass

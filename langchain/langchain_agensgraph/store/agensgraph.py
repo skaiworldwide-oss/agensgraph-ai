@@ -524,6 +524,30 @@ class _StoreCore(Component):
         await self._setup.aensure()
         return await self._engine.arun(lambda: self._sweep_all(batch_size))
 
+    def cypher_subquery(self, namespace: str = "%s", *, nested: bool = False) -> str:
+        """A SQL subquery a Cypher statement can hold, giving the items in a namespace as a list.
+
+        Each element is a map of ``namespace`` (its labels), ``key``, ``value``, ``created_at``
+        and ``updated_at``; expired items are left out. ``namespace`` is the SQL for the
+        namespace's labels joined by ``.``: a placeholder, by default, or an expression.
+        ``nested`` takes the namespaces under it as well. For example::
+
+            graph.query(
+                f"UNWIND [1] AS a WITH {store.cypher_subquery()} AS items UNWIND items AS i "
+                'MATCH (p:"Person") WHERE p.name = i.value.name RETURN p, i.key AS key',
+                ("users.prefs",),
+            )
+        """
+        under = " OR starts_with(s.prefix, w.prefix || '.')" if nested else ""
+        return (
+            "(SELECT coalesce(jsonb_agg(jsonb_build_object('namespace', "
+            "string_to_array(s.prefix, '.'), 'key', s.key, 'value', s.value, 'created_at', "
+            "s.created_at, 'updated_at', s.updated_at) ORDER BY s.prefix, s.key), '[]') "
+            f"FROM {self._tables.store} s, (SELECT ({namespace})::text AS prefix) w "
+            f"WHERE (s.prefix = w.prefix{under}) "
+            "AND (s.expires_at IS NULL OR s.expires_at > now()))"
+        )
+
     # -- the batch -------------------------------------------------------------------------
 
     def _texts(self, ops: Sequence[Op]) -> tuple[list[str], list[tuple[str, str, str, int]]]:

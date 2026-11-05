@@ -7,7 +7,6 @@ Appendix D).
 
 collect_ignore = [
     "test_async.py",
-    "test_checkpoint.py",
     "test_composition.py",
     "test_enhanced_schema.py",
     "test_index_config.py",

@@ -1,6 +1,3 @@
-from langchain_agensgraph.checkpoint.agensgraph import (
-    AgensSaver,
-    AsyncAgensSaver,
-)
+from langchain_agensgraph.checkpoint.agensgraph import AgensSaver
 
-__all__ = ["AgensSaver", "AsyncAgensSaver"]
+__all__ = ["AgensSaver"]

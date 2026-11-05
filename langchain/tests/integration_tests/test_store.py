@@ -11,6 +11,7 @@ from langgraph.store.base import GetOp, InvalidNamespaceError, PutOp, SearchItem
 from langgraph.store.memory import InMemoryStore
 
 from langchain_agensgraph._core.engine import AgensEngine
+from langchain_agensgraph.graphs import AgensGraph, GraphDocument, Node
 from langchain_agensgraph.store import AgensStore, AsyncAgensStore
 from tests import datagen
 from tests.goldens.golden import FixedEmbeddings
@@ -138,6 +139,28 @@ def test_a_first_call_in_a_callers_transaction_finds_the_tables_setup_made(
         store.put(("docs",), "k", {"v": 1})
         assert plain(store.get(("docs",), "k")) == (("docs",), "k", {"v": 1})
     assert plain(AgensStore(engine, graph_name=graph_name).get(("docs",), "k")) is not None
+
+
+@pytest.mark.parametrize(("nested", "keys"), [(False, ["prefs"]), (True, ["prefs", "x"])])
+def test_a_cypher_statement_reads_the_items_next_to_the_graph(
+    engine: AgensEngine, graph_name: str, nested: bool, keys: list[str]
+) -> None:
+    graph = AgensGraph(engine, graph_name=graph_name, create_graph=True)
+    ada = Node(id="ada", type="Person", properties={"name": "Ada"})
+    graph.add_graph_documents([GraphDocument(nodes=[ada], relationships=[])])
+    store = AgensStore(engine, graph_name=graph_name)
+    store.put(("users", "ada"), "prefs", {"name": "Ada", "theme": "dark"})
+    store.put(("users", "ada", "old"), "x", {"name": "Ada"})
+    store.put(("users", "adam"), "prefs", {"name": "Ada"})
+    store.put(("users", "bob"), "prefs", {"name": "Bob"})
+    rows = graph.query(
+        f"UNWIND [1] AS a WITH {store.cypher_subquery(nested=nested)} AS items "
+        'UNWIND items AS i MATCH (p:"Person") WHERE p.name = i.value.name '
+        "RETURN p.name AS who, i.key AS key, i.namespace AS namespace",
+        ("users.ada",),
+    )
+    assert [row["key"] for row in rows] == keys
+    assert rows[0] == {"who": "Ada", "key": "prefs", "namespace": ["users", "ada"]}
 
 
 def test_a_namespace_label_holding_a_period_is_refused(

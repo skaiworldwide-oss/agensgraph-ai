@@ -11,6 +11,7 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langchain_agensgraph._core.engine import AgensEngine
 from langchain_agensgraph._core.names import companion_schema, ident
 from langchain_agensgraph.chat_message_histories import AgensChatMessageHistory
+from langchain_agensgraph.graphs import AgensGraph, GraphDocument, Node
 from langchain_agensgraph.observability import log_queries
 from tests import datagen
 
@@ -114,6 +115,34 @@ def test_a_first_call_in_a_callers_transaction_finds_the_tables_setup_made(
         chat.add_messages([HumanMessage("hi", id="m1")])
         assert [m.content for m in chat.messages] == ["hi"]
     assert [m.content for m in history(engine, graph_name, "s").messages] == ["hi"]
+
+
+def test_a_cypher_statement_reads_the_messages_next_to_the_graph(
+    engine: AgensEngine, graph_name: str
+) -> None:
+    graph = AgensGraph(engine, graph_name=graph_name, create_graph=True)
+    ada = Node(id="ada", type="Person", properties={"name": "Ada"})
+    graph.add_graph_documents([GraphDocument(nodes=[ada], relationships=[])])
+    chat = history(engine, graph_name, "s")
+    blocks = [{"type": "reasoning", "summary": []}, {"type": "text", "text": "Ada wrote it."}]
+    chat.add_messages(
+        [
+            HumanMessage("Who is Ada?", id="m1"),
+            AIMessage(blocks, id="m2"),  # type: ignore[arg-type]
+            AIMessage("Nobody here.", id="m3"),
+        ]
+    )
+    history(engine, graph_name, "other").add_messages([HumanMessage("Ada again", id="m4")])
+    rows = graph.query(
+        f'MATCH (p:"Person") WITH p, {chat.cypher_subquery()} AS messages '
+        "UNWIND messages AS m WITH p, m WHERE m.text CONTAINS p.name "
+        "RETURN p.name AS who, m.id AS id, m.type AS type, m.seq AS seq, m.text AS text",
+        (chat.session_id,),
+    )
+    assert rows == [
+        {"who": "Ada", "id": "m1", "type": "human", "seq": 0, "text": "Who is Ada?"},
+        {"who": "Ada", "id": "m2", "type": "ai", "seq": 1, "text": "Ada wrote it."},
+    ]
 
 
 def test_concurrent_writers_lose_nothing_and_keep_their_own_order(

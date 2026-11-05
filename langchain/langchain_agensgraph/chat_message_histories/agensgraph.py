@@ -13,6 +13,9 @@ therefore changes nothing the second time. A message without an id is given one;
 message is not changed.
 
 Tables are made on first use, under the graph's schema lock; the graph itself need not exist.
+
+A Cypher statement reads a session's messages next to the graph through
+:meth:`AgensChatMessageHistory.cypher_subquery`.
 """
 
 from __future__ import annotations
@@ -27,6 +30,7 @@ from langchain_core.messages import BaseMessage, message_to_dict, messages_from_
 
 from .._core.component import Component
 from .._core.engine import AgensEngine, bind
+from .._core.messages import message_fields
 from .._core.names import companion_schema, qualified
 from .._core.program import Pipeline, Program, Statement
 from .._core.setup import Migrations, Setup
@@ -147,6 +151,27 @@ class AgensChatMessageHistory(Component, BaseChatMessageHistory):
         else:
             found = yield Statement(self._tables.read_last, (self.session_id, self.window))
         return messages_from_dict([row[0] for row in found.records])
+
+    def cypher_subquery(self, session: str = "%s") -> str:
+        """A SQL subquery a Cypher statement can hold, giving a session's messages as a list.
+
+        Each element is a map of ``seq``, ``id``, ``type`` (``human``, ``ai``, …), ``text`` (always
+        a string), ``content`` (a string or a list of blocks) and ``message``, the whole
+        ``message_to_dict`` form, in the order they were added. ``session`` is the SQL for the
+        session id: a placeholder, by default, or an expression. For example::
+
+            graph.query(
+                f"UNWIND [1] AS a WITH {history.cypher_subquery()} AS messages "
+                'UNWIND messages AS m MATCH (p:"Person") WHERE m.text CONTAINS p.name '
+                "RETURN p.name AS who, m.seq AS seq",
+                (history.session_id,),
+            )
+        """
+        return (
+            "(SELECT coalesce(jsonb_agg(jsonb_build_object('seq', m.seq, 'id', m.message_id, "
+            f"{message_fields('m.message')}) ORDER BY m.seq), '[]') "
+            f"FROM {self._tables.messages} m WHERE m.session_id = {session})"
+        )
 
     # -- writing -------------------------------------------------------------------------------
 

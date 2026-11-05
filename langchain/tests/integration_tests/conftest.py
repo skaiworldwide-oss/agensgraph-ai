@@ -7,7 +7,6 @@ Appendix D).
 
 collect_ignore = [
     "test_async.py",
-    "test_chat_history.py",
     "test_checkpoint.py",
     "test_composition.py",
     "test_cypher_qa.py",
@@ -19,6 +18,5 @@ collect_ignore = [
     "test_lifecycle.py",
     "test_retrievers.py",
     "test_shared_state.py",
-    "test_store.py",
     "test_text2cypher_dataset.py",
 ]

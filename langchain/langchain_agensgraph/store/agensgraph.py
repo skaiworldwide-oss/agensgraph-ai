@@ -1,1100 +1,949 @@
-"""LangGraph ``BaseStore`` backed by AgensGraph.
+"""A LangGraph ``BaseStore`` in the companion schema of an AgensGraph graph.
 
-Stores long-term, cross-thread memory as graph vertices, so a memory is an ordinary
-vertex that can be linked to other memories and to domain data with ordinary edges::
+Items live in ``"<graph>_store".store`` -- one row per (namespace, key), the namespace as its
+labels joined by ``.``, the value as ``jsonb`` -- and, with an index configured, their embeddings
+in ``"<graph>_store".store_vectors``, one row per indexed field, deleted with the item. The layout
+and its semantics follow PostgresStore from ``langgraph-checkpoint-postgres`` (MIT): a filter means
+what it means to ``InMemoryStore``, a semantic search scores an item by its nearest field and fills
+any shortfall with items that have no embedding, and an item's time to live can be refreshed when
+it is read.
 
-    (:StoreItem {prefix, key, value, created_at, updated_at})
+A batch is one round trip: its reads, then its writes, in one pipeline and so one implicit
+transaction, after one embedding call for every text the batch needs embedded. Reads therefore see
+the store as it was before the batch, and the last write to a key in a batch is the one kept.
 
-``BaseStore`` declares only ``batch``/``abatch`` as abstract and derives ``get``,
-``put``, ``search``, ``delete`` and ``list_namespaces`` from them, so those two entry
-points carry the whole implementation. Each batch issues one statement per kind of
-operation it contains, whatever the number of items.
-
-A namespace tuple is stored as a ``.``-joined path, which LangGraph's own rejection of
-``.`` inside a namespace label makes lossless and reversible by ``split``. A composite
-property index over ``(prefix, key)`` serves point lookups. Each item also stores the
-namespaces containing it, so "everything under this namespace" is a containment test
-over that list rather than a range over the path -- a range compares two strings, and
-jsonb compares with the database's collation, which on a linguistically collated
-database put a descendant outside its own parent's range.
-
-Embeddings are held outside the property bag, in a narrow table in a companion schema
-keyed by graphid and indexed with HNSW. A foreign key ties each row to its vertex and
-cascades, so deleting a memory drops its embedding.
+Tables are made on first use, under the graph's schema lock, from an append-only list of
+migrations whose progress is kept in the schema. The graph itself need not exist.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
-from datetime import datetime, timezone
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+import logging
+import re
+import threading
+from collections.abc import AsyncIterator, Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import asynccontextmanager, contextmanager
+from dataclasses import dataclass, field
+from typing import Any, Literal, cast
 
-from agensgraph import Vector
-from agensgraph.introspect import DesiredIndex
-from agensgraph.vector import search_option_statements
+import numpy as np
+from agensgraph import Distance as VectorDistance
+from agensgraph import Jsonb, Vector
+from langchain_core.embeddings import Embeddings
 from langgraph.store.base import (
     BaseStore,
     GetOp,
-    InvalidNamespaceError,
+    IndexConfig,
     Item,
     ListNamespacesOp,
-    MatchCondition,
     Op,
     PutOp,
     Result,
     SearchItem,
     SearchOp,
+    TTLConfig,
+    ensure_embeddings,
+    get_text_at_path,
+    tokenize_path,
+    validate_op_namespace,
 )
-from langgraph.store.base.embed import get_text_at_path
-from psycopg import sql
-from psycopg.types.json import Jsonb
+from langgraph.store.base.batch import AsyncBatchedBaseStore
 
-from langchain_agensgraph.graphs.agensgraph import AgensGraph, checked_names
+from .._core.component import Component
+from .._core.engine import AgensEngine, bind
+from .._core.names import companion_schema, literal, qualified
+from .._core.program import Pipeline, Program, Statement
+from .._core.settings import EF_SEARCH_MAX
+from .._core.setup import Migrations, Setup
 
-# "." separates namespace labels; "/" is its byte-successor.
-NS_SEP = "."
-NS_SEP_NEXT = "/"
+logger = logging.getLogger(__name__)
 
-DEFAULT_LABEL = "StoreItem"
-DEFAULT_VECTOR_TABLE = "item_vec"
+Distance = Literal["cosine", "l2", "inner_product"]
 
-_EVERY_NAMESPACE = 1_000_000
-"""How many distinct namespaces one read will take when it has to take them all.
-
-Only when something after the statement collapses rows -- a wildcard matched by position,
-a depth limit that shortens a namespace -- can the page not be taken by the server. The
-rows are distinct namespaces rather than items, so this counts the namespaces a store
-holds and not the memories in them.
-"""
+_MEASURES: dict[str, tuple[VectorDistance, str]] = {
+    # distance: pgvector's measure, and the score from the distance d
+    "cosine": (VectorDistance.COSINE, "1 - d"),
+    "l2": (VectorDistance.L2, "-d"),
+    "inner_product": (VectorDistance.INNER_PRODUCT, "-d"),
+}
 
 
-def _utcnow() -> str:
-    return datetime.now(timezone.utc).isoformat()
+class AgensIndexConfig(IndexConfig, total=False):
+    """``IndexConfig`` with the index and the measure used for it.
 
-
-def flatten_namespace(namespace: Tuple[str, ...]) -> str:
-    """Join a namespace tuple into its indexed path form.
-
-    A namespace that could not be encoded unambiguously is rejected.
+    ``ann_index_config``: ``{"kind": "hnsw", "m": 16, "ef_construction": 64}``,
+    ``{"kind": "ivfflat", "lists": 100}`` or ``{"kind": "flat"}`` for none, with
+    ``"vector_type": "vector" | "halfvec"``. ``distance_type``: ``"cosine"`` (the default),
+    ``"l2"`` or ``"inner_product"``.
     """
-    if not namespace:
-        raise InvalidNamespaceError("Namespace cannot be empty.")
-    for label in namespace:
-        if not label:
-            raise InvalidNamespaceError(
-                f"Namespace labels cannot be empty strings. Got {namespace}"
+
+    ann_index_config: dict[str, Any]
+    distance_type: Distance
+
+
+@dataclass(frozen=True)
+class _Index:
+    """An index configuration, checked and resolved."""
+
+    dims: int
+    embeddings: Embeddings
+    fields: list[tuple[str, Literal["$"] | list[str]]]
+    vectors_per_item: int
+    vector_type: str
+    distance: str
+    kind: str
+    parameters: dict[str, int] = field(default_factory=dict)
+
+    @classmethod
+    def of(cls, config: Mapping[str, Any]) -> _Index:
+        dims = int(config["dims"])
+        if dims < 1:
+            raise ValueError(f"dims must be positive, not {dims}")
+        embeddings = ensure_embeddings(config.get("embed"))
+        if embeddings is None:
+            raise ValueError("an index needs embed=: an Embeddings, a function or provider:model")
+        raw_fields = config.get("fields") or ["$"]
+        if isinstance(raw_fields, str):
+            raw_fields = [raw_fields]
+        fields: list[tuple[str, Literal["$"] | list[str]]] = []
+        count = 0
+        for path in raw_fields:
+            if path == "$":
+                fields.append(("$", "$"))
+                count += 1
+            else:
+                tokens = tokenize_path(path)
+                fields.append((path, tokens))
+                count += len(tokens)
+        ann = dict(config.get("ann_index_config") or {})
+        kind = str(ann.pop("kind", "hnsw"))
+        if kind not in ("hnsw", "ivfflat", "flat"):
+            raise ValueError(f"an index kind is hnsw, ivfflat or flat, not {kind!r}")
+        vector_type = str(ann.pop("vector_type", "vector"))
+        if vector_type not in ("vector", "halfvec"):
+            raise ValueError(f"a vector type is vector or halfvec, not {vector_type!r}")
+        distance = str(config.get("distance_type", "cosine"))
+        if distance not in _MEASURES:
+            raise ValueError(f"a distance is cosine, l2 or inner_product, not {distance!r}")
+        allowed = {"hnsw": {"m", "ef_construction"}, "ivfflat": {"lists"}, "flat": set()}[kind]
+        parameters = {}
+        for name, value in ann.items():
+            name = "lists" if name == "nlist" else name
+            if name in allowed and int(value) > 0:
+                parameters[name] = int(value)
+        return cls(dims, embeddings, fields, count, vector_type, distance, kind, parameters)
+
+    @property
+    def operator(self) -> str:
+        return _MEASURES[self.distance][0].value
+
+    @property
+    def operator_class(self) -> str:
+        return _MEASURES[self.distance][0].operator_class_for(self.vector_type)
+
+    @property
+    def score(self) -> str:
+        return _MEASURES[self.distance][1]
+
+    @property
+    def typed(self) -> str:
+        """The embedding column's type, such as ``vector(1536)``."""
+        return f"{self.vector_type}({self.dims})"
+
+
+class _Tables:
+    """The store's tables in a graph's companion schema, and the statements that use them."""
+
+    def __init__(self, graph: str, index: _Index | None) -> None:
+        schema = companion_schema(graph)
+        self.schema = schema
+        self.store = qualified(schema, "store")
+        self.vectors = qualified(schema, "store_vectors")
+        self.index = index
+        self.migrations = [
+            f"CREATE TABLE IF NOT EXISTS {self.store} (prefix text NOT NULL, key text NOT NULL, "
+            "value jsonb NOT NULL, created_at timestamptz NOT NULL DEFAULT now(), "
+            "updated_at timestamptz NOT NULL DEFAULT now(), expires_at timestamptz, "
+            "ttl_minutes double precision, PRIMARY KEY (prefix, key))",
+            f"CREATE INDEX IF NOT EXISTS store_prefix_idx ON {self.store} "
+            "USING btree (prefix text_pattern_ops)",
+            f"CREATE INDEX IF NOT EXISTS store_expires_at_idx ON {self.store} (expires_at) "
+            "WHERE expires_at IS NOT NULL",
+        ]
+        self.vector_migrations: list[str] = []
+        if index is not None:
+            self.vector_migrations.append(
+                f"CREATE TABLE IF NOT EXISTS {self.vectors} (prefix text NOT NULL, "
+                f"key text NOT NULL, field_name text NOT NULL, embedding {index.typed} NOT NULL, "
+                "created_at timestamptz NOT NULL DEFAULT now(), "
+                "updated_at timestamptz NOT NULL DEFAULT now(), "
+                "PRIMARY KEY (prefix, key, field_name), "
+                f"FOREIGN KEY (prefix, key) REFERENCES {self.store} (prefix, key) "
+                "ON DELETE CASCADE)"
             )
-        if NS_SEP in label:
-            raise InvalidNamespaceError(
-                f"Invalid namespace label {label!r} in {namespace}. "
-                f"Namespace labels cannot contain periods ('{NS_SEP}')."
-            )
-    if namespace[0] == "langgraph":
-        raise InvalidNamespaceError(
-            f'Root label for namespace cannot be "langgraph". Got: {namespace}'
+            if index.kind != "flat":
+                options = ", ".join(f"{k} = {v}" for k, v in index.parameters.items())
+                self.vector_migrations.append(
+                    f"CREATE INDEX IF NOT EXISTS store_vectors_embedding_idx ON {self.vectors} "
+                    f"USING {index.kind} (embedding {index.operator_class})"
+                    + (f" WITH ({options})" if options else "")
+                )
+
+    @property
+    def steps(self) -> dict[int, str]:
+        """Every migration by its number, the vector table's from 1000 on, so either list can grow
+        without renumbering the other."""
+        steps = dict(enumerate(self.migrations))
+        steps.update((1000 + number, step) for number, step in enumerate(self.vector_migrations))
+        return steps
+
+    # -- reads -----------------------------------------------------------------------------
+
+    def get(self, ttl: TTLConfig | None) -> str:
+        """Every key asked for, with its TTL refreshed where asked, in one statement."""
+        alive = _alive("s", ttl)
+        return (
+            "WITH asked AS (SELECT * FROM unnest(%s::text[], %s::text[], %s::bool[]) "
+            "AS a(prefix, key, refresh)), "
+            f"refreshed AS (UPDATE {self.store} s "
+            "SET expires_at = now() + make_interval(secs => s.ttl_minutes * 60) FROM asked a "
+            "WHERE s.prefix = a.prefix AND s.key = a.key AND a.refresh "
+            f"AND s.ttl_minutes IS NOT NULL{alive} RETURNING s.prefix) "
+            "SELECT s.prefix, s.key, s.value, s.created_at, s.updated_at "
+            f"FROM {self.store} s JOIN asked a ON s.prefix = a.prefix AND s.key = a.key"
+            f"{' WHERE ' + alive[5:] if alive else ''}"
         )
-    return NS_SEP.join(namespace)
+
+    def listing(self, where: str, ttl: TTLConfig | None, refresh: bool) -> str:
+        """A search without a query: newest first."""
+        alive = _alive("s", ttl)
+        found = (
+            "SELECT s.prefix, s.key, s.value, s.created_at, s.updated_at, NULL::float8 AS score "
+            f"FROM {self.store} s WHERE {where}{alive} "
+            "ORDER BY s.updated_at DESC, s.prefix, s.key LIMIT %s OFFSET %s"
+        )
+        return self._refreshing(found) if refresh else found
+
+    def semantic(self, where: str, ttl: TTLConfig | None, refresh: bool) -> str:
+        """A search with a query: each item scored by its nearest field, best first; then, when
+        fewer than the limit are scored, items without an embedding, newest first, fill the
+        shortfall. The fill's scan runs only when there is one: its limit is then zero, and the
+        server reads nothing for it.
+
+        Parameters: the query vector, the filter's, how many field rows to read, the limit, the
+        offset, the filter's again, the limit again.
+        """
+        assert self.index is not None
+        alive = _alive("s", ttl)
+        found = (
+            "SELECT s.prefix, s.key, s.value, s.created_at, s.updated_at, "
+            f"{self.index.score.replace('d', 'best.d')} AS score FROM ("
+            "SELECT DISTINCT ON (near.prefix, near.key) near.prefix, near.key, near.d FROM ("
+            f"SELECT sv.prefix, sv.key, sv.embedding {self.index.operator} "
+            f"%s::{self.index.typed} AS d "
+            f"FROM {self.vectors} sv JOIN {self.store} s "
+            "ON s.prefix = sv.prefix AND s.key = sv.key "
+            f"WHERE {where}{alive} ORDER BY d LIMIT %s) near "
+            "ORDER BY near.prefix, near.key, near.d) best "
+            f"JOIN {self.store} s ON s.prefix = best.prefix AND s.key = best.key "
+            "ORDER BY best.d, s.prefix, s.key LIMIT %s OFFSET %s"
+        )
+        filled = (
+            "SELECT s.prefix, s.key, s.value, s.created_at, s.updated_at, NULL::float8 AS score "
+            f"FROM {self.store} s WHERE {where}{alive} AND NOT EXISTS ("
+            f"SELECT 1 FROM {self.vectors} sv WHERE sv.prefix = s.prefix AND sv.key = s.key) "
+            "ORDER BY s.updated_at DESC, s.prefix, s.key "
+            "LIMIT greatest(%s - (SELECT count(*) FROM found), 0)"
+        )
+        refreshed = f"{self._refreshed}, " if refresh else ""
+        return (
+            f"WITH found AS ({found}), {refreshed}filled AS ({filled}) "
+            "SELECT * FROM found UNION ALL SELECT * FROM filled"
+        )
+
+    def _refreshing(self, found: str) -> str:
+        return f"WITH found AS ({found}), {self._refreshed} SELECT * FROM found"
+
+    @property
+    def _refreshed(self) -> str:
+        """A ``WITH`` clause's statement putting off the expiry of every item in ``found``."""
+        return (
+            f"refreshed AS (UPDATE {self.store} s "
+            "SET expires_at = now() + make_interval(secs => s.ttl_minutes * 60) FROM found f "
+            "WHERE s.prefix = f.prefix AND s.key = f.key AND s.ttl_minutes IS NOT NULL "
+            "RETURNING s.prefix)"
+        )
+
+    def namespaces(self, conditions: Sequence[str], ttl: TTLConfig | None) -> str:
+        """Distinct namespaces, cut to ``max_depth`` labels, in byte order."""
+        where = list(conditions)
+        if ttl and ttl.get("omit_expired"):
+            where.append("(expires_at IS NULL OR expires_at > now())")
+        clause = (" WHERE " + " AND ".join(where)) if where else ""
+        return (
+            'SELECT DISTINCT ON (cut COLLATE "C") cut FROM ('
+            "SELECT CASE WHEN %s::integer IS NULL THEN prefix ELSE "
+            "array_to_string((string_to_array(prefix, '.'))[1:%s::integer], '.') END AS cut "
+            f"FROM {self.store}{clause}) n "
+            'ORDER BY cut COLLATE "C" LIMIT %s OFFSET %s'
+        )
+
+    # -- writes ----------------------------------------------------------------------------
+
+    @property
+    def delete(self) -> str:
+        return (
+            f"DELETE FROM {self.store} s USING unnest(%s::text[], %s::text[]) AS d(prefix, key) "
+            "WHERE s.prefix = d.prefix AND s.key = d.key"
+        )
+
+    @property
+    def upsert(self) -> str:
+        return (
+            f"INSERT INTO {self.store} AS s "
+            "(prefix, key, value, created_at, updated_at, expires_at, ttl_minutes) "
+            "SELECT u.prefix, u.key, u.value, now(), now(), "
+            "now() + make_interval(secs => u.ttl * 60), u.ttl "
+            "FROM unnest(%s::text[], %s::text[], %s::jsonb[], %s::float8[]) "
+            "AS u(prefix, key, value, ttl) "
+            "ON CONFLICT (prefix, key) DO UPDATE SET value = EXCLUDED.value, "
+            "updated_at = now(), expires_at = EXCLUDED.expires_at, "
+            "ttl_minutes = EXCLUDED.ttl_minutes"
+        )
+
+    @property
+    def unindex(self) -> str:
+        return (
+            f"DELETE FROM {self.vectors} sv USING unnest(%s::text[], %s::text[]) AS d(prefix, key) "
+            "WHERE sv.prefix = d.prefix AND sv.key = d.key"
+        )
+
+    @property
+    def index_rows(self) -> str:
+        assert self.index is not None
+        return (
+            f"INSERT INTO {self.vectors} (prefix, key, field_name, embedding) "
+            f"SELECT u.prefix, u.key, u.field, u.embedding::{self.index.typed} "
+            "FROM unnest(%s::text[], %s::text[], %s::text[], %s::vector[]) "
+            "AS u(prefix, key, field, embedding) "
+            "ON CONFLICT (prefix, key, field_name) DO UPDATE "
+            "SET embedding = EXCLUDED.embedding, updated_at = now()"
+        )
+
+    @property
+    def sweep(self) -> str:
+        return (
+            f"WITH gone AS (SELECT prefix, key FROM {self.store} "
+            "WHERE expires_at IS NOT NULL AND expires_at < now() LIMIT %s FOR UPDATE SKIP LOCKED) "
+            f"DELETE FROM {self.store} s USING gone "
+            "WHERE s.prefix = gone.prefix AND s.key = gone.key RETURNING 1"
+        )
 
 
-def unflatten_namespace(prefix: str) -> Tuple[str, ...]:
-    """Recover the namespace tuple from its path form."""
-    return tuple(prefix.split(NS_SEP))
+def _alive(alias: str, ttl: TTLConfig | None) -> str:
+    """`` AND <alias> has not expired`` when expired items are to be left out of reads."""
+    if ttl and ttl.get("omit_expired"):
+        return f" AND ({alias}.expires_at IS NULL OR {alias}.expires_at > now())"
+    return ""
 
 
-def _descendant_bounds(prefix: str) -> Tuple[str, str]:
-    """Half-open range covering every strict descendant of ``prefix``.
+# -- namespaces and filters ------------------------------------------------------------------
 
-    For narrowing in Python, where a ``str`` compares by code point and ``.`` (0x2E) is
-    therefore followed by ``/`` (0x2F). The database compares a namespace as jsonb under
-    its default collation, which orders punctuation differently and takes no ``COLLATE``,
-    so a query narrows with :func:`ancestors_of` instead.
+
+def _text(namespace: Sequence[str]) -> str:
+    return ".".join(namespace)
+
+
+def _namespace(text: str) -> tuple[str, ...]:
+    return tuple(text.split(".")) if text else ()
+
+
+def _escape_like(text: str) -> str:
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _within(prefix: Sequence[str], params: list[Any]) -> str:
+    """The namespace itself or any namespace below it."""
+    if not prefix:
+        return "TRUE"
+    path = _text(prefix)
+    params += [path, _escape_like(path) + ".%"]
+    return "(s.prefix = %s OR s.prefix LIKE %s ESCAPE '\\')"
+
+
+def _match(path: Sequence[str], kind: str) -> str:
+    """A pattern matching namespaces on whole labels, ``*`` standing for any one label."""
+    body = r"\.".join("[^.]+" if part == "*" else re.escape(part) for part in path)
+    return rf"(^|\.){body}\Z" if kind == "suffix" else rf"^{body}(\.|\Z)"
+
+
+def _filter(where: Mapping[str, Any] | None, params: list[Any]) -> str:
+    """A search filter with the meaning ``InMemoryStore`` gives it, over each item's value.
+
+    A key's value is compared to the item's value at that key: a mapping of operators applies
+    each (``$eq``, ``$ne``, and ``$gt``, ``$gte``, ``$lt``, ``$lte`` as numbers, a string that
+    reads as a number counting as one, and a missing key matching none of them); any other
+    mapping matches an object holding at least those keys, compared the same way; a list matches
+    a list of the same length, element by element; anything else must be equal, ``None`` matching
+    a missing key.
     """
-    return prefix + NS_SEP, prefix + NS_SEP_NEXT
+    if not where:
+        return "TRUE"
+    return " AND ".join(
+        _compared("s.value->" + _key(key), value, params) for key, value in where.items()
+    )
 
 
-def ancestors_of(prefix: str) -> List[str]:
-    """Every namespace that contains this one, itself included.
+def _key(key: object) -> str:
+    if not isinstance(key, str) or "\x00" in key:
+        raise ValueError(f"a filter key must be a string, not {key!r}")
+    return literal(key)
 
-    ``"users.alice.memories"`` yields ``["users", "users.alice",
-    "users.alice.memories"]``.
 
-    Stored beside the prefix so that "is a descendant of p" becomes "holds p among its
-    ancestors" -- an equality inside a list rather than a comparison between two
-    strings, which no collation reorders. A GIN property index over the list serves it.
+def _compared(expr: str, wanted: Any, params: list[Any]) -> str:
+    if isinstance(wanted, Mapping):
+        if any(isinstance(k, str) and k.startswith("$") for k in wanted):
+            return (
+                "(" + " AND ".join(_operator(expr, op, v, params) for op, v in wanted.items()) + ")"
+            )
+        parts = [f"jsonb_typeof({expr}) = 'object'"]
+        parts += [_compared(f"({expr})->{_key(k)}", v, params) for k, v in wanted.items()]
+        return "(" + " AND ".join(parts) + ")"
+    if isinstance(wanted, list | tuple):
+        # A CASE, since SQL may evaluate either side of an AND first and the length of a
+        # scalar is an error.
+        parts = [
+            f"(CASE WHEN jsonb_typeof({expr}) = 'array' "
+            f"THEN jsonb_array_length({expr}) = {len(wanted)} ELSE false END)"
+        ]
+        parts += [_compared(f"({expr})->{i}", v, params) for i, v in enumerate(wanted)]
+        return "(" + " AND ".join(parts) + ")"
+    if wanted is None:
+        return f"({expr} IS NULL OR {expr} = 'null'::jsonb)"
+    params.append(Jsonb(wanted))
+    return f"coalesce({expr} = %s::jsonb, false)"
+
+
+def _operator(expr: str, op: str, value: Any, params: list[Any]) -> str:
+    if op == "$eq":
+        if value is None:
+            return f"({expr} IS NULL OR {expr} = 'null'::jsonb)"
+        params.append(Jsonb(value))
+        return f"coalesce({expr} = %s::jsonb, false)"
+    if op == "$ne":
+        if value is None:
+            return f"({expr} IS NOT NULL AND {expr} <> 'null'::jsonb)"
+        params.append(Jsonb(value))
+        return f"coalesce({expr} <> %s::jsonb, true)"
+    comparisons = {"$gt": ">", "$gte": ">=", "$lt": "<", "$lte": "<="}
+    if op in comparisons:
+        if isinstance(value, bool) or not isinstance(value, int | float):
+            raise ValueError(f"{op} compares numbers, not {value!r}")
+        # A number, or a string that reads as one, as Python's float() reads it; anything else,
+        # a missing key included, does not compare.
+        params += [_NUMERIC_TEXT, float(value)]
+        return (
+            f"coalesce(CASE WHEN jsonb_typeof({expr}) = 'number' THEN ({expr})::numeric "
+            f"WHEN jsonb_typeof({expr}) = 'string' AND ({expr} #>> '{{}}') ~ %s "
+            f"THEN ({expr} #>> '{{}}')::numeric END {comparisons[op]} %s::numeric, false)"
+        )
+    raise ValueError(f"unsupported filter operator {op!r}")
+
+
+_NUMERIC_TEXT = r"^\s*[-+]?([0-9]+(\.[0-9]*)?|\.[0-9]+)([eE][-+]?[0-9]+)?\s*$"
+
+
+# -- the shared core -------------------------------------------------------------------------
+
+
+@dataclass
+class _Plan:
+    """The statements of one batch, and how each result becomes the batch's results."""
+
+    statements: list[Statement] = field(default_factory=list)
+    readers: list[Callable[[list[Any], list[Result]], None]] = field(default_factory=list)
+
+    def read(self, statement: Statement, reader: Callable[[list[Any], list[Result]], None]) -> None:
+        self.statements.append(statement)
+        self.readers.append(reader)
+
+    def write(self, statement: Statement) -> None:
+        self.read(statement, lambda rows, results: None)
+
+
+class _StoreCore(Component):
+    """What both stores share: binding, setup, closing, and the program of a batch."""
+
+    supports_ttl: bool = True
+    _what = "store"
+
+    def _init_core(
+        self,
+        engine: AgensEngine | str | None,
+        graph: Any,
+        graph_name: str | None,
+        index: AgensIndexConfig | IndexConfig | None,
+        ttl: TTLConfig | None,
+        setup: bool,
+    ) -> None:
+        self._engine, self._owns_engine, self.graph_name = bind(engine, graph, graph_name)
+        self.index_config = index
+        self._index = _Index.of(index) if index else None
+        self.embeddings: Embeddings | None = self._index.embeddings if self._index else None
+        self.ttl_config = ttl
+        self._tables = _Tables(self.graph_name, self._index)
+        self._setup_wanted = setup
+        migrations = Migrations(self._tables.schema, "store_migrations", self._tables.steps)
+        self._setup = Setup(
+            self._engine,
+            self.graph_name,
+            migrations.check,
+            migrations.create,
+            key=migrations.key,
+        )
+
+    async def asetup(self) -> None:
+        """Make the store's tables now rather than on its first call."""
+        self._open()
+        await self._setup.aensure()
+
+    async def abatch(self, ops: Iterable[Op]) -> list[Result]:
+        listed = _grouped(ops)
+        self._open()
+        if self._setup_wanted:
+            await self._setup.aensure()
+        texts, fields = self._texts(listed)
+        vectors = await self.embeddings.aembed_documents(texts) if texts and self.embeddings else []
+        return await self._engine.arun(lambda: self._batch(listed, vectors, fields))
+
+    async def asweep_ttl(self, *, batch_size: int = 1000) -> int:
+        """Delete expired items, a batch at a time; how many were deleted."""
+        self._open()
+        await self._setup.aensure()
+        return await self._engine.arun(lambda: self._sweep_all(batch_size))
+
+    # -- the batch -------------------------------------------------------------------------
+
+    def _texts(self, ops: Sequence[Op]) -> tuple[list[str], list[tuple[str, str, str, int]]]:
+        """Search queries to embed, and the fields of each indexed put: (prefix, key, field,
+        position in the list of texts)."""
+        texts: list[str] = []
+        fields: list[tuple[str, str, str, int]] = []
+        if self._index is None:
+            return texts, fields
+        for op in ops:
+            if isinstance(op, SearchOp) and op.query:
+                texts.append(op.query)
+        for op in _last_puts(ops).values():
+            if op.value is None or op.index is False:
+                continue
+            paths = (
+                self._index.fields
+                if op.index is None
+                else [(path, tokenize_path(path)) for path in op.index]
+            )
+            for path, tokens in paths:
+                found = get_text_at_path(op.value, tokens)
+                for i, text in enumerate(found):
+                    name = f"{path}.{i}" if len(found) > 1 else path
+                    fields.append((_text(op.namespace), op.key, name, len(texts)))
+                    texts.append(text)
+        return texts, fields
+
+    def _batch(
+        self,
+        ops: Sequence[Op],
+        vectors: list[list[float]],
+        fields: list[tuple[str, str, str, int]],
+    ) -> Program[list[Result]]:
+        results: list[Result] = [None] * len(ops)
+        plan = _Plan()
+        tables = self._tables
+        ttl = self.ttl_config
+        query_vectors = iter(vectors)
+
+        gets = [(i, op) for i, op in enumerate(ops) if isinstance(op, GetOp)]
+        if gets:
+            refresh = bool(ttl and ttl.get("refresh_on_read"))
+
+            def read_gets(rows: list[Any], out: list[Result]) -> None:
+                found = {(r[0], r[1]): r for r in rows}
+                for i, op in gets:
+                    row = found.get((_text(op.namespace), op.key))
+                    out[i] = None if row is None else _item(row)
+
+            plan.read(
+                Statement(
+                    tables.get(ttl),
+                    (
+                        [_text(op.namespace) for _, op in gets],
+                        [op.key for _, op in gets],
+                        [bool(op.refresh_ttl) and refresh for _, op in gets],
+                    ),
+                ),
+                read_gets,
+            )
+
+        for i, op in enumerate(ops):
+            if isinstance(op, SearchOp):
+                self._search(plan, i, op, query_vectors)
+            elif isinstance(op, ListNamespacesOp):
+                self._list(plan, i, op)
+
+        puts = _last_puts(ops)
+        if puts:
+            self._put(plan, list(puts.values()), vectors, fields)
+
+        if not plan.statements:
+            return results
+        rows = yield Pipeline(tuple(plan.statements))
+        for reader, result in zip(plan.readers, rows, strict=True):
+            reader(list(result.records), results)
+        return results
+
+    def _search(
+        self, plan: _Plan, i: int, op: SearchOp, query_vectors: Iterator[list[float]]
+    ) -> None:
+        tables, ttl = self._tables, self.ttl_config
+        refresh = bool(ttl and ttl.get("refresh_on_read")) and op.refresh_ttl
+        params: list[Any] = []
+        where = _within(op.namespace_prefix, params)
+        where = f"{where} AND {_filter(op.filter, params)}"
+
+        def read_found(rows: list[Any], out: list[Result]) -> None:
+            out[i] = [_search_item(row) for row in rows]
+
+        if op.query and self._index is not None:
+            vector = Vector(np.asarray(next(query_vectors), dtype=np.float32))
+            fetch = (op.offset + op.limit) * self._index.vectors_per_item * 2 + 1
+
+            plan.read(
+                Statement(
+                    tables.semantic(where, ttl, refresh),
+                    (vector, *params, fetch, op.limit, op.offset, *params, op.limit),
+                    settings=self._search_settings(fetch),
+                ),
+                read_found,
+            )
+        else:
+            plan.read(
+                Statement(tables.listing(where, ttl, refresh), (*params, op.limit, op.offset)),
+                read_found,
+            )
+
+    def _search_settings(self, fetch: int) -> dict[str, object] | None:
+        if self._index is None or self._index.kind != "hnsw":
+            return None
+        return {
+            "hnsw.ef_search": max(40, min(fetch, EF_SEARCH_MAX)),
+            "hnsw.iterative_scan": "strict_order",
+        }
+
+    def _list(self, plan: _Plan, i: int, op: ListNamespacesOp) -> None:
+        conditions = []
+        params: list[Any] = [op.max_depth, op.max_depth]
+        for condition in op.match_conditions or ():
+            if condition.path:
+                conditions.append("prefix ~ %s")
+                params.append(_match(condition.path, condition.match_type))
+        params += [op.limit, op.offset]
+
+        def read(rows: list[Any], out: list[Result]) -> None:
+            out[i] = [_namespace(row[0]) for row in rows]
+
+        plan.read(Statement(self._tables.namespaces(conditions, self.ttl_config), params), read)
+
+    def _put(
+        self,
+        plan: _Plan,
+        puts: list[PutOp],
+        vectors: list[list[float]],
+        fields: list[tuple[str, str, str, int]],
+    ) -> None:
+        tables = self._tables
+        deleted = [op for op in puts if op.value is None]
+        stored = [op for op in puts if op.value is not None]
+        if deleted:
+            plan.write(
+                Statement(
+                    tables.delete,
+                    ([_text(op.namespace) for op in deleted], [op.key for op in deleted]),
+                )
+            )
+        if not stored:
+            return
+        plan.write(
+            Statement(
+                tables.upsert,
+                (
+                    [_text(op.namespace) for op in stored],
+                    [op.key for op in stored],
+                    [Jsonb(dict(cast(Mapping[str, Any], op.value))) for op in stored],
+                    [None if op.ttl is None else float(op.ttl) for op in stored],
+                ),
+            )
+        )
+        if self._index is None:
+            return
+        plan.write(
+            Statement(
+                tables.unindex,
+                ([_text(op.namespace) for op in stored], [op.key for op in stored]),
+            )
+        )
+        if fields:
+            plan.write(
+                Statement(
+                    tables.index_rows,
+                    (
+                        [f[0] for f in fields],
+                        [f[1] for f in fields],
+                        [f[2] for f in fields],
+                        [Vector(np.asarray(vectors[f[3]], dtype=np.float32)) for f in fields],
+                    ),
+                )
+            )
+
+    def _sweep_all(self, batch_size: int) -> Program[int]:
+        """Expired items deleted ``batch_size`` at a time, each batch its own statement, until a
+        batch comes up short; how many were deleted."""
+        total = 0
+        while True:
+            swept = yield Statement(self._tables.sweep, (batch_size,))
+            total += len(swept.records)
+            if len(swept.records) < batch_size:
+                return total
+
+
+def _last_puts(ops: Iterable[Op]) -> dict[tuple[tuple[str, ...], str], PutOp]:
+    """The last put to each key: the one a batch keeps."""
+    puts: dict[tuple[tuple[str, ...], str], PutOp] = {}
+    for op in ops:
+        if isinstance(op, PutOp):
+            puts[(op.namespace, op.key)] = op
+    return puts
+
+
+def _item(row: Sequence[Any]) -> Item:
+    prefix, key, value, created, updated = row[:5]
+    return Item(
+        value=_value(value),
+        key=key,
+        namespace=_namespace(prefix),
+        created_at=created,
+        updated_at=updated,
+    )
+
+
+def _search_item(row: Sequence[Any]) -> SearchItem:
+    prefix, key, value, created, updated, score = row[:6]
+    return SearchItem(
+        namespace=_namespace(prefix),
+        key=key,
+        value=_value(value),
+        created_at=created,
+        updated_at=updated,
+        score=None if score is None else float(score),
+    )
+
+
+def _value(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else json.loads(value)
+
+
+def _grouped(ops: Iterable[Op]) -> list[Op]:
+    listed = list(ops)
+    for op in listed:
+        validate_op_namespace(op)
+    return listed
+
+
+# -- the stores ------------------------------------------------------------------------------
+
+
+class AgensStore(_StoreCore, BaseStore):
+    """A LangGraph store whose blocking and awaiting methods both talk to the server directly.
+
+    ``index`` makes ``search(query=...)`` semantic; ``ttl`` gives items a time to live, refreshed
+    on read with ``refresh_on_read`` and removed by :meth:`sweep_ttl` or the sweeper thread.
     """
-    parts = prefix.split(NS_SEP)
-    return [NS_SEP.join(parts[: i + 1]) for i in range(len(parts))]
-
-
-class AgensStore(BaseStore):
-    """Long-term memory for LangGraph agents, stored in an AgensGraph graph.
-
-    Args:
-        graph: An existing :class:`AgensGraph`. Supply this to share a connection pool
-            with other components.
-        conf: psycopg connection parameters, used when ``graph`` is not given.
-        graph_name: Graph to create/use when constructing from ``conf``. label: Vertex
-        label holding items. index: ``{"dims": int, "embed": Embeddings, "fields":
-        [...]}`` to enable
-            semantic search. Omit it and the store is a plain key/value store.
-        promoted: Property names to mirror into typed generated columns, so filters and
-            sorts on them compare in the column's own type. A promoted value is held in
-            both the column and the property map, and native comparison can order values
-            differently from jsonb comparison.
-        vector_schema: Schema holding the embedding table. Must not be a graph schema.
-    """
-
-    supports_ttl = False
 
     def __init__(
         self,
-        graph: Optional[AgensGraph] = None,
+        engine: AgensEngine | str | None = None,
         *,
-        conf: Optional[Dict[str, Any]] = None,
-        graph_name: str = "store",
-        label: str = DEFAULT_LABEL,
-        index: Optional[Dict[str, Any]] = None,
-        promoted: Optional[Sequence[str]] = None,
-        vector_schema: Optional[str] = None,
+        graph: Any = None,
+        graph_name: str | None = None,
+        index: AgensIndexConfig | IndexConfig | None = None,
+        ttl: TTLConfig | None = None,
+        setup: bool = True,
     ) -> None:
-        if graph is None:
-            if conf is None:
-                raise ValueError("AgensStore requires either `graph` or `conf`.")
-            # Nothing here reads the schema, and describing a graph counts every vertex
-            # and every edge in it, for a component that never looks at the answer.
-            graph = AgensGraph(graph_name, conf, create=True, refresh_schema=False)
-            self._owns_graph = True
-        else:
-            self._owns_graph = False
-        self._graph = graph
-        self._label = label
-        self._index = index
-        self._promoted = tuple(promoted or ())
-        self._vector_schema = vector_schema or f"{graph.graph_name}_store"
-        # Whether this server's pgvector can be told to keep looking when a filter rejects
-        # what the distance index returned. Established when the extension is checked for.
-        self._iterative_scan = False
-        self._setup()
-
-    # ---- schema setup ----
-
-    def _setup(self) -> None:
-        """Create the label, its indexes, and (when indexing) the embedding table."""
-        checked_names(
-            label=self._label,
-            vector_schema=self._vector_schema,
-            **{f"promoted[{i}]": name for i, name in enumerate(self._promoted)},
-        )
-        if self._promoted:
-            # Promoted columns are part of how the label is declared, so this one cannot go
-            # through the shared path, which creates a label and nothing else.
-            self._graph.query(self._create_label_cypher())
-        else:
-            self._graph.create_labels(vertices=(self._label,))
-        self._graph.ensure_indexes(
-            [
-                # An item is one namespace and one key, and a put merges on the pair, so
-                # the index over it is unique -- otherwise two writers both look, both
-                # find nothing, and both create. A read narrowing by namespace alone is
-                # served by its leading column, so there is nothing else to index.
-                DesiredIndex(
-                    label=self._label,
-                    properties=("prefix", "key"),
-                    unique=True,
-                    name=f"{self._label}_pk",
-                ),
-                # A descendant search asks whether a namespace is among an item's
-                # ancestors, and GIN is the access method for a containment test over a
-                # list.
-                DesiredIndex(
-                    label=self._label,
-                    properties=("ancestors",),
-                    method="gin",
-                    name=f"{self._label}_ancestors",
-                ),
-            ]
-        )
-        if self._index:
-            self._require_vector_extension()
-            # An embedding is sent as itself once the types are registered rather than as
-            # its decimal spelling, which for 1,536 dimensions is 6,152 bytes against
-            # 21,504 and leaves the server nothing to parse.
-            self._graph.register_vectors()
-            for stmt in self._create_vector_table_sql():
-                self._graph.query(stmt)
-
-    def _require_vector_extension(self) -> None:
-        """Semantic search needs pgvector, which AgensGraph does not bundle.
-
-        The driver reads the catalogs for this, so there is one answer to the question
-        rather than a second query of this package's own asking it a slightly different
-        way.
-        """
-        version = self._graph.connection.vector_version()
-        if version is not None:
-            # Whether a filtered search can be told to keep looking rather than to stop at
-            # a fixed number of candidates. Asked once here rather than per search.
-            self._iterative_scan = version >= (0, 8)
-            return
-        raise RuntimeError(
-            "AgensStore(index=...) needs the pgvector extension, which is not created "
-            "in this database. Run CREATE EXTENSION vector as a role that may -- and if "
-            "the extension is not on the server, build it against this server's "
-            "pg_config first -- or omit `index` to use the store without semantic "
-            "search."
-        )
-
-    def _create_label_cypher(self) -> sql.Composed:
-        if self._promoted:
-            cols = sql.SQL(", ").join(
-                sql.SQL("{c} text GENERATED").format(c=sql.Identifier(name))
-                for name in self._promoted
-            )
-            return sql.SQL("CREATE VLABEL IF NOT EXISTS {l} ({cols})").format(
-                l=sql.Identifier(self._label), cols=cols
-            )
-        return sql.SQL("CREATE VLABEL IF NOT EXISTS {l}").format(l=sql.Identifier(self._label))
-
-    def _create_property_index_cypher(self, name: str, props: Sequence[str]) -> sql.Composed:
-        return sql.SQL("CREATE PROPERTY INDEX IF NOT EXISTS {name} ON {l} ({cols})").format(
-            name=sql.Identifier(name),
-            l=sql.Identifier(self._label),
-            cols=sql.SQL(", ").join(sql.Identifier(p) for p in props),
-        )
-
-    def _create_vector_table_sql(self) -> List[sql.Composed]:
-        """DDL for the embedding table.
-
-        A graph schema holds only labels, so the table lives in a companion schema and
-        refers back to the label by graphid, cascading on delete.
-
-        Written out rather than asked for through the driver's ``vector_index``, which
-        describes a property index over a vector held in an element's properties. These
-        embeddings are not held there: an item's value is a document a caller gave, and
-        putting a thousand floats beside it means every read of the item detoasts them.
-        So they sit in a table of their own, keyed by the element's identity, and an index
-        over a plain table is not a property index.
-        """
-        dims = int(self._index["dims"])  # type: ignore[index]
-        vec = sql.Identifier(self._vector_schema, DEFAULT_VECTOR_TABLE)
-        return [
-            sql.SQL("CREATE SCHEMA IF NOT EXISTS {s}").format(
-                s=sql.Identifier(self._vector_schema)
-            ),
-            sql.SQL(
-                "CREATE TABLE IF NOT EXISTS {vec} ("
-                "  id graphid PRIMARY KEY REFERENCES {label} (id) ON DELETE CASCADE,"
-                "  embedding vector({dims})"
-                ")"
-            ).format(
-                vec=vec,
-                label=sql.Identifier(self._graph.graph_name, self._label),
-                dims=sql.SQL(str(dims)),
-            ),
-            sql.SQL(
-                "CREATE INDEX IF NOT EXISTS {name} ON {vec} "
-                "USING hnsw (embedding vector_cosine_ops)"
-            ).format(name=sql.Identifier(f"{DEFAULT_VECTOR_TABLE}_hnsw"), vec=vec),
-            # The namespace test, in a form the search that joins this table can use.
-            #
-            # A property index is written in terms of the graph's own property accessor,
-            # and that accessor cannot be spelled in plain SQL -- so the index over
-            # `ancestors` serves the Cypher reads and is invisible to the search here,
-            # which has to be SQL because it joins the embedding table. With this one the
-            # planner narrows to the rows that could match and ranks those, instead of
-            # ranking the whole table.
-            #
-            # Written out rather than asked for through `ensure_indexes`, which describes
-            # property indexes and cannot describe this one.
-            sql.SQL(
-                "CREATE INDEX IF NOT EXISTS {name} ON {label} "
-                "USING gin ((properties -> 'ancestors') jsonb_ops)"
-            ).format(
-                name=sql.Identifier(f"{self._label}_ancestors_json"),
-                label=sql.Identifier(self._graph.graph_name, self._label),
-            ),
-        ]
-
-    # ---- predicate builders ----
-
-    def _key_predicate(
-        self, pairs: Sequence[Tuple[str, str]], params: Dict[str, Any]
-    ) -> sql.Composed:
-        """An OR of ``(prefix = .. AND key = ..)`` equalities.
-
-        Each term is an equality on both indexed properties, so the composite index
-        answers every key in the batch.
-        """
-        terms = []
-        for i, (prefix, key) in enumerate(pairs):
-            params[f"p{i}"] = prefix
-            params[f"k{i}"] = key
-            terms.append(
-                sql.SQL("(n.prefix = %({p})s AND n.key = %({k})s)").format(
-                    p=sql.SQL(f"p{i}"), k=sql.SQL(f"k{i}")
-                )
-            )
-        # ORed: these are the keys of one batch, and a row matching any of them is
-        # wanted.
-        return sql.SQL(" OR ").join(terms)
-
-    @staticmethod
-    def _namespace_predicate_named(prefix: str, params: Dict[str, Any], tag: str) -> sql.Composed:
-        """Match a namespace and all of its descendants.
-
-        An item stores every namespace that contains it, so this asks whether the one
-        being searched for is among them. That is an equality inside a list, which no
-        collation can reorder, and a GIN property index over the list answers it.
-        """
-        params[f"ns_p{tag}"] = Jsonb([prefix])
-        return sql.SQL("(n.ancestors @> %({p})s)").format(p=sql.SQL(f"ns_p{tag}"))
-
-    def _namespace_predicate(
-        self, prefix: str, params: Dict[str, Any], suffix: str = ""
-    ) -> sql.Composed:
-        return self._namespace_predicate_named(prefix, params, suffix)
-
-    @staticmethod
-    def _value_path(path: Sequence[str]) -> sql.Composed:
-        """A property reference into ``value``, e.g. ``n.value.a.b``."""
-        return sql.SQL(".").join(
-            [sql.SQL("n"), sql.SQL("value")] + [sql.Identifier(p) for p in path]
-        )
-
-    def _filter_predicate(self, flt: Dict[str, Any], params: Dict[str, Any]) -> sql.Composed:
-        """Filters over ``value``, including comparison operators and nested keys.
-
-        A field maps to a scalar or list for equality, or to a map of ``$`` operators
-        (``$eq``, ``$ne``, ``$gt``, ``$gte``, ``$lt``, ``$lte``). A map without
-        operators descends into the nested key of the same name. Every form is expressed
-        in the query, so paging still happens in the database.
-        """
-        terms: List[sql.Composed] = []
-        counter = [0]
-
-        def emit(path: List[str], want: Any) -> None:
-            if isinstance(want, dict) and any(k.startswith("$") for k in want):
-                for op, operand in want.items():
-                    terms.append(self._operator_term(path, op, operand, params, counter))
-                return
-            if isinstance(want, dict):
-                for key, nested in want.items():
-                    emit(path + [key], nested)
-                return
-            terms.append(self._operator_term(path, "$eq", want, params, counter))
-
-        for field, want in flt.items():
-            emit([field], want)
-        return sql.SQL(" AND ").join(terms)
-
-    def _operator_term(
-        self,
-        path: List[str],
-        op: str,
-        operand: Any,
-        params: Dict[str, Any],
-        counter: List[int],
-    ) -> sql.Composed:
-        name = f"f{counter[0]}"
-        counter[0] += 1
-        # A scalar goes as itself: the driver sends a string as text, which is what a
-        # property index on the key is on. Wrapped as jsonb it is compared as jsonb, so
-        # the index no longer matches and the comparison reads the label instead. A list
-        # or a map stays jsonb, being what it is compared to.
-        params[name] = Jsonb(operand) if isinstance(operand, (list, dict)) else operand
-        ref = self._value_path(path)
-        placeholder = sql.SQL(f"%({name})s")
-        if op == "$eq":
-            return sql.SQL("{ref} = {v}").format(ref=ref, v=placeholder)
-        if op == "$ne":
-            # An absent key is unequal to anything, so it satisfies $ne.
-            return sql.SQL("({ref} IS NULL OR {ref} <> {v})").format(ref=ref, v=placeholder)
-        comparison = {"$gt": ">", "$gte": ">=", "$lt": "<", "$lte": "<="}.get(op)
-        if comparison is None:
-            raise ValueError(f"Unsupported operator: {op}")
-        return sql.SQL("{ref} {cmp} {v}").format(ref=ref, cmp=sql.SQL(comparison), v=placeholder)
-
-    # ---- row <-> item ----
-
-    @staticmethod
-    def _row_to_item(row: Dict[str, Any], cls: Any = Item, **extra: Any) -> Any:
-        value = row["value"]
-        if isinstance(value, str):  # a bag value round-trips as text in some shapes
-            value = json.loads(value)
-        return cls(
-            value=value,
-            key=row["key"],
-            namespace=unflatten_namespace(row["prefix"]),
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-            **extra,
-        )
-
-    # ---- statements ----
-
-    def _put_cypher(self) -> sql.Composed:
-        """Set-based upsert. ``created_at`` survives an update; ``updated_at`` moves."""
-        return sql.SQL(
-            "UNWIND %(rows)s AS r "
-            "MERGE (n:{l} {{prefix: r.prefix, key: r.key}}) "
-            "  ON CREATE SET n.value = r.value, n.created_at = r.created_at, "
-            "                n.updated_at = r.updated_at, n.ancestors = r.ancestors "
-            "  ON MATCH  SET n.value = r.value, n.updated_at = r.updated_at, "
-            "                n.ancestors = r.ancestors "
-            "RETURN id(n) AS id, r.prefix AS prefix, r.key AS key"
-        ).format(l=sql.Identifier(self._label))
-
-    def _delete_cypher(self, predicate: sql.Composed) -> sql.Composed:
-        return sql.SQL("MATCH (n:{l}) WHERE {pred} DETACH DELETE n").format(
-            l=sql.Identifier(self._label), pred=predicate
-        )
-
-    def _get_cypher(self, predicate: sql.Composed) -> sql.Composed:
-        return sql.SQL(
-            "MATCH (n:{l}) WHERE {pred} "
-            "RETURN n.prefix AS prefix, n.key AS key, n.value AS value, "
-            "       n.created_at AS created_at, n.updated_at AS updated_at"
-        ).format(l=sql.Identifier(self._label), pred=predicate)
-
-    def _search_cypher(self, predicate: sql.Composed, limit: int, offset: int) -> sql.Composed:
-        return sql.SQL(
-            "MATCH (n:{l}) WHERE {pred} "
-            "RETURN n.prefix AS prefix, n.key AS key, n.value AS value, "
-            "       n.created_at AS created_at, n.updated_at AS updated_at "
-            "ORDER BY n.prefix, n.key SKIP {off} LIMIT {lim}"
-        ).format(
-            l=sql.Identifier(self._label),
-            pred=predicate,
-            off=sql.SQL(str(int(offset))),
-            lim=sql.SQL(str(int(limit))),
-        )
-
-    def _list_namespaces_cypher(
-        self, predicate: Optional[sql.Composed], limit: int, offset: int
-    ) -> sql.Composed:
-        where = sql.SQL("WHERE {p} ").format(p=predicate) if predicate is not None else sql.SQL("")
-        return sql.SQL(
-            "MATCH (n:{l}) {where}RETURN DISTINCT n.prefix AS prefix "
-            "ORDER BY prefix SKIP {off} LIMIT {lim}"
-        ).format(
-            l=sql.Identifier(self._label),
-            where=where,
-            off=sql.SQL(str(int(offset))),
-            lim=sql.SQL(str(int(limit))),
-        )
-
-    def _recall_options(self, over_fetch: int) -> Dict[str, Any]:
-        """What the index has to be told to fill a page that is narrowed afterwards.
-
-        The distance index ranks every embedding in the table and knows nothing about
-        namespaces, so a search of one namespace looks at the nearest few overall and keeps
-        whichever of them happen to belong to it. Where a namespace holds a small fraction
-        of the store, the nearest few hold none of it and a page comes back short.
-
-        So the index is told to keep going until the page is full rather than to look at a
-        fixed number of candidates: ``iterative_scan`` re-enters the index as the filter
-        rejects what it returns. ``strict_order`` rather than ``relaxed_order`` because the
-        candidates are ranked and cut afterwards, so their order is the answer.
-
-        Raising ``ef_search`` alone does not do it: forty is already the default, so
-        setting forty sets nothing, and a page of ten asks for exactly that many
-        candidates. It is still raised alongside, for the pages that ask for more.
-
-        Iterative scanning arrived in pgvector 0.8. Below that there is nothing to set, and
-        a search there is as good as the over-fetch makes it.
-        """
-        # pgvector takes 1..1000 for ef_search and refuses anything outside, so a large
-        # enough page would have made the search fail rather than merely under-recall.
-        options: Dict[str, Any] = {"hnsw.ef_search": min(max(over_fetch, 40), 1000)}
-        if self._iterative_scan:
-            options["hnsw.iterative_scan"] = "strict_order"
-        return options
-
-    def _vector_search_sql(self, over_fetch: int) -> sql.Composed:
-        """The nearest candidates *within the namespace*, by distance.
-
-        The namespace is part of the search rather than something applied to its results.
-        Ranked globally and narrowed afterwards, a search of one user's memories in a store
-        holding many users returns only whatever of theirs happens to fall in the global
-        nearest few, which for a store of any size is little or none of it.
-
-        The distance is still computed only over the embedding table; the join to the
-        label carries the containment test that decides which rows count.
-        """
-        return sql.SQL(
-            "SELECT m.properties ->> 'prefix' AS prefix, "
-            "       m.properties ->> 'key' AS key, "
-            "       m.properties -> 'value' AS value, "
-            "       m.properties ->> 'created_at' AS created_at, "
-            "       m.properties ->> 'updated_at' AS updated_at, "
-            "       t.dist AS dist "
-            "FROM (SELECT v.id, v.embedding <=> %(qvec)s AS dist "
-            "      FROM {vec} v "
-            "      JOIN {label} mm ON mm.id = v.id "
-            "      WHERE mm.properties -> 'ancestors' @> %(ns)s "
-            "      ORDER BY dist LIMIT {n}) t "
-            "JOIN {label} m ON m.id = t.id "
-            "ORDER BY t.dist"
-        ).format(
-            vec=sql.Identifier(self._vector_schema, DEFAULT_VECTOR_TABLE),
-            label=sql.Identifier(self._graph.graph_name, self._label),
-            n=sql.SQL(str(int(over_fetch))),
-        )
-
-    def _upsert_vectors_sql(self, count: int) -> sql.Composed:
-        values = sql.SQL(", ").join(
-            sql.SQL("(%({i})s::graphid, %({e})s)").format(
-                i=sql.SQL(f"vid{i}"), e=sql.SQL(f"vec{i}")
-            )
-            for i in range(count)
-        )
-        return sql.SQL(
-            "INSERT INTO {vec} (id, embedding) VALUES {vals} "
-            "ON CONFLICT (id) DO UPDATE SET embedding = EXCLUDED.embedding"
-        ).format(vec=sql.Identifier(self._vector_schema, DEFAULT_VECTOR_TABLE), vals=values)
-
-    # ---- embedding ----
-
-    def _embed(self, texts: List[str]) -> List[List[float]]:
-        embed = self._index["embed"]  # type: ignore[index]
-        if hasattr(embed, "embed_documents"):
-            return embed.embed_documents(texts)
-        return [embed(t) for t in texts]  # type: ignore[operator]
-
-    async def _aembed(self, texts: List[str]) -> List[List[float]]:
-        embed = self._index["embed"]  # type: ignore[index]
-        if hasattr(embed, "aembed_documents"):
-            return await embed.aembed_documents(texts)
-        return self._embed(texts)
-
-    def _text_for(self, value: Dict[str, Any]) -> str:
-        """The text an item is embedded from: the named fields, else the whole value."""
-        fields = (self._index or {}).get("fields")
-        if not fields:
-            return json.dumps(value, default=str)
-        # LangGraph's fields are JSON paths -- "metadata.title", "items[0]", "items[*]"
-        # -- not top-level keys. Read as keys, a dotted field matched nothing and every
-        # item was embedded from the empty string, which ranks them all alike.
-        parts: List[str] = []
-        for field in fields:
-            try:
-                parts.extend(str(found) for found in get_text_at_path(value, field) if found)
-            except Exception:
-                if field in value:
-                    parts.append(str(value[field]))
-        return " ".join(parts)
-
-    # ---- op grouping ----
-
-    @staticmethod
-    def _group(
-        ops: Iterable[Op],
-    ) -> Tuple[
-        List[Tuple[int, GetOp]],
-        List[Tuple[int, PutOp]],
-        List[Tuple[int, PutOp]],
-        List[Tuple[int, SearchOp]],
-        List[Tuple[int, ListNamespacesOp]],
-    ]:
-        """Split ops by kind, keeping each op's index so results can be reordered."""
-        gets: List[Tuple[int, GetOp]] = []
-        puts: List[Tuple[int, PutOp]] = []
-        deletes: List[Tuple[int, PutOp]] = []
-        searches: List[Tuple[int, SearchOp]] = []
-        lists: List[Tuple[int, ListNamespacesOp]] = []
-        for i, op in enumerate(ops):
-            if isinstance(op, GetOp):
-                gets.append((i, op))
-            elif isinstance(op, PutOp):
-                (deletes if op.value is None else puts).append((i, op))
-            elif isinstance(op, SearchOp):
-                searches.append((i, op))
-            elif isinstance(op, ListNamespacesOp):
-                lists.append((i, op))
-            else:  # pragma: no cover - guards a future op kind
-                raise NotImplementedError(f"Unsupported operation: {type(op).__name__}")
-        return gets, puts, deletes, searches, lists
-
-    def _put_rows(self, puts: List[Tuple[int, PutOp]]) -> List[Dict[str, Any]]:
-        now = _utcnow()
-        rows = []
-        for _, op in puts:
-            rows.append(
-                {
-                    "prefix": (prefix := flatten_namespace(op.namespace)),
-                    "key": op.key,
-                    "value": op.value,
-                    "created_at": now,
-                    "updated_at": now,
-                    # Every namespace containing this one, so that a descendant search
-                    # is an equality inside a list rather than a comparison the
-                    # database's collation gets a say in.
-                    "ancestors": ancestors_of(prefix),
-                }
-            )
-        return rows
-
-    @staticmethod
-    def _to_embed(
-        rows: List[Dict[str, Any]], puts: List[Tuple[int, PutOp]]
-    ) -> List[Dict[str, Any]]:
-        """The rows of a batch whose text is to be embedded.
-
-        ``index=False`` on a put asks for the item to be stored and not embedded, so it
-        is left out here -- otherwise the caller is charged for an embedding they declined
-        and the item turns up in results they meant it to stay out of.
-        """
-        return [row for row, (_, op) in zip(rows, puts) if op.index is not False]
-
-    @staticmethod
-    def _has_wildcard(op: ListNamespacesOp) -> bool:
-        return any(any(part == "*" for part in cond.path) for cond in (op.match_conditions or ()))
+        self._init_core(engine, graph, graph_name, index, ttl, setup)
+        self._sweeper: threading.Thread | None = None
+        self._stop = threading.Event()
 
     @classmethod
-    def _match_predicate_sql(
-        cls, op: ListNamespacesOp, params: Dict[str, Any]
-    ) -> Optional[sql.Composed]:
-        """Express wildcard-free match conditions in SQL.
+    @contextmanager
+    def from_conn_string(
+        cls, conninfo: str, *, graph_name: str, **kwargs: Any
+    ) -> Iterator[AgensStore]:
+        """A store on an engine of its own, closed with the block."""
+        with AgensEngine(conninfo) as engine:
+            store = cls(engine, graph_name=graph_name, **kwargs)
+            try:
+                yield store
+            finally:
+                store.stop_ttl_sweeper()
 
-        A prefix condition reuses the namespace range; a suffix condition matches on the
-        path's tail. Conditions holding ``*`` are matched positionally by
-        :meth:`_apply_match_conditions` and yield no predicate here.
-        """
-        if not op.match_conditions or cls._has_wildcard(op):
-            return None
-        terms = []
-        for i, cond in enumerate(op.match_conditions):
-            joined = NS_SEP.join(cond.path)
-            if cond.match_type == "prefix":
-                terms.append(cls._namespace_predicate_named(joined, params, f"_mc{i}"))
-            else:
-                params[f"mc_s{i}"] = NS_SEP + joined
-                params[f"mc_x{i}"] = joined
-                terms.append(
-                    sql.SQL("(n.prefix = %({x})s OR n.prefix ENDS WITH %({s})s)").format(
-                        x=sql.SQL(f"mc_x{i}"), s=sql.SQL(f"mc_s{i}")
-                    )
-                )
-        # ANDed: LangGraph's reference applies `all(...)` over the conditions, so a
-        # namespace has to satisfy every one of them.
-        return sql.SQL(" AND ").join(terms)
+    def setup(self) -> None:
+        """Make the store's tables now rather than on its first call."""
+        self._open()
+        self._setup.ensure()
 
-    @staticmethod
-    def _condition_ok(prefix: str, condition: MatchCondition) -> bool:
-        """Whether a namespace satisfies one condition, ``*`` matching any one label.
+    def batch(self, ops: Iterable[Op]) -> list[Result]:
+        listed = _grouped(ops)
+        self._open()
+        if self._setup_wanted:
+            self._setup.ensure()
+        texts, fields = self._texts(listed)
+        vectors = self.embeddings.embed_documents(texts) if texts and self.embeddings else []
+        return self._engine.run(lambda: self._batch(listed, vectors, fields))
 
-        A namespace shorter than the path cannot satisfy it, and the labels are compared
-        from the front for a prefix and from the back for a suffix.
-        """
-        parts = prefix.split(NS_SEP)
-        path = condition.path
-        if len(parts) < len(path):
-            return False
-        if condition.match_type == "prefix":
-            pairs = zip(parts, path)
-        elif condition.match_type == "suffix":
-            pairs = zip(reversed(parts), reversed(path))
-        else:
-            raise ValueError(f"Unsupported match type: {condition.match_type}")
-        return all(want == "*" or part == want for part, want in pairs)
+    def sweep_ttl(self, *, batch_size: int = 1000) -> int:
+        """Delete expired items, a batch at a time; how many were deleted."""
+        self._open()
+        self._setup.ensure()
+        return self._engine.run(lambda: self._sweep_all(batch_size))
 
-    def _apply_match_conditions(self, prefixes: List[str], op: ListNamespacesOp) -> List[str]:
-        """Keep the namespaces satisfying every condition.
-
-        Read here rather than in the statement when any condition holds a ``*``, since a
-        wildcard matches a label by position and there is no range for a prefix index to
-        narrow. Every condition is applied, not only the ones holding a wildcard: the
-        statement emitted none of them in that case, so all of them are still to be
-        applied, and a namespace has to satisfy all of them rather than any.
-        """
-        if not op.match_conditions or not self._has_wildcard(op):
-            return prefixes
-        return [
-            prefix
-            for prefix in prefixes
-            if all(self._condition_ok(prefix, c) for c in op.match_conditions)
-        ]
-
-    @staticmethod
-    def _truncate_depth(prefixes: List[str], max_depth: Optional[int]) -> List[str]:
-        if max_depth is None:
-            return prefixes
-        seen, out = set(), []
-        for prefix in prefixes:
-            trimmed = NS_SEP.join(prefix.split(NS_SEP)[:max_depth])
-            if trimmed not in seen:
-                seen.add(trimmed)
-                out.append(trimmed)
-        return out
-
-    # ---- sync API ----
-
-    def batch(self, ops: Iterable[Op]) -> List[Result]:
-        ops = list(ops)
-        results: List[Result] = [None] * len(ops)
-        gets, puts, deletes, searches, lists = self._group(ops)
-
-        if deletes:
-            params: Dict[str, Any] = {}
-            pairs = [(flatten_namespace(op.namespace), op.key) for _, op in deletes]
-            self._graph.query(self._delete_cypher(self._key_predicate(pairs, params)), params)
-            for i, _ in deletes:
-                results[i] = None
-
-        if puts:
-            rows = self._put_rows(puts)
-            indexed = self._to_embed(rows, puts)
-            # Embedded before anything is written, and outside the transaction, because
-            # this is a call to something that is not the database. Written first, the
-            # item would be committed and then the call made -- and a call that fails
-            # leaves an item nothing can find, for as long as it exists.
-            vectors = (
-                self._embed([self._text_for(r["value"]) for r in indexed])
-                if self._index and indexed
-                else []
-            )
-
-            def write() -> List[Dict[str, Any]]:
-                with self._graph.transaction():
-                    written = self._graph.query(self._put_cypher(), {"rows": Jsonb(rows)})
-                    if vectors:
-                        self._write_vectors(indexed, written, vectors)
-                    return written
-
-            self._graph.merging(write)
-            for i, _ in puts:
-                results[i] = None
-
-        if gets:
-            params = {}
-            pairs = [(flatten_namespace(op.namespace), op.key) for _, op in gets]
-            rows = self._graph.query(self._get_cypher(self._key_predicate(pairs, params)), params)
-            found = {(r["prefix"], r["key"]): r for r in rows}
-            for i, op in gets:
-                row = found.get((flatten_namespace(op.namespace), op.key))
-                results[i] = self._row_to_item(row) if row else None
-
-        for i, op in searches:
-            results[i] = self._search(op)
-
-        for i, op in lists:
-            results[i] = self._list_namespaces(op)
-
-        return results
-
-    def _vector_params(
-        self,
-        rows: List[Dict[str, Any]],
-        written: List[Dict[str, Any]],
-        vectors: List[List[float]],
-    ) -> Tuple[int, Dict[str, Any]]:
-        """Pair each embedding with the element it belongs to, by the key it was put at."""
-        ids = {(r["prefix"], r["key"]): r["id"] for r in written}
-        params: Dict[str, Any] = {}
-        count = 0
-        for row, vec in zip(rows, vectors):
-            held = ids.get((row["prefix"], row["key"]))
-            if held is None:
-                continue
-            params[f"vid{count}"] = held
-            params[f"vec{count}"] = Vector(vec)
-            count += 1
-        return count, params
-
-    def _write_vectors(
-        self,
-        rows: List[Dict[str, Any]],
-        written: List[Dict[str, Any]],
-        vectors: List[List[float]],
-    ) -> None:
-        """Put the embeddings in the side table, beside the items they belong to."""
-        count, params = self._vector_params(rows, written, vectors)
-        if count:
-            self._graph.query(self._upsert_vectors_sql(count), params)
-
-    def _ranked_by_distance(
-        self, over_fetch: int, qvec: List[float], prefix: str
-    ) -> List[Dict[str, Any]]:
-        """The nearest candidates, with the index told how many to look at.
-
-        The option and the search go on one connection, which is the only place the option
-        means anything: sent through a pool they would land on different backends, and the
-        search meant to look further would not. Inside a transaction so that it ends with
-        the search rather than tuning whoever borrows the connection next.
-        """
-        options = self._recall_options(over_fetch)
-        statement = self._vector_search_sql(over_fetch)
-        params = {"qvec": Vector(qvec), "ns": Jsonb([prefix])}
-        if not options:
-            return self._graph.query(statement, params)
-        with self._graph.transaction() as conn:
-            # In one round trip rather than one each, since nothing reads their results.
-            conn.pipeline_batch(
-                [(one, None) for one in search_option_statements(options, local=True)]
-            )
-            return self._graph.query(statement, params)
-
-    async def _aranked_by_distance(
-        self, over_fetch: int, qvec: List[float], prefix: str
-    ) -> List[Dict[str, Any]]:
-        """Async sibling of :meth:`_ranked_by_distance`."""
-        options = self._recall_options(over_fetch)
-        statement = self._vector_search_sql(over_fetch)
-        params = {"qvec": Vector(qvec), "ns": Jsonb([prefix])}
-        if not options:
-            return await self._graph.aquery(statement, params)
-        async with self._graph.atransaction() as conn:
-            await conn.pipeline_batch(
-                [(one, None) for one in search_option_statements(options, local=True)]
-            )
-            return await self._graph.aquery(statement, params)
-
-    def _search(self, op: SearchOp) -> List[SearchItem]:
-        prefix = flatten_namespace(op.namespace_prefix)
-        if op.query and self._index:
-            return self._semantic_search(op, prefix)
-        params: Dict[str, Any] = {}
-        predicate = self._namespace_predicate(prefix, params)
-        if op.filter:
-            predicate = sql.SQL("({ns}) AND ({f})").format(
-                ns=predicate, f=self._filter_predicate(op.filter, params)
-            )
-        rows = self._graph.query(self._search_cypher(predicate, op.limit, op.offset), params)
-        return [self._row_to_item(r, SearchItem, score=None) for r in rows]
-
-    def _semantic_search(self, op: SearchOp, prefix: str) -> List[SearchItem]:
-        """Rank by distance, then narrow to the namespace and filter.
-
-        The distance index ranks the whole table, so candidates are over-fetched and
-        narrowed afterwards.
-        """
-        over_fetch = max(op.limit + op.offset, 1) * 4
-        qvec = self._embed([op.query])[0]  # type: ignore[list-item]
-        ranked = self._in_namespace(self._ranked_by_distance(over_fetch, qvec, prefix), prefix)
-        if not (op.filter and ranked):
-            return self._semantic_items(ranked, None, op)
-        statement, params = self._filter_query(ranked, op.filter)
-        return self._semantic_items(ranked, self._graph.query(statement, params), op)
-
-    @staticmethod
-    def _in_namespace(rows: List[Dict[str, Any]], prefix: str) -> List[Dict[str, Any]]:
-        """The candidates under the namespace searched, itself included.
-
-        Read here because the rows are already in hand and a namespace is compared as a
-        whole label: an exact string against an exact string, which is the same question
-        however it is asked.
-        """
-        lo, hi = _descendant_bounds(prefix)
-        return [r for r in rows if r["prefix"] == prefix or lo <= r["prefix"] < hi]
-
-    def _filter_query(
-        self, ranked: List[Dict[str, Any]], flt: Dict[str, Any]
-    ) -> Tuple[sql.Composed, Dict[str, Any]]:
-        """Which of the candidates pass the filter, asked of the database.
-
-        The same predicate a search without a query uses, so one filter means one answer.
-        Read in Python it would be a second implementation of every operator, and a
-        comparison is a different question there: ``$gt`` over a value stored as text
-        orders by type class in jsonb and by magnitude in Python, so the two answered
-        oppositely and which one a caller got depended on whether they passed a query.
-
-        The candidates are named by the two properties a composite index covers, so this
-        is a point lookup per candidate rather than a scan.
-        """
-        params: Dict[str, Any] = {}
-        pairs = [(row["prefix"], row["key"]) for row in ranked]
-        predicate = sql.SQL("({keys}) AND ({f})").format(
-            keys=self._key_predicate(pairs, params),
-            f=self._filter_predicate(flt, params),
+    def start_ttl_sweeper(self, sweep_interval_minutes: float | None = None) -> threading.Thread:
+        """Sweep expired items every interval on a daemon thread, until stopped or closed."""
+        if self._sweeper is not None and self._sweeper.is_alive():
+            return self._sweeper
+        interval = 60 * (
+            sweep_interval_minutes or (self.ttl_config or {}).get("sweep_interval_minutes") or 5
         )
-        return self._select_keys_cypher(predicate), params
+        self._stop.clear()
 
-    def _select_keys_cypher(self, predicate: sql.Composed) -> sql.Composed:
-        """Only which items matched: the values are already in hand."""
-        return sql.SQL("MATCH (n:{l}) WHERE {pred} RETURN n.prefix AS prefix, n.key AS key").format(
-            l=sql.Identifier(self._label), pred=predicate
-        )
+        def loop() -> None:
+            while not self._stop.wait(interval):
+                try:
+                    self.sweep_ttl()
+                except Exception:  # noqa: BLE001 - a sweep that fails is tried again next time
+                    logger.exception("sweeping expired store items failed")
 
-    def _semantic_items(
-        self,
-        ranked: List[Dict[str, Any]],
-        kept: Optional[List[Dict[str, Any]]],
-        op: SearchOp,
-    ) -> List[SearchItem]:
-        """The candidates that survived, in the order the distance put them in.
+        self._sweeper = threading.Thread(target=loop, name="agens-store-ttl", daemon=True)
+        self._sweeper.start()
+        return self._sweeper
 
-        ``kept`` names the ones that passed a filter, or is ``None`` when there was no
-        filter to pass.
-        """
-        keys = None if kept is None else {(r["prefix"], r["key"]) for r in kept}
-        out: List[SearchItem] = []
-        for row in ranked:
-            if keys is not None and (row["prefix"], row["key"]) not in keys:
-                continue
-            value = row["value"]
-            if isinstance(value, str):
-                value = json.loads(value)
-            out.append(
-                self._row_to_item(
-                    {**row, "value": value},
-                    SearchItem,
-                    score=1.0 - float(row["dist"]),
-                )
-            )
-        return out[op.offset : op.offset + op.limit]
-
-    def _collapses_rows(self, op: ListNamespacesOp) -> bool:
-        """Whether anything after the statement can turn several rows into fewer.
-
-        A wildcard condition is matched by position and a depth limit shortens a
-        namespace, and either can drop or merge rows -- so the page cannot be taken until
-        they have been. Without them the rows the statement returns are the answer, and
-        the server can take the page itself.
-        """
-        return op.max_depth is not None or self._has_wildcard(op)
-
-    def _namespace_page(
-        self,
-        op: ListNamespacesOp,
-        predicate: Optional[sql.Composed],
-        params: Dict[str, Any],
-    ) -> Tuple[sql.Composed, Dict[str, Any]]:
-        """The statement that reads the namespaces, paged where paging is sound."""
-        if self._collapses_rows(op):
-            # Everything, because what comes back is not yet what is being counted. The
-            # rows are distinct namespaces rather than items, so this is the number of
-            # namespaces there are and not the number of memories.
-            return self._list_namespaces_cypher(predicate, _EVERY_NAMESPACE, 0), params
-        return (
-            self._list_namespaces_cypher(predicate, op.limit, op.offset),
-            params,
-        )
-
-    def _namespaces_from(
-        self, rows: List[Dict[str, Any]], op: ListNamespacesOp
-    ) -> List[Tuple[str, ...]]:
-        """The namespaces a read found, narrowed and paged if that is still to do."""
-        prefixes = [r["prefix"] for r in rows]
-        if self._collapses_rows(op):
-            prefixes = self._apply_match_conditions(prefixes, op)
-            prefixes = self._truncate_depth(prefixes, op.max_depth)
-            prefixes = prefixes[op.offset : op.offset + op.limit]
-        return [unflatten_namespace(p) for p in prefixes]
-
-    def _list_namespaces(self, op: ListNamespacesOp) -> List[Tuple[str, ...]]:
-        params: Dict[str, Any] = {}
-        predicate = self._match_predicate_sql(op, params)
-        rows = self._graph.query(*self._namespace_page(op, predicate, params))
-        return self._namespaces_from(rows, op)
-
-    # ---- async API ----
-
-    async def abatch(self, ops: Iterable[Op]) -> List[Result]:
-        ops = list(ops)
-        results: List[Result] = [None] * len(ops)
-        gets, puts, deletes, searches, lists = self._group(ops)
-
-        if deletes:
-            params: Dict[str, Any] = {}
-            pairs = [(flatten_namespace(op.namespace), op.key) for _, op in deletes]
-            await self._graph.aquery(
-                self._delete_cypher(self._key_predicate(pairs, params)), params
-            )
-
-        if puts:
-            rows = self._put_rows(puts)
-            indexed = self._to_embed(rows, puts)
-            # Embedded first, for the reason given in :meth:`batch`.
-            vectors = (
-                await self._aembed([self._text_for(r["value"]) for r in indexed])
-                if self._index and indexed
-                else []
-            )
-
-            async def write() -> None:
-                async with self._graph.atransaction():
-                    written = await self._graph.aquery(self._put_cypher(), {"rows": Jsonb(rows)})
-                    if vectors:
-                        await self._awrite_vectors(indexed, written, vectors)
-
-            await self._graph.amerging(write)
-            for i, _ in puts:
-                results[i] = None
-
-        if gets:
-            params = {}
-            pairs = [(flatten_namespace(op.namespace), op.key) for _, op in gets]
-            rows = await self._graph.aquery(
-                self._get_cypher(self._key_predicate(pairs, params)), params
-            )
-            found = {(r["prefix"], r["key"]): r for r in rows}
-            for i, op in gets:
-                row = found.get((flatten_namespace(op.namespace), op.key))
-                results[i] = self._row_to_item(row) if row else None
-
-        for i, op in searches:
-            results[i] = await self._asearch(op)
-
-        for i, op in lists:
-            results[i] = await self._alist_namespaces(op)
-
-        return results
-
-    async def _awrite_vectors(
-        self,
-        rows: List[Dict[str, Any]],
-        written: List[Dict[str, Any]],
-        vectors: List[List[float]],
-    ) -> None:
-        """Async sibling of :meth:`_write_vectors`."""
-        count, params = self._vector_params(rows, written, vectors)
-        if count:
-            await self._graph.aquery(self._upsert_vectors_sql(count), params)
-
-    async def _asearch(self, op: SearchOp) -> List[SearchItem]:
-        prefix = flatten_namespace(op.namespace_prefix)
-        if op.query and self._index:
-            over_fetch = max(op.limit + op.offset, 1) * 4
-            qvec = (await self._aembed([op.query]))[0]
-            ranked = self._in_namespace(
-                await self._aranked_by_distance(over_fetch, qvec, prefix), prefix
-            )
-            if not (op.filter and ranked):
-                return self._semantic_items(ranked, None, op)
-            statement, params = self._filter_query(ranked, op.filter)
-            return self._semantic_items(ranked, await self._graph.aquery(statement, params), op)
-        params: Dict[str, Any] = {}
-        predicate = self._namespace_predicate(prefix, params)
-        if op.filter:
-            predicate = sql.SQL("({ns}) AND ({f})").format(
-                ns=predicate, f=self._filter_predicate(op.filter, params)
-            )
-        rows = await self._graph.aquery(self._search_cypher(predicate, op.limit, op.offset), params)
-        return [self._row_to_item(r, SearchItem, score=None) for r in rows]
-
-    async def _alist_namespaces(self, op: ListNamespacesOp) -> List[Tuple[str, ...]]:
-        params: Dict[str, Any] = {}
-        predicate = self._match_predicate_sql(op, params)
-        rows = await self._graph.aquery(*self._namespace_page(op, predicate, params))
-        return self._namespaces_from(rows, op)
-
-    # ---- lifecycle ----
+    def stop_ttl_sweeper(self, timeout: float | None = None) -> bool:
+        """Stop the sweeper; whether it has stopped."""
+        if self._sweeper is None:
+            return True
+        self._stop.set()
+        self._sweeper.join(timeout)
+        stopped = not self._sweeper.is_alive()
+        if stopped:
+            self._sweeper = None
+        return stopped
 
     def close(self) -> None:
-        """Close the graph this store opened for itself.
-
-        A store given a ``graph=`` was handed one that belongs to somebody else -- very
-        likely shared with a vector store and a checkpointer -- and closing it from here
-        took their connection out from under them.
-        """
-        if self._owns_graph:
-            self._graph.close()
+        self.stop_ttl_sweeper()
+        super().close()
 
     async def aclose(self) -> None:
-        """Async sibling of :meth:`close`."""
-        if self._owns_graph:
-            await self._graph.aclose()
-            self._graph.close()
+        self.stop_ttl_sweeper()
+        await super().aclose()
 
 
-__all__ = ["AgensStore", "flatten_namespace", "unflatten_namespace"]
+class AsyncAgensStore(_StoreCore, AsyncBatchedBaseStore):
+    """A LangGraph store for an event loop: concurrent calls on the loop are batched together.
+
+    Make it inside a running loop, or with :meth:`afrom_conn_string`. Its blocking methods may be
+    called from another thread; on the loop's own thread they would wait on themselves, and are
+    refused.
+    """
+
+    def __init__(
+        self,
+        engine: AgensEngine | str | None = None,
+        *,
+        graph: Any = None,
+        graph_name: str | None = None,
+        index: AgensIndexConfig | IndexConfig | None = None,
+        ttl: TTLConfig | None = None,
+        setup: bool = True,
+    ) -> None:
+        AsyncBatchedBaseStore.__init__(self)
+        self._init_core(engine, graph, graph_name, index, ttl, setup)
+        self._sweeper_task: asyncio.Task[None] | None = None
+
+    @classmethod
+    @asynccontextmanager
+    async def afrom_conn_string(
+        cls, conninfo: str, *, graph_name: str, **kwargs: Any
+    ) -> AsyncIterator[AsyncAgensStore]:
+        """A store on an engine of its own, whose pools close with the block."""
+        engine = AgensEngine(conninfo)
+        store = cls(engine, graph_name=graph_name, **kwargs)
+        try:
+            yield store
+        finally:
+            await store.stop_ttl_sweeper()
+            await engine.aclose()
+
+    async def setup(self) -> None:
+        """Make the store's tables now rather than on its first call."""
+        await self.asetup()
+
+    async def sweep_ttl(self, *, batch_size: int = 1000) -> int:
+        """Delete expired items, a batch at a time; how many were deleted."""
+        return await self.asweep_ttl(batch_size=batch_size)
+
+    async def start_ttl_sweeper(
+        self, sweep_interval_minutes: float | None = None
+    ) -> asyncio.Task[None]:
+        """Sweep expired items every interval in a task on this loop, until stopped."""
+        if self._sweeper_task is not None and not self._sweeper_task.done():
+            return self._sweeper_task
+        interval = 60 * (
+            sweep_interval_minutes or (self.ttl_config or {}).get("sweep_interval_minutes") or 5
+        )
+
+        async def loop() -> None:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    await self.sweep_ttl()
+                except Exception:  # noqa: BLE001 - a sweep that fails is tried again next time
+                    logger.exception("sweeping expired store items failed")
+
+        self._sweeper_task = asyncio.create_task(loop())
+        return self._sweeper_task
+
+    async def stop_ttl_sweeper(self) -> bool:
+        """Stop the sweeper; whether it has stopped."""
+        task, self._sweeper_task = self._sweeper_task, None
+        if task is None:
+            return True
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        return True
+
+    def close(self) -> None:
+        """Stop the sweeper, which a blocking call can only cancel, and close."""
+        if self._sweeper_task is not None:
+            self._sweeper_task.cancel()
+            self._sweeper_task = None
+        super().close()
+
+    async def aclose(self) -> None:
+        await self.stop_ttl_sweeper()
+        await super().aclose()
+
+
+__all__ = ["AgensIndexConfig", "AgensStore", "AsyncAgensStore"]

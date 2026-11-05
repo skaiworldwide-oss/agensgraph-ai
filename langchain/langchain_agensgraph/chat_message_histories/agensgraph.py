@@ -1,376 +1,235 @@
-"""Chat message history backed by AgensGraph.
+"""A LangChain chat message history in the companion schema of an AgensGraph graph.
 
-Messages for a session are stored as an ordered chain of ``Message`` vertices
-linked from a ``Session`` vertex::
+Two tables in ``"<graph>_store"``: ``chat_session``, one row per session holding the next sequence
+number and how many messages it has, and ``chat_message``, one row per message, keyed by session
+and sequence number and unique by session and message id. A message is kept as LangChain's own
+``message_to_dict``, so it comes back as it went in, ``additional_kwargs`` and all.
 
-    (:Session {id})-[:HAS_MESSAGE]->(:Message {seq, data})
+Every call is one round trip. Adding messages is a pipeline, so one implicit transaction: the first
+statement reserves a block of sequence numbers on the session's row, which also locks it, so two
+writers to one session take turns; the second inserts the messages, skipping any whose id the
+session already holds, and adds to the count only what it inserted. Adding the same messages twice
+therefore changes nothing the second time. A message without an id is given one; the caller's
+message is not changed.
 
-``data`` is the LangChain ``message_to_dict`` form, so any ``BaseMessage`` subtype
-round-trips losslessly through ``messages_from_dict``. ``seq`` is a monotonic
-per-session ordinal used to preserve order.
+Tables are made on first use, under the graph's schema lock; the graph itself need not exist.
 """
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional, Sequence
+import uuid
+from collections.abc import Sequence
+from typing import Any
 
-from agensgraph.introspect import DesiredIndex
+from agensgraph import Jsonb
 from langchain_core.chat_history import BaseChatMessageHistory
-from langchain_core.messages import (
-    BaseMessage,
-    message_to_dict,
-    messages_from_dict,
-)
-from psycopg import sql
-from psycopg.types.json import Jsonb
+from langchain_core.messages import BaseMessage, message_to_dict, messages_from_dict
 
-from langchain_agensgraph.graphs.agensgraph import AgensGraph, checked_names
+from .._core.component import Component
+from .._core.engine import AgensEngine, bind
+from .._core.names import companion_schema, qualified
+from .._core.program import Pipeline, Program, Statement
+from .._core.setup import Migrations, Setup
 
 
-class AgensChatMessageHistory(BaseChatMessageHistory):
-    """Persist LangChain chat messages in an AgensGraph graph.
+class _Tables:
+    def __init__(self, graph: str) -> None:
+        self.schema = companion_schema(graph)
+        self.sessions = qualified(self.schema, "chat_session")
+        self.messages = qualified(self.schema, "chat_message")
+        self.migrations = [
+            f"CREATE TABLE IF NOT EXISTS {self.sessions} (session_id text PRIMARY KEY, "
+            "created_at timestamptz NOT NULL DEFAULT now(), "
+            "updated_at timestamptz NOT NULL DEFAULT now(), next_seq bigint NOT NULL, "
+            "message_count bigint NOT NULL)",
+            f"CREATE TABLE IF NOT EXISTS {self.messages} (session_id text NOT NULL, "
+            "seq bigint NOT NULL, message_id text NOT NULL, message jsonb NOT NULL, "
+            "created_at timestamptz NOT NULL DEFAULT now(), PRIMARY KEY (session_id, seq), "
+            "UNIQUE (session_id, message_id))",
+        ]
 
-    Args:
-        session_id: Identifier for the conversation. graph: An existing
-        :class:`AgensGraph` to reuse. If omitted, ``conf``
-            (and ``graph_name``) are used to build one.
-        conf: psycopg connection kwargs (used only when ``graph`` is None). graph_name:
-        Graph to store messages in (default ``chat_history``). session_node_label:
-        Vertex label for sessions (default ``Session``). message_node_label: Vertex
-        label for messages (default ``Message``). relationship: Edge label linking
-        session to messages
-            (default ``HAS_MESSAGE``).
-        window: If set, ``messages`` returns only the most recent ``window``
-            messages (still in chronological order).
+    @property
+    def reserve(self) -> str:
+        """Reserve ``%s`` sequence numbers for a session, making the session if it is new."""
+        return (
+            f"INSERT INTO {self.sessions} AS s (session_id, next_seq, message_count) "
+            "VALUES (%s, %s, 0) ON CONFLICT (session_id) DO UPDATE "
+            "SET next_seq = s.next_seq + EXCLUDED.next_seq, updated_at = now()"
+        )
+
+    @property
+    def insert(self) -> str:
+        """Insert messages at the numbers just reserved, and count what was inserted."""
+        return (
+            f"WITH inserted AS (INSERT INTO {self.messages} (session_id, seq, message_id, message) "
+            f"SELECT %s, (SELECT next_seq FROM {self.sessions} WHERE session_id = %s) - %s "
+            "+ u.ord - 1, u.id, u.message "
+            "FROM unnest(%s::text[], %s::jsonb[]) WITH ORDINALITY AS u(id, message, ord) "
+            "ON CONFLICT (session_id, message_id) DO NOTHING RETURNING 1) "
+            f"UPDATE {self.sessions} SET message_count = message_count + "
+            "(SELECT count(*) FROM inserted) WHERE session_id = %s"
+        )
+
+    @property
+    def read(self) -> str:
+        return f"SELECT message FROM {self.messages} WHERE session_id = %s ORDER BY seq"
+
+    @property
+    def read_last(self) -> str:
+        return (
+            f"SELECT message FROM (SELECT seq, message FROM {self.messages} "
+            "WHERE session_id = %s ORDER BY seq DESC LIMIT %s) last ORDER BY seq"
+        )
+
+    @property
+    def clear_messages(self) -> str:
+        return f"DELETE FROM {self.messages} WHERE session_id = %s"
+
+    @property
+    def clear_session(self) -> str:
+        return f"DELETE FROM {self.sessions} WHERE session_id = %s"
+
+
+class AgensChatMessageHistory(Component, BaseChatMessageHistory):
+    """The messages of one session, in the order they were added.
+
+    ``window`` limits what :attr:`messages` returns to the last that many. ``engine`` is an
+    :class:`AgensEngine` or a conninfo string; ``graph`` an ``AgensGraph`` whose engine and graph
+    name are used, ``graph_name`` the graph otherwise.
     """
+
+    _what = "chat history"
 
     def __init__(
         self,
         session_id: str,
+        engine: AgensEngine | str | None = None,
         *,
-        graph: Optional[AgensGraph] = None,
-        conf: Optional[Dict[str, Any]] = None,
-        graph_name: str = "chat_history",
-        session_node_label: str = "Session",
-        message_node_label: str = "Message",
-        relationship: str = "HAS_MESSAGE",
-        window: Optional[int] = None,
+        graph: Any = None,
+        graph_name: str | None = None,
+        window: int | None = None,
+        setup: bool = True,
     ) -> None:
-        if graph is None:
-            if conf is None:
-                raise ValueError("AgensChatMessageHistory requires either `graph` or `conf`.")
-            # Nothing here reads the schema, and describing a graph counts every vertex
-            # and every edge in it, for a component that never looks at the answer.
-            graph = AgensGraph(graph_name, conf, create=True, refresh_schema=False)
-        self._graph = graph
+        if not isinstance(session_id, str) or not session_id:
+            raise ValueError("session_id must be a non-empty string")
+        if window is not None and window < 1:
+            raise ValueError(f"window must be positive, not {window}")
         self.session_id = session_id
-        self.session_node_label = session_node_label
-        self.message_node_label = message_node_label
-        self.relationship = relationship
         self.window = window
-        # Whether this session has been given the number it counts from. A session
-        # written before it carried one is counted once, here rather than on every append.
-        self._numbered = False
-
-        # Ensure the labels exist (AgensGraph requires labels before MERGE/CREATE in
-        # some paths; IF NOT EXISTS makes this idempotent).
-        checked_names(
-            session_node_label=session_node_label,
-            message_node_label=message_node_label,
-            relationship=relationship,
+        self._engine, self._owns_engine, self.graph_name = bind(engine, graph, graph_name)
+        self._tables = _Tables(self.graph_name)
+        self._setup_wanted = setup
+        migrations = Migrations(
+            self._tables.schema, "chat_migrations", dict(enumerate(self._tables.migrations))
         )
-        self._graph.create_labels(
-            vertices=(self.session_node_label, self.message_node_label),
-            edges=(self.relationship,),
-        )
-        # A session is its id, and every lookup and append merges on it, so the index
-        # over it is unique -- that is what stops two requests for the same session from
-        # each finding nothing and each creating one. Without it a per-session read is
-        # also a scan of every session.
-        self._graph.ensure_indexes(
-            [
-                DesiredIndex(
-                    label=self.session_node_label,
-                    properties=("id",),
-                    unique=True,
-                    name=f"{self.session_node_label}_id_idx",
-                ),
-                # A conversation is read far more often than it is added to, and it is
-                # read by its last few messages. Keyed this way a window is the first rows
-                # of an index range, whatever the length of the conversation.
-                DesiredIndex(
-                    label=self.message_node_label,
-                    properties=("session", "seq"),
-                    name=f"{self.message_node_label}_session_seq",
-                ),
-            ]
+        self._setup = Setup(
+            self._engine,
+            self.graph_name,
+            migrations.check,
+            migrations.create,
+            key=migrations.key,
         )
 
-    # ---- query builders (shared by sync + async) ----
-
-    def _select_query(self) -> Any:
-        """The session's messages, or the last ``window`` of them.
-
-        Reached by the session a message carries rather than by walking the edges out of
-        the session vertex. Both answer the same question, but the edge walk has to visit
-        every message of the session before it can take the last few, so a window would
-        cost the whole conversation.
-
-        That is what the ``(session, seq)`` index is for. It orders as well as narrows, so
-        a window is the first rows of an index range and nothing is sorted.
-        """
-        order = "ORDER BY m.seq"
-        limit = ""
-        if self.window is not None:
-            # take the last `window` by seq desc, caller re-sorts ascending
-            order = "ORDER BY m.seq DESC"
-            limit = f"LIMIT {int(self.window)}"
-        return sql.SQL(
-            "MATCH (m:{ml}) WHERE m.session = %(sid)s "
-            "RETURN m.data AS data, m.seq AS seq " + order + " " + limit
-        ).format(ml=sql.Identifier(self.message_node_label))
-
-    def _append_query(self) -> Any:
-        """Append messages, numbering them from where the session left off.
-
-        The session carries the next number, so appending costs the messages appended
-        rather than the messages already there. Counting them instead would make each
-        append dearer than the last, which over a conversation is quadratic in its length.
-
-        A session written before it carried the number has its messages counted once to
-        establish it. That is the only time the count is taken.
-
-        One statement, so the number is read and moved on by the statement that writes.
-        Uniqueness on ``(session, seq)`` is not expressible as a property index, which is
-        per label rather than per session, so two appenders committing at the same instant
-        can still collide. Both messages are written; only their order between the two is
-        unsettled.
-        """
-        return sql.SQL(
-            "MERGE (s:{sl} {{id: %(sid)s}}) "
-            "WITH s, coalesce(s.next_seq, 0) AS base "
-            "SET s.next_seq = base + %(added)s, s.named = true "
-            "WITH s, base "
-            "UNWIND %(rows)s AS row "
-            "CREATE (s)-[:{rl}]->(:{ml} "
-            "{{seq: base + row.i, data: row.data, session: %(sid)s}})"
-        ).format(
-            sl=sql.Identifier(self.session_node_label),
-            ml=sql.Identifier(self.message_node_label),
-            rl=sql.Identifier(self.relationship),
-        )
-
-    def _repair_needed_query(self) -> Any:
-        """Whether a session is missing anything, asked of the session alone.
-
-        Two things can be missing, and they arrived at different times: the number the
-        session counts from, and the session name each message carries. A session can have
-        the first and not the second, and that session reads back empty -- every message is
-        there and none says which session it belongs to -- so the two are asked about
-        separately rather than taken as one condition.
-
-        Asked of the session vertex and nothing else. Counting the messages to decide
-        whether they need repairing would cost the whole conversation on every request
-        that builds a history, to answer a yes or no -- so the answer is stored as one: a
-        session repaired, or written already carrying both, says so on itself.
-
-        A read, so the counts are allowed: on this server an aggregate followed by a write
-        clause in one statement is refused with an internal error, which is also why
-        neither repair can be made by the statement that appends.
-        """
-        return sql.SQL(
-            "MATCH (s:{sl} {{id: %(sid)s}}) "
-            "RETURN count(s) AS sessions, count(s.next_seq) AS numbered, "
-            "count(s.named) AS named"
-        ).format(sl=sql.Identifier(self.session_node_label))
-
-    def _count_messages_query(self) -> Any:
-        """How many messages a session holds, for the one that never carried a number.
-
-        Only asked when ``next_seq`` is missing, which is once in the life of a session
-        written before it existed.
-        """
-        return sql.SQL(
-            "MATCH (s:{sl} {{id: %(sid)s}})-[:{rl}]->(m:{ml}) RETURN count(m) AS cnt"
-        ).format(
-            sl=sql.Identifier(self.session_node_label),
-            ml=sql.Identifier(self.message_node_label),
-            rl=sql.Identifier(self.relationship),
-        )
-
-    def _number_query(self) -> Any:
-        """Give a session the number it now carries, counted once."""
-        return sql.SQL(
-            "MATCH (s:{sl} {{id: %(sid)s}}) WHERE s.next_seq IS NULL SET s.next_seq = %(cnt)s"
-        ).format(sl=sql.Identifier(self.session_node_label))
-
-    def _mark_named_query(self) -> Any:
-        """Record that this session's messages carry it, so nobody asks again."""
-        return sql.SQL("MATCH (s:{sl} {{id: %(sid)s}}) SET s.named = true").format(
-            sl=sql.Identifier(self.session_node_label)
-        )
-
-    def _name_session_query(self) -> Any:
-        """Tell a session's messages which session they belong to.
-
-        A message carrying no session of its own is reachable only by the edge from the
-        session vertex, so it is walked once here and named. Asked for separately from the
-        numbering, because a session can carry the number and not the names -- and that is
-        exactly the session whose messages would otherwise not be found.
-        """
-        return sql.SQL(
-            "MATCH (s:{sl} {{id: %(sid)s}})-[:{rl}]->(m:{ml}) SET m.session = %(sid)s"
-        ).format(
-            sl=sql.Identifier(self.session_node_label),
-            ml=sql.Identifier(self.message_node_label),
-            rl=sql.Identifier(self.relationship),
-        )
-
-    def _clear_query(self, delete_session_node: bool) -> Any:
-        if delete_session_node:
-            return sql.SQL(
-                "MATCH (s:{sl} {{id: %(sid)s}}) "
-                "OPTIONAL MATCH (s)-[:{rl}]->(m:{ml}) "
-                "DETACH DELETE s, m"
-            ).format(
-                sl=sql.Identifier(self.session_node_label),
-                ml=sql.Identifier(self.message_node_label),
-                rl=sql.Identifier(self.relationship),
-            )
-        return sql.SQL("MATCH (s:{sl} {{id: %(sid)s}})-[:{rl}]->(m:{ml}) DETACH DELETE m").format(
-            sl=sql.Identifier(self.session_node_label),
-            ml=sql.Identifier(self.message_node_label),
-            rl=sql.Identifier(self.relationship),
-        )
-
-    def _rows_to_messages(self, rows: List[Dict[str, Any]]) -> List[BaseMessage]:
-        if self.window is not None:
-            rows = list(reversed(rows))  # _select_query returned desc; restore order
-        data = []
-        for r in rows:
-            d = r["data"]
-            data.append(d)
-        return messages_from_dict(data)
-
-    @staticmethod
-    def _offsets(messages: Sequence[BaseMessage]) -> List[Dict[str, Any]]:
-        """Each message with its offset from wherever the session's numbering resumes."""
-        return [{"i": i, "data": message_to_dict(m)} for i, m in enumerate(messages)]
+    # -- reading -------------------------------------------------------------------------------
 
     @property
-    def messages(self) -> List[BaseMessage]:
-        rows = self._graph.query(self._select_query(), {"sid": self.session_id})
-        if not rows and not self._numbered:
-            # Nothing came back, which is either a session with no messages or one
-            # written before a message carried the session it belongs to. Asked only
-            # when the read found nothing, so a conversation that has any messages is
-            # still one statement.
-            if self._number_existing_messages():
-                rows = self._graph.query(self._select_query(), {"sid": self.session_id})
-        return self._rows_to_messages(rows)
+    def messages(self) -> list[BaseMessage]:  # type: ignore[override]
+        self._ensure()
+        return self._engine.run(self._read, replay=True)
 
-    def _number_existing_messages(self) -> bool:
-        """Establish the session's next number, for one written before it carried it.
+    async def aget_messages(self) -> list[BaseMessage]:
+        await self._aensure()
+        return await self._engine.arun(self._read, replay=True)
 
-        Done once per history object, and it reads nothing once the number is there. The
-        count and the write are separate statements because on this server an aggregate
-        followed by a write clause in one statement is refused.
-        """
-        if self._numbered:
-            return False
-        self._numbered = True
-        rows = self._graph.query(self._repair_needed_query(), {"sid": self.session_id})
-        if not rows or not int(rows[0]["sessions"]):
-            return False  # no such session yet
-        numbered = int(rows[0]["numbered"])
-        named = int(rows[0]["named"])
-        if numbered and named:
-            return False  # it carries both already
-        count = (
-            int(self._graph.query(self._count_messages_query(), {"sid": self.session_id})[0]["cnt"])
-            if not numbered
-            else 0
-        )
-        with self._graph.transaction():
-            if not named:
-                self._graph.query(self._name_session_query(), {"sid": self.session_id})
-                self._graph.query(self._mark_named_query(), {"sid": self.session_id})
-            if not numbered:
-                self._graph.query(self._number_query(), {"sid": self.session_id, "cnt": count})
-        return True
+    def _read(self) -> Program[list[BaseMessage]]:
+        if self.window is None:
+            found = yield Statement(self._tables.read, (self.session_id,))
+        else:
+            found = yield Statement(self._tables.read_last, (self.session_id, self.window))
+        return messages_from_dict([row[0] for row in found.records])
+
+    # -- writing -------------------------------------------------------------------------------
 
     def add_messages(self, messages: Sequence[BaseMessage]) -> None:
-        if not messages:
+        """Add messages after those already held; one already held, by id, is skipped."""
+        rows = self._rows(messages)
+        if not rows:
             return
-        self._number_existing_messages()
-        self._graph.merging(
-            lambda: self._graph.query(
-                self._append_query(),
-                {
-                    "sid": self.session_id,
-                    "rows": Jsonb(self._offsets(messages)),
-                    "added": len(messages),
-                },
-            )
-        )
-
-    def clear(self, delete_session_node: bool = False) -> None:
-        self._graph.query(self._clear_query(delete_session_node), {"sid": self.session_id})
-
-    # ---- async API ----
-
-    async def aget_messages(self) -> List[BaseMessage]:
-        rows = await self._graph.aquery(self._select_query(), {"sid": self.session_id})
-        if not rows and not self._numbered:
-            if await self._anumber_existing_messages():
-                rows = await self._graph.aquery(self._select_query(), {"sid": self.session_id})
-        return self._rows_to_messages(rows)
-
-    async def _anumber_existing_messages(self) -> bool:
-        """Async sibling of :meth:`_number_existing_messages`."""
-        if self._numbered:
-            return False
-        self._numbered = True
-        rows = await self._graph.aquery(self._repair_needed_query(), {"sid": self.session_id})
-        if not rows or not int(rows[0]["sessions"]):
-            return False
-        numbered = int(rows[0]["numbered"])
-        named = int(rows[0]["named"])
-        if numbered and named:
-            return False
-        count = 0
-        if not numbered:
-            counted = await self._graph.aquery(
-                self._count_messages_query(), {"sid": self.session_id}
-            )
-            count = int(counted[0]["cnt"])
-        async with self._graph.atransaction():
-            if not named:
-                await self._graph.aquery(self._name_session_query(), {"sid": self.session_id})
-                await self._graph.aquery(self._mark_named_query(), {"sid": self.session_id})
-            if not numbered:
-                await self._graph.aquery(
-                    self._number_query(), {"sid": self.session_id, "cnt": count}
-                )
-        return True
+        self._ensure()
+        self._engine.run(lambda: self._add(rows), replay=True)
 
     async def aadd_messages(self, messages: Sequence[BaseMessage]) -> None:
-        if not messages:
+        rows = self._rows(messages)
+        if not rows:
             return
-        await self._anumber_existing_messages()
-        await self._graph.amerging(
-            lambda: self._graph.aquery(
-                self._append_query(),
-                {
-                    "sid": self.session_id,
-                    "rows": Jsonb(self._offsets(messages)),
-                    "added": len(messages),
-                },
+        await self._aensure()
+        await self._engine.arun(lambda: self._add(rows), replay=True)
+
+    def _rows(self, messages: Sequence[BaseMessage]) -> list[tuple[str, dict[str, Any]]]:
+        rows: dict[str, dict[str, Any]] = {}
+        for message in messages:
+            if not isinstance(message, BaseMessage):
+                raise TypeError(f"a message must be a BaseMessage, not {type(message).__name__}")
+            encoded = message_to_dict(message)
+            key = message.id or str(uuid.uuid4())
+            encoded["data"] = {**encoded["data"], "id": key}
+            rows.setdefault(key, encoded)
+        return list(rows.items())
+
+    def _add(self, rows: list[tuple[str, dict[str, Any]]]) -> Program[None]:
+        tables = self._tables
+        count = len(rows)
+        yield Pipeline(
+            (
+                Statement(tables.reserve, (self.session_id, count)),
+                Statement(
+                    tables.insert,
+                    (
+                        self.session_id,
+                        self.session_id,
+                        count,
+                        [key for key, _ in rows],
+                        [Jsonb(message) for _, message in rows],
+                        self.session_id,
+                    ),
+                ),
             )
         )
 
-    async def aclear(self, delete_session_node: bool = False) -> None:
-        await self._graph.aquery(self._clear_query(delete_session_node), {"sid": self.session_id})
+    def clear(self) -> None:
+        """Remove the session's messages, and the session."""
+        self._ensure()
+        self._engine.run(self._clear, replay=True)
 
+    async def aclear(self) -> None:
+        await self._aensure()
+        await self._engine.arun(self._clear, replay=True)
 
-__all__ = ["AgensChatMessageHistory"]
+    def _clear(self) -> Program[None]:
+        yield Pipeline(
+            (
+                Statement(self._tables.clear_messages, (self.session_id,)),
+                Statement(self._tables.clear_session, (self.session_id,)),
+            )
+        )
+
+    # -- setup and closing ---------------------------------------------------------------------
+
+    def _ensure(self) -> None:
+        self._open()
+        if self._setup_wanted:
+            self._setup.ensure()
+
+    async def _aensure(self) -> None:
+        self._open()
+        if self._setup_wanted:
+            await self._setup.aensure()
+
+    def setup(self) -> None:
+        """Make the tables now rather than on the first call."""
+        self._open()
+        self._setup.ensure()
+
+    async def asetup(self) -> None:
+        self._open()
+        await self._setup.aensure()

@@ -1,9 +1,5 @@
-"""LangGraph store implementations backed by AgensGraph."""
+"""LangGraph stores in the companion schema of an AgensGraph graph."""
 
-from langchain_agensgraph.store.agensgraph import (
-    AgensStore,
-    flatten_namespace,
-    unflatten_namespace,
-)
+from langchain_agensgraph.store.agensgraph import AgensIndexConfig, AgensStore, AsyncAgensStore
 
-__all__ = ["AgensStore", "flatten_namespace", "unflatten_namespace"]
+__all__ = ["AgensIndexConfig", "AgensStore", "AsyncAgensStore"]

@@ -1,58 +1,51 @@
-"""LangChain's standard VectorStore conformance suite.
-
-Subclasses the canonical test suite from ``langchain-tests`` (the one
-``langchain-postgres`` already adopts). Validates that ``AgensgraphVector``
-honors the VectorStore protocol: ``add_documents``, ``get_by_ids``,
-``delete``, async siblings, and id-based mutation semantics.
-"""
+"""LangChain's standard vector store suite, in each configuration a store can take."""
 
 from __future__ import annotations
 
-import os
-import uuid
-from typing import Generator
+from collections.abc import AsyncIterator, Iterator
+from typing import Any, ClassVar
 
 import pytest
 from langchain_core.vectorstores import VectorStore
 from langchain_tests.integration_tests.vectorstores import VectorStoreIntegrationTests
 
-from langchain_agensgraph.graphs.agensgraph import AgensGraph
-from langchain_agensgraph.vectorstores.agensgraph_vector import AgensgraphVector
+from langchain_agensgraph._core.engine import AgensEngine
+from langchain_agensgraph.vectorstores import AgensgraphVector
+
+pytestmark = pytest.mark.server
 
 
-def _conf():
-    return {
-        "dbname": os.getenv("AGENSGRAPH_DB"),
-        "user": os.getenv("AGENSGRAPH_USER"),
-        "password": os.getenv("AGENSGRAPH_PASSWORD"),
-        "host": os.getenv("AGENSGRAPH_HOST", "localhost"),
-        "port": int(os.getenv("AGENSGRAPH_PORT", 5432)),
-    }
+@pytest.fixture
+async def engine(dsn: str) -> AsyncIterator[AgensEngine]:
+    """An engine per test, closed on the test's own loop, which its awaiting pools belong to."""
+    made = AgensEngine(dsn)
+    yield made
+    await made.aclose()
 
 
-class TestAgensgraphVectorStandard(VectorStoreIntegrationTests):
-    """Run the langchain-tests vector store conformance suite."""
+class TestAgensgraphVector(VectorStoreIntegrationTests):
+    """An approximate index, built after the first write."""
 
-    @pytest.fixture()
-    def vectorstore(self) -> Generator[VectorStore, None, None]:
-        # Use a unique node label per test class run so concurrent
-        # CI shards do not collide on shared graph state.
-        node_label = f"std_{uuid.uuid4().hex[:8]}"
-        AgensGraph("standardtest", _conf(), create=True)
-        store = AgensgraphVector.from_texts(
-            texts=["bootstrap"],
-            embedding=self.get_embeddings(),
-            graph_name="standardtest",
-            url=os.environ.get("AGENSGRAPH_URL"),
-            node_label=node_label,
-            pre_delete_collection=True,
+    options: ClassVar[dict[str, Any]] = {}
+
+    @pytest.fixture
+    def vectorstore(self, engine: AgensEngine, graph_name: str) -> Iterator[VectorStore]:
+        yield AgensgraphVector(
+            self.get_embeddings(),
+            engine=engine,
+            graph_name=graph_name,
+            create_graph=True,
+            **self.options,
         )
-        # `from_texts` seeds one row; the suite expects an empty store.
-        store.query("MATCH (n) DETACH DELETE n")
-        try:
-            yield store
-        finally:
-            try:
-                store.query("MATCH (n) DETACH DELETE n")
-            except Exception:
-                pass
+
+
+class TestExactSearch(TestAgensgraphVector):
+    options: ClassVar[dict[str, Any]] = {"index": None}
+
+
+class TestHybridSearch(TestAgensgraphVector):
+    options: ClassVar[dict[str, Any]] = {"search_type": "hybrid"}
+
+
+class TestHalfPrecision(TestAgensgraphVector):
+    options: ClassVar[dict[str, Any]] = {"vector_type": "halfvec"}

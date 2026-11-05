@@ -1,59 +1,62 @@
-"""LangChain's standard retriever conformance suite, over AgensVectorRetriever."""
+"""LangChain's standard retriever suite, over each retriever a vector store gives."""
 
-import os
-from typing import Type
+from __future__ import annotations
+
+from collections.abc import AsyncIterator
+from typing import Any
 
 import pytest
+from langchain_core.embeddings import DeterministicFakeEmbedding
 from langchain_core.retrievers import BaseRetriever
 from langchain_tests.integration_tests import RetrieversIntegrationTests
 
-from langchain_agensgraph.retrievers import AgensVectorRetriever
-from langchain_agensgraph.vectorstores.agensgraph_vector import AgensgraphVector
-from tests.integration_tests.fake_embeddings import FakeEmbeddings
+from langchain_agensgraph._core.engine import AgensEngine
+from langchain_agensgraph.retrievers import AgensGraphContextRetriever, AgensVectorRetriever
+from langchain_agensgraph.vectorstores import AgensgraphVector
 
-url = os.environ.get(
-    "AGENSGRAPH_URL",
-    "postgresql://{}:{}@{}:{}/{}".format(
-        os.getenv("AGENSGRAPH_USER"),
-        os.getenv("AGENSGRAPH_PASSWORD"),
-        os.getenv("AGENSGRAPH_HOST", "localhost"),
-        os.getenv("AGENSGRAPH_PORT", 5432),
-        os.getenv("AGENSGRAPH_DB"),
-    ),
-)
+pytestmark = pytest.mark.server
 
-# The suite constructs retrievers with k=1 and k=3, so the store must hold at
-# least three documents for "foo" to return three neighbours.
+# The suite asks for one and for three results, so the store holds more than three.
 TEXTS = ["foo", "bar", "baz", "qux"]
 
-_store: AgensgraphVector = None
 
+class _Seeded(RetrieversIntegrationTests):
+    store: AgensgraphVector
 
-@pytest.fixture(autouse=True, scope="module")
-def seeded_store():
-    global _store
-    _store = AgensgraphVector.from_texts(
-        texts=TEXTS,
-        embedding=FakeEmbeddings(),
-        pre_delete_collection=True,
-        graph_name="retriever_standard",
-        url=url,
-    )
-    yield
-    _store.query("MATCH (n) DETACH DELETE n")
-    _store.close()
-    _store = None
-
-
-class TestAgensVectorRetrieverStandard(RetrieversIntegrationTests):
-    @property
-    def retriever_constructor(self) -> Type[BaseRetriever]:
-        return AgensVectorRetriever
-
-    @property
-    def retriever_constructor_params(self) -> dict:
-        return {"store": _store, "k": 2}
+    @pytest.fixture(autouse=True)
+    async def seeded(self, dsn: str, graph_name: str) -> AsyncIterator[None]:
+        engine = AgensEngine(dsn)
+        store = AgensgraphVector(
+            DeterministicFakeEmbedding(size=6),
+            engine=engine,
+            graph_name=graph_name,
+            create_graph=True,
+        )
+        await store.aadd_texts(TEXTS)
+        type(self).store = store
+        yield
+        await engine.aclose()
 
     @property
     def retriever_query_example(self) -> str:
         return "foo"
+
+
+class TestAgensVectorRetriever(_Seeded):
+    @property
+    def retriever_constructor(self) -> type[BaseRetriever]:
+        return AgensVectorRetriever
+
+    @property
+    def retriever_constructor_params(self) -> dict[str, Any]:
+        return {"vectorstore": self.store, "k": 2}
+
+
+class TestAgensGraphContextRetriever(_Seeded):
+    @property
+    def retriever_constructor(self) -> type[BaseRetriever]:
+        return AgensGraphContextRetriever
+
+    @property
+    def retriever_constructor_params(self) -> dict[str, Any]:
+        return {"vectorstore": self.store, "k": 2}

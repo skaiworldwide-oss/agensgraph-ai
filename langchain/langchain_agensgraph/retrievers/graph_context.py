@@ -1,174 +1,234 @@
-"""Retrieve documents with their bounded graph neighbourhood, in one statement.
+"""Retrieve chunks with the part of the graph around them.
 
-The similarity search finds the seeds; what makes a graph store worth asking is
-what sits *around* them. This retriever appends a variable-length expansion to
-the same statement the seed search runs, so the seeds and every neighbour within
-``expand_by_hops`` arrive in one server round trip -- the expansion runs per
-seed, after the index has already cut the candidates to k, never as one query
-per seed from the client.
+The similarity search finds the seeds; what makes a graph store worth asking is what sits around
+them. After the search, one SQL statement walks out from every seed at once, up to ``hops`` edges
+in either direction, reading at most a cap of edges from each node it reaches, so a hub cannot
+flood the result. The walk reads the graph's ``ag_edge`` and ``ag_vertex``, which every edge and
+vertex label inherits from, or one relationship type's own table.
+
+Each document's metadata carries the context: ``_context_nodes_`` (id, label and properties of
+each neighbour) and ``_context_rels_`` (type, start, end and properties of each edge), each
+deduplicated and cut to its cap, beside ``_seed_id_`` and ``_seed_label_`` naming the chunk's own
+vertex. :func:`render_graph_context` writes them into the text for a prompt.
+
+From 2.18.6 a read through ``ag_vertex`` or ``ag_edge`` checks the reader's grants on every label,
+so a role missing one is refused; the refusal names the labels to grant.
 """
 
 from __future__ import annotations
 
-import re
-from typing import Any, Dict, List, Optional
+from collections.abc import Sequence
+from typing import Any
 
+import psycopg
+from langchain_core.callbacks import (
+    AsyncCallbackManagerForRetrieverRun,
+    CallbackManagerForRetrieverRun,
+)
 from langchain_core.documents import Document
-from pydantic import Field, PrivateAttr, model_validator
+from pydantic import Field
 
+from langchain_agensgraph._core.names import checked, ident, qualified
+from langchain_agensgraph._core.program import Program, Statement
+from langchain_agensgraph.errors import AgensGraphError
 from langchain_agensgraph.retrievers.vector import AgensVectorRetriever
-from langchain_agensgraph.vectorstores.agensgraph_vector import IndexType, SearchType
-
-_RELATIONSHIP_TYPE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
-
-# Every neighbour within N hops is the far end of some walk of length 1..N, and
-# every edge of the neighbourhood is the LAST edge of some walk of at most N --
-# so collecting the walk ends and each walk's last edge, DISTINCT, yields the
-# complete deduplicated context without unwinding paths into rows. OPTIONAL
-# keeps a neighbourless seed alive: collect() skips its NULL, leaving [].
-# The slice bounds are query parameters; the hop bound cannot be (a
-# variable-length pattern takes only literal bounds), so it is inlined after
-# validation. Braces other than the store's own format keys must not appear.
-_EXPANSION = """
-    OPTIONAL MATCH ({anchor})-[rels{rel_type}*1..{hops}]-(peer)
-    WITH node, score, id({anchor}) AS seed_id, label({anchor}) AS seed_label,
-         collect(DISTINCT CASE WHEN peer IS NULL THEN NULL ELSE
-             jsonb_build_object('id', id(peer), 'label', label(peer),
-                 'properties', properties(peer) ||
-                 jsonb_build_object({embedding_property_literal}, Null))
-         END)[0..%(max_context_nodes)s] AS ctx_nodes,
-         collect(DISTINCT CASE WHEN rels IS NULL THEN NULL ELSE
-             jsonb_build_object('type', label(rels[-1]),
-                 'start', start_id(rels[-1]), 'end', end_id(rels[-1]),
-                 'properties', properties(rels[-1]))
-         END)[0..%(max_context_rels)s] AS ctx_rels
-    RETURN node.{text_property} AS text, score, node.__id__ AS doc_id,
-           node || jsonb_build_object({text_property_literal}, Null,
-               {embedding_property_literal}, Null, '__id__', Null,
-               '_seed_id_', seed_id, '_seed_label_', seed_label,
-               '_context_nodes_', ctx_nodes, '_context_rels_', ctx_rels) AS metadata
-"""
-
-# After the server-side rank fusion `node` is a properties map, not a vertex, so
-# it cannot anchor a pattern; the seed is found again by the identity property
-# the store writes. OPTIONAL, so a row the re-match misses keeps its seed and
-# carries an empty context rather than vanishing.
-_HYBRID_ANCHOR = """
-    OPTIONAL MATCH (seed:{label}) WHERE seed.__id__ = node.__id__
-"""
 
 
-def build_expansion_query(
-    *, hops: int, hybrid: bool, relationship_type: Optional[str] = None
-) -> str:
-    """The retrieval query that fetches each seed's bounded neighbourhood.
+def neighbourhood(graph: str, relationship_type: str | None) -> str:
+    """The walk from ``%s`` seed ids, at most ``%s`` edges per node, at most ``%s`` hops deep,
+    cut to the first ``%s`` nodes and ``%s`` edges of each seed.
 
-    ``hops`` is inlined -- a variable-length bound must be a literal -- so it is
-    range-checked here as well as by the retriever's field. ``relationship_type``
-    is inlined into the pattern and therefore accepts only a plain identifier;
-    one type at most, since the server takes no alternation in a
-    variable-length pattern.
+    One row per step: seed, node reached, its label and properties, the edge taken, its start,
+    end, label and properties, in the order seed, depth, node, edge. A seed's first nodes and
+    edges are those that order reaches first, which are the ones a reader keeping that many of
+    each keeps; a step is returned only when its node or its edge is one of them, so the vertex
+    of every other step is never read.
     """
-    if not 1 <= int(hops) <= 3:
-        raise ValueError("expand_by_hops must be between 1 and 3")
-    if relationship_type is not None and not _RELATIONSHIP_TYPE.match(relationship_type):
-        raise ValueError(
-            "relationship_type must be a plain identifier "
-            "(letters, digits and underscores, not starting with a digit); "
-            f"got {relationship_type!r}"
+    edges = (
+        qualified(graph, relationship_type)
+        if relationship_type is not None
+        else f"{ident(graph)}.ag_edge"
+    )
+    return (
+        "WITH RECURSIVE walk(seed, node, depth, edge, estart, eend, eoid, eprops) AS ("
+        "SELECT s, s, 0, NULL::graphid, NULL::graphid, NULL::graphid, NULL::oid, NULL::jsonb "
+        "FROM unnest(%s::graphid[]) AS s "
+        "UNION ALL "
+        'SELECT w.seed, n.other, w.depth + 1, n.id, n.start, n."end", n.tableoid, n.properties '
+        "FROM walk w, LATERAL ("
+        'SELECT e.id, e.start, e."end", e.tableoid, e.properties, '
+        'CASE WHEN e.start = w.node THEN e."end" ELSE e.start END AS other '
+        f'FROM {edges} e WHERE e.start = w.node OR e."end" = w.node '
+        "ORDER BY e.id LIMIT %s) n "
+        "WHERE w.depth < %s), "
+        "steps AS (SELECT * FROM walk WHERE depth > 0), "
+        "nodes AS (SELECT seed, node FROM ("
+        "SELECT seed, node, row_number() OVER (PARTITION BY seed ORDER BY min(depth), node) AS n "
+        "FROM steps WHERE node <> seed GROUP BY seed, node) ranked WHERE n <= %s), "
+        "edges AS (SELECT seed, edge FROM ("
+        "SELECT seed, edge, row_number() OVER (PARTITION BY seed ORDER BY depth, node, edge) AS n "
+        "FROM (SELECT DISTINCT ON (seed, edge) seed, edge, depth, node FROM steps "
+        "ORDER BY seed, edge, depth, node) first) ranked WHERE n <= %s), "
+        "kept AS (SELECT s.* FROM steps s "
+        "WHERE EXISTS (SELECT 1 FROM nodes k WHERE k.seed = s.seed AND k.node = s.node) "
+        "OR EXISTS (SELECT 1 FROM edges k WHERE k.seed = s.seed AND k.edge = s.edge)) "
+        "SELECT w.seed, w.node, vl.labname, v.properties, w.edge, w.estart, w.eend, "
+        "el.labname, w.eprops "
+        f"FROM kept w JOIN {ident(graph)}.ag_vertex v ON v.id = w.node "
+        "JOIN ag_label vl ON vl.relid = v.tableoid "
+        "LEFT JOIN ag_label el ON el.relid = w.eoid "
+        "ORDER BY w.seed, w.depth, w.node, w.edge"
+    )
+
+
+UNGRANTED = (
+    "SELECT l.labname FROM ag_label l JOIN ag_graph g ON g.oid = l.graphid "
+    "WHERE g.graphname = %s AND NOT has_table_privilege(l.relid, 'SELECT') ORDER BY 1"
+)
+
+
+def walk(
+    graph: str,
+    seeds: Sequence[Any],
+    *,
+    hops: int,
+    cap: int,
+    nodes: int,
+    rels: int,
+    relationship_type: str | None,
+) -> Program[list[tuple[Any, ...]]]:
+    """The walk's steps (:func:`neighbourhood`); a role refused a label is told which."""
+    if not seeds:
+        return []
+    try:
+        result = yield Statement(
+            neighbourhood(graph, relationship_type),
+            (list(seeds), cap, hops, nodes, rels),
+            may_fail=True,
         )
-    rel_type = f':"{relationship_type}"' if relationship_type else ""
-    body = _EXPANSION.replace("{hops}", str(int(hops)))
-    body = body.replace("{rel_type}", rel_type)
-    if hybrid:
-        return _HYBRID_ANCHOR + body.replace("{anchor}", "seed")
-    return body.replace("{anchor}", "node")
+    except psycopg.errors.InsufficientPrivilege as refused:
+        missing = yield Statement(UNGRANTED, (graph,))
+        labels = ", ".join(str(row[0]) for row in missing.records)
+        raise AgensGraphError(
+            f"reading the graph around a chunk needs SELECT on every label of {graph!r}; "
+            f"this role lacks it on: {labels or 'a label it cannot see'}"
+        ) from refused
+    return list(result.records)
 
 
 class AgensGraphContextRetriever(AgensVectorRetriever):
-    """Similarity seeds plus their neighbourhood, one round trip.
+    """Similarity seeds and their neighbourhood within ``hops`` edges.
 
-    Each returned document is a seed the vector (or hybrid) search chose, and
-    its metadata carries the seed's neighbourhood within ``expand_by_hops``:
-    ``_context_nodes_`` (id, label, properties per neighbour) and
-    ``_context_rels_`` (type, start, end, properties per edge), both
-    deduplicated per seed and cut to ``max_context_nodes`` /
-    ``max_context_rels``. The caps bound the *payload*; the traversal itself is
-    bounded by the hop count, which is why the hop bound stops at three and a
-    ``relationship_type`` filter exists for densely connected graphs.
-
-    This retriever builds its own retrieval query; pass a custom one to
-    :class:`AgensVectorRetriever` instead.
-
-    Example:
-        .. code-block:: python
-
-            retriever = AgensGraphContextRetriever(
-                store=store,
-                k=4,
-                expand_by_hops=2,
-                document_formatter=render_graph_context,
-            )
-            docs = retriever.invoke("who reviewed the failed deploy?")
+    ``max_context_nodes`` and ``max_context_rels`` bound what each document carries, and also how
+    many edges are read from any one node. ``relationship_type`` walks only edges of that type.
+    This retriever reads the graph itself, and its seeds are the store's hits as they are, past
+    any retrieval query the store holds; for a Cypher retrieval query of your own, use
+    :class:`AgensVectorRetriever`.
     """
 
-    expand_by_hops: int = Field(default=1, ge=1, le=3)
+    hops: int = Field(default=1, ge=1, le=3)
     max_context_nodes: int = Field(default=20, ge=1)
     max_context_rels: int = Field(default=20, ge=1)
-    relationship_type: Optional[str] = None
+    relationship_type: str | None = None
 
-    _expansion_query: str = PrivateAttr(default="")
+    def _seeds(self, kwargs: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        if self.retrieval_query is not None or "retrieval_query" in kwargs:
+            raise ValueError(
+                "AgensGraphContextRetriever reads the graph itself; use AgensVectorRetriever "
+                "with a retrieval query of your own"
+            )
+        if self.relationship_type is not None:
+            checked(self.relationship_type, "relationship type")
+        return self._arguments(kwargs)
 
-    @model_validator(mode="after")
-    def _build_own_query(self) -> "AgensGraphContextRetriever":
-        if self.retrieval_query is not None:
-            raise ValueError(
-                "AgensGraphContextRetriever builds its own retrieval query; "
-                "use AgensVectorRetriever for a custom one."
-            )
-        if self.store._index_type != IndexType.NODE:
-            raise ValueError(
-                "Graph context expands from vertices; this store searches a relationship index."
-            )
-        self._expansion_query = build_expansion_query(
-            hops=self.expand_by_hops,
-            hybrid=self.store.search_type == SearchType.HYBRID,
+    def _get_relevant_documents(
+        self, query: str, *, run_manager: CallbackManagerForRetrieverRun, **kwargs: Any
+    ) -> list[Document]:
+        k, search = self._seeds(kwargs)
+        where = search.pop("filter", None)
+        store = self.vectorstore
+        # The seeds are the store's own hits, never read through a retrieval query it may hold.
+        hits = store._search_hits(query, k, where, retrieval_query=None, **search)
+        rows = store.engine.run(lambda: self._walk(hits), graph=store.graph_name, replay=True)
+        return self._finalize(self._with_context(hits, rows))
+
+    async def _aget_relevant_documents(
+        self, query: str, *, run_manager: AsyncCallbackManagerForRetrieverRun, **kwargs: Any
+    ) -> list[Document]:
+        k, search = self._seeds(kwargs)
+        where = search.pop("filter", None)
+        store = self.vectorstore
+        hits = await store._asearch_hits(query, k, where, retrieval_query=None, **search)
+        rows = await store.engine.arun(
+            lambda: self._walk(hits), graph=store.graph_name, replay=True
+        )
+        return self._finalize(self._with_context(hits, rows))
+
+    def _walk(self, hits: list[tuple[Document, float, Any]]) -> Program[list[tuple[Any, ...]]]:
+        return walk(
+            self.vectorstore.graph_name,
+            [gid for _, _, gid in hits],
+            hops=self.hops,
+            cap=self.max_context_rels,
+            nodes=self.max_context_nodes,
+            rels=self.max_context_rels,
             relationship_type=self.relationship_type,
         )
-        return self
 
-    def _effective_retrieval_query(self) -> Optional[str]:
-        return self._expansion_query
-
-    def _search_kwargs(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        if "retrieval_query" in kwargs:
-            raise ValueError(
-                "AgensGraphContextRetriever builds its own retrieval query; "
-                "use AgensVectorRetriever for a custom one."
+    def _with_context(
+        self, hits: list[tuple[Document, float, Any]], rows: list[tuple[Any, ...]]
+    ) -> list[tuple[Document, float]]:
+        nodes: dict[str, dict[str, dict[str, Any]]] = {}
+        rels: dict[str, dict[str, dict[str, Any]]] = {}
+        for seed, node, label, properties, edge, start, end, edge_label, edge_props in rows:
+            seed_nodes = nodes.setdefault(str(seed), {})
+            seed_rels = rels.setdefault(str(seed), {})
+            if str(node) != str(seed) and len(seed_nodes) < self.max_context_nodes:
+                seed_nodes.setdefault(
+                    str(node), {"id": str(node), "label": label, "properties": properties or {}}
+                )
+            if edge is not None and len(seed_rels) < self.max_context_rels:
+                seed_rels.setdefault(
+                    str(edge),
+                    {
+                        "type": edge_label,
+                        "start": str(start),
+                        "end": str(end),
+                        "properties": edge_props or {},
+                    },
+                )
+        out = []
+        for document, score, gid in hits:
+            seed = str(gid)
+            metadata = {
+                **document.metadata,
+                "_seed_id_": seed,
+                "_seed_label_": self.vectorstore.label,
+                "_context_nodes_": list(nodes.get(seed, {}).values()),
+                "_context_rels_": list(rels.get(seed, {}).values()),
+            }
+            out.append(
+                (
+                    Document(id=document.id, page_content=document.page_content, metadata=metadata),
+                    score,
+                )
             )
-        merged = super()._search_kwargs(kwargs)
-        merged["params"] = {
-            **(merged["params"] or {}),
-            "max_context_nodes": self.max_context_nodes,
-            "max_context_rels": self.max_context_rels,
-        }
-        return merged
+        return out
 
 
 def render_graph_context(doc: Document) -> Document:
-    """A ready-made ``document_formatter``: the context, written into the text.
+    """A ready-made ``document_formatter``: the context, written under the chunk's text.
 
-    The structured context stays in metadata; this renders a readable account of
-    it under the seed's own text, for handing straight to a prompt. A neighbour
-    is named by its ``name``, ``title`` or ``text`` property, whichever it has
-    first, else by its id; an edge names both ends the same way.
+    The structured context stays in the metadata. A neighbour is named by its ``name``, ``title``
+    or ``text`` property, whichever it has first, else by its id; an edge names both ends the same
+    way, and the chunk itself is named for the edges that reach it.
     """
-    nodes: List[Dict[str, Any]] = doc.metadata.get("_context_nodes_") or []
-    rels: List[Dict[str, Any]] = doc.metadata.get("_context_rels_") or []
+    nodes: list[dict[str, Any]] = doc.metadata.get("_context_nodes_") or []
+    rels: list[dict[str, Any]] = doc.metadata.get("_context_rels_") or []
     if not nodes and not rels:
         return doc
 
-    def name_of(props: Dict[str, Any], fallback: Any) -> str:
+    def name_of(props: dict[str, Any], fallback: Any) -> str:
         for key in ("name", "title", "text"):
             value = props.get(key)
             if isinstance(value, str) and value:
@@ -180,9 +240,6 @@ def render_graph_context(doc: Document) -> Document:
         for node in nodes
     }
     lines = [f"- {name}" for name in named.values()]
-    # The seed is named for the edges that point back at it, and not listed among
-    # them: it is the document the context belongs to, not one of its neighbours.
-    # Without a name an edge into it would read as a bare graph id.
     seed_id = doc.metadata.get("_seed_id_")
     if seed_id is not None:
         own = name_of(doc.metadata, doc.id or "this document")

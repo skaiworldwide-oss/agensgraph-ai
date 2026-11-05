@@ -18,11 +18,7 @@ collect_ignore = [
     "test_indexes.py",
     "test_lifecycle.py",
     "test_retrievers.py",
-    "test_retrievers_standard.py",
     "test_shared_state.py",
     "test_store.py",
     "test_text2cypher_dataset.py",
-    "test_vectorstore.py",
-    "test_vectorstore_standard.py",
-    "test_vectorstore_v02.py",
 ]

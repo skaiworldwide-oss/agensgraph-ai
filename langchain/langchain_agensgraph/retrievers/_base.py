@@ -1,15 +1,8 @@
-"""What every retriever in this package shares.
-
-A retriever here is a thin, typed face over one server round trip: the subclass
-builds and runs its statement, and this base stamps what came back. Both the
-blocking and the awaiting template methods are implemented by every subclass
-directly -- none of them falls back to running the blocking path in an executor,
-so concurrent retrievals overlap on the driver's own async connection.
-"""
+"""What every retriever in this package shares: a result count, scores, a formatter."""
 
 from __future__ import annotations
 
-from typing import Callable, List, Optional, Tuple
+from collections.abc import Callable, Iterable
 
 from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
@@ -17,25 +10,26 @@ from pydantic import Field
 
 
 class _AgensRetrieverBase(BaseRetriever):
-    """Shared shape: a result count, score stamping, and a formatter hook.
+    """``k`` documents per retrieval, each carrying its score in ``metadata["score"]``.
 
-    ``k`` is the number of documents a retrieval returns; a call may override it
-    with ``retriever.invoke(query, k=...)`` and the override is never clamped by
-    the constructor's value. ``document_formatter`` reshapes each finished
-    document -- rendering graph context into ``page_content``, say -- after the
-    score and provenance are stamped.
+    A call may pass ``k=`` and other search arguments to ``invoke``; they win over the
+    retriever's own. ``document_formatter`` reshapes each finished document -- rendering graph
+    context into the text, say. Every document handed out is a new one, so nothing the store or a
+    cache holds is changed.
     """
 
     k: int = Field(default=4, ge=1)
-    document_formatter: Optional[Callable[[Document], Document]] = None
+    document_formatter: Callable[[Document], Document] | None = None
 
-    def _finalize(self, hits: List[Tuple[Document, float]]) -> List[Document]:
-        """Stamp each hit with its score and which retriever produced it."""
-        docs: List[Document] = []
-        for doc, score in hits:
-            doc.metadata["score"] = score
-            doc.metadata["__retriever"] = type(self).__name__
+    def _finalize(self, hits: Iterable[tuple[Document, float]]) -> list[Document]:
+        documents = []
+        for document, score in hits:
+            stamped = Document(
+                id=document.id,
+                page_content=document.page_content,
+                metadata={**document.metadata, "score": score},
+            )
             if self.document_formatter is not None:
-                doc = self.document_formatter(doc)
-            docs.append(doc)
-        return docs
+                stamped = self.document_formatter(stamped)
+            documents.append(stamped)
+        return documents

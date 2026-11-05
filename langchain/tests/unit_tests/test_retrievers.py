@@ -1,63 +1,48 @@
-"""The pure pieces of the retrievers: query building and rendering."""
+"""The retrievers' pure parts: the graph walk's statement, arguments, and rendering."""
+
+from collections.abc import Iterator
 
 import pytest
 from langchain_core.documents import Document
+from langchain_core.embeddings import DeterministicFakeEmbedding
 
-from langchain_agensgraph.retrievers.graph_context import (
-    build_expansion_query,
-    render_graph_context,
-)
+from langchain_agensgraph.retrievers import AgensGraphContextRetriever, AgensVectorRetriever
+from langchain_agensgraph.retrievers.graph_context import neighbourhood, render_graph_context
+from langchain_agensgraph.vectorstores import AgensgraphVector
 
 
-class TestBuildExpansionQuery:
-    def test_hops_are_inlined_as_a_literal_bound(self) -> None:
-        query = build_expansion_query(hops=2, hybrid=False)
-        assert "*1..2" in query
-        assert "{hops}" not in query
-
-    def test_the_vector_variant_expands_from_the_seed_vertex(self) -> None:
-        query = build_expansion_query(hops=1, hybrid=False)
-        assert "OPTIONAL MATCH (node)-[rels*1..1]-(peer)" in query
-        assert "__id__ = node.__id__" not in query
-
-    def test_the_hybrid_variant_finds_its_seed_again_first(self) -> None:
-        query = build_expansion_query(hops=1, hybrid=True)
-        assert "OPTIONAL MATCH (seed:{label}) WHERE seed.__id__ = node.__id__" in query
-        assert "OPTIONAL MATCH (seed)-[rels*1..1]-(peer)" in query
-
-    def test_a_relationship_type_narrows_the_pattern(self) -> None:
-        query = build_expansion_query(hops=1, hybrid=False, relationship_type="knows")
-        assert '-[rels:"knows"*1..1]-' in query
-
-    def test_the_caps_are_parameters_not_literals(self) -> None:
-        query = build_expansion_query(hops=1, hybrid=False)
-        assert "%(max_context_nodes)s" in query
-        assert "%(max_context_rels)s" in query
-
-    def test_the_seed_identity_travels_with_the_context(self) -> None:
-        # An edge can point at the seed itself, and the seed is never among
-        # its own neighbours -- the id and label are what let a renderer name it.
-        vector = build_expansion_query(hops=1, hybrid=False)
-        assert "id(node) AS seed_id" in vector
-        assert "label(node) AS seed_label" in vector
-        hybrid = build_expansion_query(hops=1, hybrid=True)
-        assert "id(seed) AS seed_id" in hybrid
-        assert "label(seed) AS seed_label" in hybrid
-
-    @pytest.mark.parametrize("hops", [0, 4, -1])
-    def test_out_of_range_hops_are_refused(self, hops: int) -> None:
-        with pytest.raises(ValueError, match="between 1 and 3"):
-            build_expansion_query(hops=hops, hybrid=False)
-
-    @pytest.mark.parametrize(
-        "rel_type",
-        ['a"b', "a-b", "1abc", "", 'x"]->() MATCH (m) DETACH DELETE m //'],
+@pytest.fixture
+def store() -> Iterator[AgensgraphVector]:
+    made = AgensgraphVector(
+        DeterministicFakeEmbedding(size=4), engine="host=nowhere dbname=none", graph_name="g"
     )
-    def test_a_type_that_is_not_an_identifier_is_refused(self, rel_type: str) -> None:
-        # The type is inlined into the pattern, so anything but a plain
-        # identifier is refused outright rather than quoted heroically.
-        with pytest.raises(ValueError, match="plain identifier"):
-            build_expansion_query(hops=1, hybrid=False, relationship_type=rel_type)
+    yield made
+    made.close()
+
+
+def test_the_walk_reads_every_edge_label_or_one() -> None:
+    assert '"g".ag_edge e' in neighbourhood("g", None)
+    assert '"g"."knows" e' in neighbourhood("g", "knows")
+    assert "LIMIT %s) n WHERE w.depth < %s" in neighbourhood("g", None)
+
+
+def test_the_call_wins_over_the_search_kwargs_which_win_over_the_field(
+    store: AgensgraphVector,
+) -> None:
+    retriever = AgensVectorRetriever(
+        vectorstore=store, k=1, search_kwargs={"k": 3, "filter": {"a": 1}}
+    )
+    assert retriever._arguments({}) == (3, {"filter": {"a": 1}})
+    assert retriever._arguments({"k": 5, "filter": None}) == (5, {"filter": None})
+    assert AgensVectorRetriever(vectorstore=store, k=2)._arguments({}) == (2, {})
+
+
+def test_the_graph_context_retriever_reads_the_graph_itself(store: AgensgraphVector) -> None:
+    retriever = AgensGraphContextRetriever(vectorstore=store, retrieval_query="RETURN 1")
+    with pytest.raises(ValueError, match="reads the graph itself"):
+        retriever._seeds({})
+    with pytest.raises(ValueError):
+        AgensGraphContextRetriever(vectorstore=store, hops=4)
 
 
 class TestRenderGraphContext:
@@ -88,8 +73,8 @@ class TestRenderGraphContext:
         assert "- person:Ada" in rendered.page_content
         assert "- person:3.2" in rendered.page_content
         assert "- person:Ada -[knows]-> person:3.2" in rendered.page_content
-        # The edge into the seed names the seed by its own label, not by a
-        # graph id -- and the seed is not listed among its own neighbours.
+        # The edge into the seed names the seed by its own label, not by a graph id, and the
+        # seed is not listed among its own neighbours.
         assert "- person:Ada -[wrote]-> doc:The Seed" in rendered.page_content
         assert "- doc:The Seed\n" not in rendered.page_content
         assert rendered.id == "d1"

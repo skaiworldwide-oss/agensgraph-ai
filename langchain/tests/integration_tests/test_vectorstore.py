@@ -1,1427 +1,691 @@
-"""Test AgensgraphVector functionality."""
+"""The vector store against a server: writes, reads, filters, searches, the index, lifecycle."""
 
-import os
-from hashlib import md5
-from math import isclose
-from typing import Any, Dict, List, cast
+from __future__ import annotations
 
+import numpy as np
+import psycopg
 import pytest
+from agensgraph import Jsonb
+from agensgraph.errors import StaleVectorStorage
 from langchain_core.documents import Document
+from langchain_core.embeddings import DeterministicFakeEmbedding
 from psycopg import sql
-from yaml import safe_load
+from psycopg.conninfo import make_conninfo
 
-from langchain_agensgraph.graphs.agensgraph import AgensGraph
-from langchain_agensgraph.vectorstores.agensgraph_vector import (
+from langchain_agensgraph._core.engine import AgensEngine
+from langchain_agensgraph._core.program import Program, Statement
+from langchain_agensgraph.errors import SchemaMismatchError, UnknownLabel
+from langchain_agensgraph.retrievers import (
+    AgensGraphContextRetriever,
+    AgensVectorRetriever,
+    render_graph_context,
+)
+from langchain_agensgraph.retrievers.graph_context import walk
+from langchain_agensgraph.roles import render_grants
+from langchain_agensgraph.vectorstores import (
     AgensgraphVector,
+    DistanceStrategy,
+    KeywordConfig,
     SearchType,
 )
-from langchain_agensgraph.vectorstores.utils import DistanceStrategy
-from tests.integration_tests.fake_embeddings import (
-    AngularTwoDimensionalEmbeddings,
-    FakeEmbeddings,
-)
-from tests.integration_tests.fixtures.filtering_test_cases import (
-    DOCUMENTS,
-    TYPE_1_FILTERING_TEST_CASES,
-    TYPE_2_FILTERING_TEST_CASES,
-    TYPE_3_FILTERING_TEST_CASES,
-    TYPE_4_FILTERING_TEST_CASES,
-)
+from langchain_agensgraph.vectorstores.config import IndexConfig
+from tests import datagen
+from tests.filter_oracle import matches
+from tests.goldens.golden import FixedEmbeddings
+from tests.integration_tests.fixtures import filtering_test_cases as cases
+
+pytestmark = pytest.mark.server
+
+DIMS = 8
+FILTERS = [
+    {"s10": 3},
+    {"lang": {"$in": ["ko", "ur"]}},
+    {"lang": {"$nin": ["ko"]}},
+    {"year": {"$gte": 2020}},
+    {"price": {"$lt": 10}},
+    {"price": {"$between": [10, 20]}},
+    {"flag": True},
+    {"note": {"$exists": True}},
+    {"note": {"$exists": False}},
+    {"lang": {"$ne": "en"}},
+    {"note": {"$like": "n1%"}},
+    {"note": {"$ilike": "N2_"}},
+    {"$and": [{"s10": 3}, {"year": {"$lt": 2010}}]},
+    {"$or": [{"s1": 7}, {"s1": 8}]},
+    {"$not": {"flag": True}},
+    {"year": {"$gt": "2000"}},
+]
 
 
-def _no_id(docs):
-    """Drop ``Document.id`` from results.
-
-    These tests pre-date 0.2.0's ``Document.id`` population (which the
-    LangChain conformance suite requires). Comparing on page_content +
-    metadata only preserves the original test intent.
-    """
-    out = []
-    for item in docs:
-        if isinstance(item, tuple):
-            d, s = item
-            out.append((Document(page_content=d.page_content, metadata=d.metadata), s))
-        else:
-            out.append(Document(page_content=item.page_content, metadata=item.metadata))
-    return out
+@pytest.fixture
+def chunks() -> list[datagen.Chunk]:
+    return datagen.chunks(200, DIMS, seed=11)
 
 
-OS_TOKEN_COUNT = 1536
-
-texts = ["foo", "bar", "baz", "It is the end of the world. Take shelter!"]
-
-conf = {
-    "dbname": os.getenv("AGENSGRAPH_DB"),
-    "user": os.getenv("AGENSGRAPH_USER"),
-    "password": os.getenv("AGENSGRAPH_PASSWORD"),
-    "host": os.getenv("AGENSGRAPH_HOST", "localhost"),
-    "port": int(os.getenv("AGENSGRAPH_PORT", 5432)),
-}
-
-url = os.environ.get(
-    "AGENSGRAPH_URL",
-    f"postgresql://{conf['user']}:{conf['password']}@{conf['host']}:{conf['port']}/{conf['dbname']}",
-)
+@pytest.fixture
+def embedding(chunks: list[datagen.Chunk]) -> FixedEmbeddings:
+    return FixedEmbeddings({c.text: c.embedding for c in chunks}, DIMS)
 
 
-def drop_vector_indexes(store: AgensgraphVector) -> None:
-    """Cleanup all vector indexes"""
-    for index in store._vector_indexes():
-        store.query(f"""DROP PROPERTY INDEX "{index["name"]}" CASCADE""")
-
-    store.query("MATCH (n) DETACH DELETE n;")
-
-
-def drop_fulltext_indexes(store: AgensgraphVector) -> None:
-    """Cleanup all keyword indexes"""
-    for index in store._text_indexes():
-        store.query(f"""DROP PROPERTY INDEX "{index["name"]}" CASCADE""")
-
-    store.query("MATCH (n) DETACH DELETE n;")
-
-
-class FakeEmbeddingsWithOsDimension(FakeEmbeddings):
-    """Fake embeddings functionality for testing."""
-
-    def embed_documents(self, embedding_texts: List[str]) -> List[List[float]]:
-        """Return simple embeddings."""
-        return [
-            [float(1.0)] * (OS_TOKEN_COUNT - 1) + [float(i + 1)]
-            for i in range(len(embedding_texts))
-        ]
-
-    def embed_query(self, text: str) -> List[float]:
-        """Return simple embeddings."""
-        return [float(1.0)] * (OS_TOKEN_COUNT - 1) + [float(texts.index(text) + 1)]
-
-
-def test_agensgraph_vector() -> None:
-    """Test end to end construction and search."""
-    docsearch = AgensgraphVector.from_texts(
-        texts=texts,
-        embedding=FakeEmbeddingsWithOsDimension(),
-        url=url,
-        pre_delete_collection=True,
-    )
-    output = docsearch.similarity_search("foo", k=1)
-    assert _no_id(output) == [Document(page_content="foo")]
-
-    drop_vector_indexes(docsearch)
-
-
-def test_agensgraph_vector_euclidean() -> None:
-    """Test euclidean distance"""
-    docsearch = AgensgraphVector.from_texts(
-        texts=texts,
-        embedding=FakeEmbeddingsWithOsDimension(),
-        url=url,
-        pre_delete_collection=True,
-        distance_strategy=DistanceStrategy.EUCLIDEAN_DISTANCE,
-    )
-    output = docsearch.similarity_search("foo", k=1)
-    assert _no_id(output) == [Document(page_content="foo")]
-
-    drop_vector_indexes(docsearch)
-
-
-def test_agensgraph_vector_embeddings() -> None:
-    """Test end to end construction with embeddings and search."""
-    text_embeddings = FakeEmbeddingsWithOsDimension().embed_documents(texts)
-    text_embedding_pairs = list(zip(texts, text_embeddings))
-    docsearch = AgensgraphVector.from_embeddings(
-        text_embeddings=text_embedding_pairs,
-        embedding=FakeEmbeddingsWithOsDimension(),
-        url=url,
-        pre_delete_collection=True,
-    )
-    output = docsearch.similarity_search("foo", k=1)
-    assert _no_id(output) == [Document(page_content="foo")]
-
-    drop_vector_indexes(docsearch)
-
-
-def test_agensgraph_vector_catch_wrong_index_name() -> None:
-    """Test if index name is misspelled, but node label and property are correct."""
-    text_embeddings = FakeEmbeddingsWithOsDimension().embed_documents(texts)
-    text_embedding_pairs = list(zip(texts, text_embeddings))
-    AgensgraphVector.from_embeddings(
-        text_embeddings=text_embedding_pairs,
-        embedding=FakeEmbeddingsWithOsDimension(),
-        url=url,
-        pre_delete_collection=True,
-    )
-    existing = AgensgraphVector.from_existing_index(
-        embedding=FakeEmbeddingsWithOsDimension(),
-        url=url,
-        index_name="test",
-    )
-    output = existing.similarity_search("foo", k=1)
-    assert _no_id(output) == [Document(page_content="foo")]
-
-    drop_vector_indexes(existing)
-
-
-def test_agensgraph_vector_catch_wrong_node_label() -> None:
-    """Test if node label is misspelled, but index name is correct."""
-    text_embeddings = FakeEmbeddingsWithOsDimension().embed_documents(texts)
-    text_embedding_pairs = list(zip(texts, text_embeddings))
-    AgensgraphVector.from_embeddings(
-        text_embeddings=text_embedding_pairs,
-        embedding=FakeEmbeddingsWithOsDimension(),
-        url=url,
-        pre_delete_collection=True,
-    )
-    existing = AgensgraphVector.from_existing_index(
-        embedding=FakeEmbeddingsWithOsDimension(),
-        url=url,
-        index_name="vector",
-        node_label="test",
-    )
-    output = existing.similarity_search("foo", k=1)
-    assert _no_id(output) == [Document(page_content="foo")]
-
-    drop_vector_indexes(existing)
-
-
-def test_agensgraph_vector_with_metadatas() -> None:
-    """Test end to end construction and search."""
-    metadatas = [{"page": str(i)} for i in range(len(texts))]
-    docsearch = AgensgraphVector.from_texts(
-        texts=texts,
-        embedding=FakeEmbeddingsWithOsDimension(),
-        metadatas=metadatas,
-        url=url,
-        pre_delete_collection=True,
-    )
-    output = docsearch.similarity_search("foo", k=1)
-    assert _no_id(output) == [Document(page_content="foo", metadata={"page": "0"})]
-
-    drop_vector_indexes(docsearch)
-
-
-def test_agensgraph_vector_with_metadatas_with_scores() -> None:
-    """Test end to end construction and search."""
-    metadatas = [{"page": str(i)} for i in range(len(texts))]
-    docsearch = AgensgraphVector.from_texts(
-        texts=texts,
-        embedding=FakeEmbeddingsWithOsDimension(),
-        metadatas=metadatas,
-        url=url,
-        pre_delete_collection=True,
-    )
-    output = [
-        (doc, round(score, 1)) for doc, score in docsearch.similarity_search_with_score("foo", k=1)
-    ]
-    assert _no_id(output) == [(Document(page_content="foo", metadata={"page": "0"}), 1.0)]
-
-    drop_vector_indexes(docsearch)
-
-
-def test_agensgraph_vector_relevance_score() -> None:
-    """Test to make sure the relevance score is scaled to 0-1."""
-    metadatas = [{"page": str(i)} for i in range(len(texts))]
-    docsearch = AgensgraphVector.from_texts(
-        texts=texts,
-        embedding=FakeEmbeddingsWithOsDimension(),
-        metadatas=metadatas,
-        url=url,
-        pre_delete_collection=True,
+def store_for(
+    engine: AgensEngine, graph_name: str, embedding: object, **kwargs: object
+) -> AgensgraphVector:
+    return AgensgraphVector(
+        embedding,  # type: ignore[arg-type]
+        engine=engine,
+        graph_name=graph_name,
+        create_graph=True,
+        **kwargs,  # type: ignore[arg-type]
     )
 
-    output = docsearch.similarity_search_with_relevance_scores("foo", k=3)
-    expected_output = [
-        (Document(page_content="foo", metadata={"page": "0"}), 1.0),
-        (Document(page_content="bar", metadata={"page": "1"}), 0.9996752725007386),
-        (Document(page_content="baz", metadata={"page": "2"}), 0.998704667587627),
-    ]
 
-    # Check if the length of the outputs matches
-    assert len(output) == len(expected_output)
-
-    # Check if each document and its relevance score is close to the expected value
-    for (doc, score), (expected_doc, expected_score) in zip(output, expected_output):
-        assert doc.page_content == expected_doc.page_content
-        assert doc.metadata == expected_doc.metadata
-        assert isclose(score, expected_score, rel_tol=1e-5)
-
-    drop_vector_indexes(docsearch)
-
-
-def test_agensgraph_vector_retriever_search_threshold() -> None:
-    """Test using retriever for searching with threshold."""
-    metadatas = [{"page": str(i)} for i in range(len(texts))]
-    docsearch = AgensgraphVector.from_texts(
-        texts=texts,
-        embedding=FakeEmbeddingsWithOsDimension(),
-        metadatas=metadatas,
-        url=url,
-        pre_delete_collection=True,
+def load(store: AgensgraphVector, chunks: list[datagen.Chunk]) -> list[str]:
+    return store.add_texts(
+        [c.text for c in chunks], [dict(c.metadata) for c in chunks], ids=[c.id for c in chunks]
     )
 
-    retriever = docsearch.as_retriever(
-        search_type="similarity_score_threshold",
-        search_kwargs={"k": 3, "score_threshold": 0.9999},
+
+def brute_force(
+    chunks: list[datagen.Chunk], query: np.ndarray, k: int, where: dict | None = None
+) -> list[str]:
+    kept = [c for c in chunks if matches(where, c.metadata)]
+    distances = [1.0 - float(np.dot(c.embedding, query)) for c in kept]
+    order = np.argsort(distances, kind="stable")
+    return [kept[i].id for i in order[:k]]
+
+
+def test_texts_are_stored_and_found_nearest_first(
+    engine: AgensEngine, graph_name: str, chunks: list[datagen.Chunk], embedding: FixedEmbeddings
+) -> None:
+    store = store_for(engine, graph_name, embedding)
+    assert load(store, chunks) == [c.id for c in chunks]
+    target = chunks[17]
+    found = store.similarity_search_with_score(target.text, k=3)
+    assert found[0][0] == Document(id=target.id, page_content=target.text, metadata=target.metadata)
+    assert found[0][1] == pytest.approx(0.0, abs=1e-6)
+    assert [d.id for d, _ in found] == brute_force(chunks, target.embedding, 3)
+    assert store.dims == DIMS
+    assert store.index_status()["indexed"]
+
+
+def test_every_filter_matches_its_python_meaning(
+    engine: AgensEngine, graph_name: str, chunks: list[datagen.Chunk], embedding: FixedEmbeddings
+) -> None:
+    store = store_for(engine, graph_name, embedding, search_mode="exact")
+    load(store, chunks)
+    query = chunks[5].embedding
+    for where in FILTERS:
+        got = [d.id for d in store.similarity_search_by_vector(query.tolist(), k=7, filter=where)]
+        assert got == brute_force(chunks, query, 7, where), where
+
+
+def test_the_langchain_postgres_filter_cases_hold(engine: AgensEngine, graph_name: str) -> None:
+    store = store_for(
+        engine, graph_name, DeterministicFakeEmbedding(size=DIMS), search_mode="exact"
     )
-    output = retriever.invoke("foo")
-    assert _no_id(output) == [
-        Document(page_content="foo", metadata={"page": "0"}),
-    ]
-
-    drop_vector_indexes(docsearch)
-
-
-def test_custom_return_agensgraph_vector() -> None:
-    """Test end to end construction and search."""
-    docsearch = AgensgraphVector.from_texts(
-        texts=["test"],
-        embedding=FakeEmbeddingsWithOsDimension(),
-        url=url,
-        pre_delete_collection=True,
-        retrieval_query="RETURN 'foo' AS text, score, {{test: 'test'}} AS metadata",
-    )
-    output = docsearch.similarity_search("foo", k=1)
-    assert _no_id(output) == [Document(page_content="foo", metadata={"test": "test"})]
-
-    drop_vector_indexes(docsearch)
-
-
-def test_agensgraph_vector_prefer_indexname() -> None:
-    """Test using when two indexes are found, prefer by index_name."""
-    AgensgraphVector.from_texts(
-        texts=["foo"],
-        embedding=FakeEmbeddingsWithOsDimension(),
-        url=url,
-        pre_delete_collection=True,
-    )
-
-    AgensgraphVector.from_texts(
-        texts=["bar"],
-        embedding=FakeEmbeddingsWithOsDimension(),
-        url=url,
-        index_name="foo",
-        node_label="Test",
-        embedding_node_property="vector",
-        text_node_property="info",
-        pre_delete_collection=True,
-    )
-
-    existing_index = AgensgraphVector.from_existing_index(
-        embedding=FakeEmbeddingsWithOsDimension(),
-        url=url,
-        index_name="foo",
-        text_node_property="info",
-    )
-
-    output = existing_index.similarity_search("bar", k=1)
-    assert _no_id(output) == [Document(page_content="bar", metadata={})]
-    drop_vector_indexes(existing_index)
-
-
-def test_agensgraph_vector_hybrid() -> None:
-    """Test end to end construction with hybrid search."""
-    text_embeddings = FakeEmbeddingsWithOsDimension().embed_documents(texts)
-    text_embedding_pairs = list(zip(texts, text_embeddings))
-    docsearch = AgensgraphVector.from_embeddings(
-        text_embeddings=text_embedding_pairs,
-        embedding=FakeEmbeddingsWithOsDimension(),
-        url=url,
-        pre_delete_collection=True,
-        search_type=SearchType.HYBRID,
-    )
-    output = docsearch.similarity_search("foo", k=1)
-    assert _no_id(output) == [Document(page_content="foo")]
-
-    drop_vector_indexes(docsearch)
-
-
-def test_agensgraph_vector_hybrid_deduplicate() -> None:
-    """Test result deduplication with hybrid search."""
-    text_embeddings = FakeEmbeddingsWithOsDimension().embed_documents(texts)
-    text_embedding_pairs = list(zip(texts, text_embeddings))
-    docsearch = AgensgraphVector.from_embeddings(
-        text_embeddings=text_embedding_pairs,
-        embedding=FakeEmbeddingsWithOsDimension(),
-        url=url,
-        pre_delete_collection=True,
-        search_type=SearchType.HYBRID,
-    )
-    output = docsearch.similarity_search("foo", k=3)
-    assert _no_id(output) == [
-        Document(page_content="foo"),
-        Document(page_content="bar"),
-        Document(page_content="baz"),
-    ]
-
-    drop_vector_indexes(docsearch)
-
-
-def test_agensgraph_vector_hybrid_retrieval_query() -> None:
-    """Test custom retrieval_query with hybrid search."""
-    text_embeddings = FakeEmbeddingsWithOsDimension().embed_documents(texts)
-    text_embedding_pairs = list(zip(texts, text_embeddings))
-    docsearch = AgensgraphVector.from_embeddings(
-        text_embeddings=text_embedding_pairs,
-        embedding=FakeEmbeddingsWithOsDimension(),
-        url=url,
-        pre_delete_collection=True,
-        search_type=SearchType.HYBRID,
-        retrieval_query="RETURN 'moo' AS text, score, {{test: 'test'}} AS metadata",
-    )
-    output = docsearch.similarity_search("foo", k=1)
-    assert _no_id(output) == [Document(page_content="moo", metadata={"test": "test"})]
-
-    drop_vector_indexes(docsearch)
-
-
-def test_agensgraph_vector_hybrid_retrieval_query2() -> None:
-    """Test custom retrieval_query with hybrid search."""
-    text_embeddings = FakeEmbeddingsWithOsDimension().embed_documents(texts)
-    text_embedding_pairs = list(zip(texts, text_embeddings))
-    docsearch = AgensgraphVector.from_embeddings(
-        text_embeddings=text_embedding_pairs,
-        embedding=FakeEmbeddingsWithOsDimension(),
-        url=url,
-        pre_delete_collection=True,
-        search_type=SearchType.HYBRID,
-        retrieval_query="RETURN node.text AS text, score, {{test: 'test'}} AS metadata",
-    )
-    output = docsearch.similarity_search("foo", k=1)
-    assert _no_id(output) == [Document(page_content="foo", metadata={"test": "test"})]
-
-    drop_vector_indexes(docsearch)
-
-
-def test_agensgraph_vector_missing_keyword() -> None:
-    """Test hybrid search with missing keyword_index_search."""
-    text_embeddings = FakeEmbeddingsWithOsDimension().embed_documents(texts)
-    text_embedding_pairs = list(zip(texts, text_embeddings))
-    docsearch = AgensgraphVector.from_embeddings(
-        text_embeddings=text_embedding_pairs,
-        embedding=FakeEmbeddingsWithOsDimension(),
-        url=url,
-        pre_delete_collection=True,
-    )
-    try:
-        AgensgraphVector.from_existing_index(
-            embedding=FakeEmbeddingsWithOsDimension(),
-            url=url,
-            index_name="vector",
-            search_type=SearchType.HYBRID,
-        )
-    except ValueError as e:
-        assert str(e) == ("keyword_index name has to be specified when using hybrid search option")
-    drop_vector_indexes(docsearch)
-
-
-def test_agensgraph_vector_hybrid_from_existing() -> None:
-    """Test hybrid search with missing keyword_index_search."""
-    text_embeddings = FakeEmbeddingsWithOsDimension().embed_documents(texts)
-    text_embedding_pairs = list(zip(texts, text_embeddings))
-    AgensgraphVector.from_embeddings(
-        text_embeddings=text_embedding_pairs,
-        embedding=FakeEmbeddingsWithOsDimension(),
-        url=url,
-        pre_delete_collection=True,
-        search_type=SearchType.HYBRID,
-    )
-    existing = AgensgraphVector.from_existing_index(
-        embedding=FakeEmbeddingsWithOsDimension(),
-        url=url,
-        index_name="vector",
-        keyword_index_name="keyword",
-        search_type=SearchType.HYBRID,
-    )
-
-    output = existing.similarity_search("foo", k=1)
-    assert _no_id(output) == [Document(page_content="foo")]
-
-    drop_vector_indexes(existing)
-
-
-def test_agensgraph_vector_from_existing_graph() -> None:
-    """Test from_existing_graph with a single property."""
-    graph = AgensgraphVector.from_texts(
-        texts=["test"],
-        embedding=FakeEmbeddingsWithOsDimension(),
-        url=url,
-        index_name="foo",
-        node_label="Foo",
-        embedding_node_property="vector",
-        text_node_property="info",
-        pre_delete_collection=True,
-    )
-
-    graph.query("MATCH (n) DETACH DELETE n")
-
-    graph.query("""CREATE (:"Test" {name:'Foo'}),(:"Test" {name:'Bar'})""")
-
-    existing = AgensgraphVector.from_existing_graph(
-        embedding=FakeEmbeddingsWithOsDimension(),
-        url=url,
-        index_name="vector",
-        node_label="Test",
-        text_node_properties=["name"],
-        embedding_node_property="embedding",
-    )
-
-    output = existing.similarity_search("foo", k=1)
-    assert _no_id(output) == [Document(page_content="\nname: Foo")]
-
-    drop_vector_indexes(existing)
-
-
-def test_agensgraph_vector_from_existing_graph_hybrid() -> None:
-    """Test from_existing_graph hybrid with a single property."""
-    graph = AgensgraphVector.from_texts(
-        texts=["test"],
-        embedding=FakeEmbeddingsWithOsDimension(),
-        url=url,
-        index_name="foo",
-        node_label="Foo",
-        embedding_node_property="vector",
-        text_node_property="info",
-        pre_delete_collection=True,
-    )
-
-    graph.query("MATCH (n) DETACH DELETE n")
-
-    graph.query("""CREATE (:"Test" {name:'foo'}),(:"Test" {name:'Bar'})""")
-
-    existing = AgensgraphVector.from_existing_graph(
-        embedding=FakeEmbeddingsWithOsDimension(),
-        url=url,
-        index_name="vector",
-        node_label="Test",
-        text_node_properties=["name"],
-        embedding_node_property="embedding",
-        search_type=SearchType.HYBRID,
-    )
-
-    output = existing.similarity_search("foo", k=1)
-    assert _no_id(output) == [Document(page_content="\nname: foo")]
-
-    drop_vector_indexes(existing)
-
-
-def test_agensgraph_vector_from_existing_graph_multiple_properties() -> None:
-    """Test from_existing_graph with a two property."""
-    graph = AgensgraphVector.from_texts(
-        texts=["test"],
-        embedding=FakeEmbeddingsWithOsDimension(),
-        url=url,
-        index_name="foo",
-        node_label="Foo",
-        embedding_node_property="vector",
-        text_node_property="info",
-        pre_delete_collection=True,
-    )
-    graph.query("MATCH (n) DETACH DELETE n")
-
-    graph.query("""CREATE (:"Test" {name:'Foo', name2: 'Fooz'}),(:"Test" {name:'Bar'})""")
-
-    existing = AgensgraphVector.from_existing_graph(
-        embedding=FakeEmbeddingsWithOsDimension(),
-        url=url,
-        index_name="vector",
-        node_label="Test",
-        text_node_properties=["name", "name2"],
-        embedding_node_property="embedding",
-    )
-
-    output = existing.similarity_search("foo", k=1)
-    assert _no_id(output) == [Document(page_content="\nname: Foo\nname2: Fooz")]
-
-    drop_vector_indexes(existing)
-
-
-def test_agensgraph_vector_from_existing_graph_multiple_properties_hybrid() -> None:
-    """Test from_existing_graph with a two property."""
-    graph = AgensgraphVector.from_texts(
-        texts=["test"],
-        embedding=FakeEmbeddingsWithOsDimension(),
-        url=url,
-        index_name="foo",
-        node_label="Foo",
-        embedding_node_property="vector",
-        text_node_property="info",
-        pre_delete_collection=True,
-    )
-    graph.query("MATCH (n) DETACH DELETE n")
-
-    graph.query("""CREATE (:"Test" {name:'Foo', name2: 'Fooz'}),(:"Test" {name:'Bar'})""")
-
-    existing = AgensgraphVector.from_existing_graph(
-        embedding=FakeEmbeddingsWithOsDimension(),
-        url=url,
-        index_name="vector",
-        node_label="Test",
-        text_node_properties=["name", "name2"],
-        embedding_node_property="embedding",
-        search_type=SearchType.HYBRID,
-    )
-
-    output = existing.similarity_search("foo", k=1)
-    assert _no_id(output) == [Document(page_content="\nname: Foo\nname2: Fooz")]
-
-    drop_vector_indexes(existing)
-
-
-def test_agensgraph_vector_special_character() -> None:
-    """Test removing lucene."""
-    text_embeddings = FakeEmbeddingsWithOsDimension().embed_documents(texts)
-    text_embedding_pairs = list(zip(texts, text_embeddings))
-    docsearch = AgensgraphVector.from_embeddings(
-        text_embeddings=text_embedding_pairs,
-        embedding=FakeEmbeddingsWithOsDimension(),
-        url=url,
-        pre_delete_collection=True,
-        search_type=SearchType.HYBRID,
-    )
-    output = docsearch.similarity_search("It is the end of the world. Take shelter!", k=1)
-    assert _no_id(output) == [
-        Document(page_content="It is the end of the world. Take shelter!", metadata={})
-    ]
-
-    drop_vector_indexes(docsearch)
-
-
-def test_index_fetching() -> None:
-    """testing correct index creation and fetching"""
-    embeddings = FakeEmbeddings()
-
-    def create_store(node_label: str, index: str, text_properties: List[str]) -> AgensgraphVector:
-        return AgensgraphVector.from_existing_graph(
-            embedding=embeddings,
-            url=url,
-            index_name=index,
-            node_label=node_label,
-            text_node_properties=text_properties,
-            embedding_node_property="embedding",
-        )
-
-    def fetch_store(index_name: str) -> AgensgraphVector:
-        store = AgensgraphVector.from_existing_index(
-            embedding=embeddings,
-            url=url,
-            index_name=index_name,
-        )
-        return store
-
-    # create index 0
-    index_0_str = "index0"
-    create_store("label0", index_0_str, ["text"])
-
-    # create index 1
-    index_1_str = "index1"
-    create_store("label1", index_1_str, ["text"])
-
-    index_1_store = fetch_store(index_1_str)
-    assert index_1_store.index_name == index_1_str
-
-    index_0_store = fetch_store(index_0_str)
-    assert index_0_store.index_name == index_0_str
-    drop_vector_indexes(index_1_store)
-    drop_vector_indexes(index_0_store)
-
-
-def test_retrieval_params() -> None:
-    """Test if we use parameters in retrieval query"""
-    docsearch = AgensgraphVector.from_texts(
-        texts=texts,
-        embedding=FakeEmbeddings(),
-        pre_delete_collection=True,
-        retrieval_query="""
-        RETURN %(test)s as text, score, {{test: %(test1)s}} AS metadata
-        """,
-        url=url,
-    )
-
-    # Passed plainly. Before the driver, a string parameter reached the server with no
-    # declared type and the Cypher parser *parsed* it as JSON, so every value had to be
-    # `json.dumps`-ed first -- and a value that happened to read as JSON, like an order
-    # number or a postcode, silently matched nothing. A string is now sent as text.
-    output = docsearch.similarity_search("Foo", k=2, params={"test": "test", "test1": "test1"})
-    assert _no_id(output) == [
-        Document(page_content="test", metadata={"test": "test1"}),
-        Document(page_content="test", metadata={"test": "test1"}),
-    ]
-    drop_vector_indexes(docsearch)
-
-
-def test_retrieval_dictionary() -> None:
-    """Test if we use parameters in retrieval query"""
-    docsearch = AgensgraphVector.from_texts(
-        texts=texts,
-        embedding=FakeEmbeddings(),
-        pre_delete_collection=True,
-        retrieval_query="""
-        RETURN {{
-            name:'John', 
-            age: 30,
-            skills: ['Python', 'Data Analysis', 'Machine Learning']}} as text, 
-            score, {{}} AS metadata
-        """,
-        url=url,
-    )
-    expected_output = [
-        Document(
-            page_content=(
-                "skills:\n- Python\n- Data Analysis\n- Machine Learning\nage: 30\nname: John\n"
-            )
-        )
-    ]
-
-    output = docsearch.similarity_search("Foo", k=1)
-
-    def parse_document(doc: Document) -> Any:
-        return safe_load(doc.page_content)
-
-    parsed_expected = [parse_document(doc) for doc in expected_output]
-    parsed_output = [parse_document(doc) for doc in output]
-
-    assert parsed_output == parsed_expected
-    drop_vector_indexes(docsearch)
-
-
-def test_metadata_filters_type1() -> None:
-    """Test metadata filters"""
-    docsearch = AgensgraphVector.from_documents(
-        DOCUMENTS,
-        embedding=FakeEmbeddings(),
-        pre_delete_collection=True,
-        url=url,
-    )
-    # We don't test type 5, because LIKE has very SQL specific examples
-    for example in (
-        TYPE_1_FILTERING_TEST_CASES
-        + TYPE_2_FILTERING_TEST_CASES
-        + TYPE_3_FILTERING_TEST_CASES
-        + TYPE_4_FILTERING_TEST_CASES
+    store.add_documents(cases.DOCUMENTS, ids=[str(d.metadata["id"]) for d in cases.DOCUMENTS])
+    wrong = []
+    for where, expected in (
+        cases.TYPE_1_FILTERING_TEST_CASES
+        + cases.TYPE_2_FILTERING_TEST_CASES
+        + cases.TYPE_3_FILTERING_TEST_CASES
+        + cases.TYPE_4_FILTERING_TEST_CASES
+        + cases.TYPE_5_FILTERING_TEST_CASES
     ):
-        filter_dict = cast(Dict[str, Any], example[0])
-        output = docsearch.similarity_search("Foo", filter=filter_dict)
-        indices = cast(List[int], example[1])
-        adjusted_indices = [index - 1 for index in indices]
-        expected_output = [DOCUMENTS[index] for index in adjusted_indices]
-        # 0.2.0 separated system id (__id__) from user metadata, so user's
-        # metadata["id"] now round-trips. Only strip None-valued keys.
-        for doc in expected_output:
-            keys_with_none = [key for key, value in doc.metadata.items() if value is None]
-            for key in keys_with_none:
-                del doc.metadata[key]
-
-        assert _no_id(output) == expected_output
-    drop_vector_indexes(docsearch)
+        found = sorted(d.metadata["id"] for d in store.similarity_search("meow", k=5, filter=where))
+        if found != expected:
+            wrong.append((where, expected, found))
+    assert wrong == []
 
 
-def test_agensgraph_vector_relationship_index() -> None:
-    """Test end to end construction and search."""
-    embeddings = FakeEmbeddingsWithOsDimension()
-    docsearch = AgensgraphVector.from_texts(
-        texts=texts,
-        embedding=embeddings,
-        url=url,
-        pre_delete_collection=True,
+def test_a_filtered_approximate_search_still_returns_k(
+    engine: AgensEngine, graph_name: str, chunks: list[datagen.Chunk], embedding: FixedEmbeddings
+) -> None:
+    store = store_for(engine, graph_name, embedding, filter_keys=["s10"])
+    load(store, chunks)
+    assert store.index_status()["indexed"]
+    found = store.similarity_search_by_vector(chunks[0].embedding.tolist(), k=10, filter={"s10": 3})
+    assert len(found) == 10
+    assert all(d.metadata["s10"] == 3 for d in found)
+
+
+def test_adding_an_id_again_replaces_the_chunk(
+    engine: AgensEngine, graph_name: str, embedding: FixedEmbeddings
+) -> None:
+    store = store_for(engine, graph_name, DeterministicFakeEmbedding(size=DIMS))
+    store.add_texts(["foo", "bar"], [{"a": 1, "gone": True}, {"a": 2}], ids=["1", "2"])
+    store.add_texts(["new foo"], [{"a": 3}], ids=["1"])
+    store.add_texts(["new foo"], [{"a": 3}], ids=["1"])
+    assert store.get_by_ids(["2", "missing", "1"]) == [
+        Document(id="2", page_content="bar", metadata={"a": 2}),
+        Document(id="1", page_content="new foo", metadata={"a": 3}),
+    ]
+    assert store.similarity_search("new foo", k=5)[0].id == "1"
+    assert len(store.similarity_search("anything", k=5)) == 2
+
+
+def test_metadata_drops_none_and_refuses_the_keys_the_store_uses(
+    engine: AgensEngine, graph_name: str
+) -> None:
+    store = store_for(engine, graph_name, DeterministicFakeEmbedding(size=DIMS))
+    store.add_texts(["a"], [{"kept": 1, "dropped": None}], ids=["a"])
+    assert store.get_by_ids(["a"])[0].metadata == {"kept": 1}
+    for reserved in ("__id__", "text"):
+        with pytest.raises(ValueError, match="metadata may not hold"):
+            store.add_texts(["b"], [{reserved: "x"}])
+    with pytest.raises(ValueError, match="2 texts but 1 ids"):
+        store.add_texts(["c", "d"], ids=["c"])
+
+
+def test_deleting_by_id_by_filter_and_everything(
+    engine: AgensEngine, graph_name: str, chunks: list[datagen.Chunk], embedding: FixedEmbeddings
+) -> None:
+    store = store_for(engine, graph_name, embedding)
+    load(store, chunks[:40])
+    store.delete([chunks[0].id, "not stored"])
+    assert store.get_by_ids([chunks[0].id]) == []
+    store.delete(filter={"s10": 1})
+    left = store.similarity_search(chunks[2].text, k=100)
+    assert len(left) == 35 and all(d.metadata["s10"] != 1 for d in left)
+    for everything in ({}, {"$and": [{}]}):
+        # A filter testing no field matches every chunk, so it is refused as delete() is.
+        with pytest.raises(ValueError, match="delete_all"):
+            store.delete(filter=everything)
+        with pytest.raises(ValueError, match="delete_all"):
+            store.delete([chunks[1].id], filter=everything)
+    assert len(store.similarity_search(chunks[2].text, k=100)) == 35
+    with pytest.raises(ValueError, match="delete_all"):
+        store.delete()
+    store.delete(delete_all=True)
+    assert store.similarity_search(chunks[2].text, k=5) == []
+
+
+def test_a_store_already_made_says_its_own_type_to_every_first_call(
+    engine: AgensEngine, graph_name: str, chunks: list[datagen.Chunk], embedding: FixedEmbeddings
+) -> None:
+    load(store_for(engine, graph_name, embedding, vector_type="halfvec"), chunks[:5])
+    # A store opened without a type, first called with embeddings, takes halfvec from the table.
+    later = store_for(engine, graph_name, embedding)
+    rest = chunks[5:10]
+    later.add_embeddings(
+        [c.text for c in rest], [c.embedding.tolist() for c in rest], ids=[c.id for c in rest]
     )
-    # Ingest data
-    docsearch.query(
-        (
-            """CREATE ()-[:"REL" {text: 'foo', embedding: %(e1)s}]->()"""
-            """, ()-[:"REL" {text: 'far', embedding: %(e2)s}]->()"""
-        ),
-        params={
-            "e1": embeddings.embed_query("foo"),
-            "e2": embeddings.embed_query("bar"),
-        },
+    assert later.vector_type == "halfvec"
+    assert later.similarity_search(chunks[7].text, k=1)[0].id == chunks[7].id
+
+
+def test_a_k_above_one_index_scan_is_read_on_iteratively(
+    engine: AgensEngine, graph_name: str
+) -> None:
+    many = datagen.chunks(1300, 16, seed=11)
+    embedding = FixedEmbeddings({c.text: c.embedding for c in many}, 16)
+    store = store_for(engine, graph_name, embedding, search_type="hybrid")
+    load(store, many)
+    assert store.index_status()["indexed"]
+    # pgvector takes hnsw.ef_search up to 1000; past it the scan reads on until k rows are found.
+    assert len(store.similarity_search(many[0].text, k=1200)) == 1200
+    assert len(store.hybrid_search_with_details(many[0].text, k=300)) == 300
+    capped = store_for(engine, graph_name, embedding, search_type="hybrid", iterative_scan="off")
+    with pytest.raises(ValueError, match="iterative scan"):
+        capped.similarity_search(many[0].text, k=1200)
+
+
+def test_mmr_trades_nearness_for_variety(
+    engine: AgensEngine, graph_name: str, chunks: list[datagen.Chunk], embedding: FixedEmbeddings
+) -> None:
+    store = store_for(engine, graph_name, embedding, search_mode="exact")
+    load(store, chunks)
+    query = chunks[9].embedding.tolist()
+    nearest = [d.id for d in store.similarity_search_by_vector(query, k=4)]
+    assert [
+        d.id for d in store.max_marginal_relevance_search_by_vector(query, k=4, lambda_mult=1.0)
+    ] == nearest
+    varied = store.max_marginal_relevance_search_by_vector(query, k=4, fetch_k=30, lambda_mult=0.1)
+    assert len(varied) == 4 and varied[0].id == nearest[0]
+
+
+def test_stored_embeddings_come_back_as_given(
+    engine: AgensEngine, graph_name: str, chunks: list[datagen.Chunk], embedding: FixedEmbeddings
+) -> None:
+    store = store_for(engine, graph_name, embedding)
+    load(store, chunks[:10])
+    (document, distance, vector), *_ = store.search_with_embeddings(chunks[3].text, k=1)
+    assert document.id == chunks[3].id
+    assert np.allclose(vector, chunks[3].embedding)
+
+
+def test_relevance_scores_run_from_nearest_to_furthest(
+    engine: AgensEngine, graph_name: str, chunks: list[datagen.Chunk], embedding: FixedEmbeddings
+) -> None:
+    for strategy in (DistanceStrategy.COSINE, DistanceStrategy.EUCLIDEAN_DISTANCE):
+        store = store_for(
+            engine, graph_name, embedding, distance_strategy=strategy, label=f"L{strategy.name}"
+        )
+        load(store, chunks[:20])
+        scored = store.similarity_search_with_relevance_scores(chunks[4].text, k=5)
+        assert scored[0][1] == pytest.approx(1.0, abs=1e-5)
+        assert all(0.0 <= s <= 1.0 for _, s in scored)
+        assert [s for _, s in scored] == sorted((s for _, s in scored), reverse=True)
+
+
+def test_a_hybrid_search_finds_the_rare_word(
+    engine: AgensEngine, graph_name: str, chunks: list[datagen.Chunk], embedding: FixedEmbeddings
+) -> None:
+    store = store_for(engine, graph_name, embedding, search_type=SearchType.HYBRID)
+    load(store, chunks)
+    rare = next(c for c in chunks if datagen.RARE_WORD in c.text)
+    hits = store.hybrid_search_with_details(datagen.RARE_WORD, k=5)
+    assert hits[0].document.id == rare.id
+    assert hits[0].keyword_rank == 1 and hits[0].keyword_score is not None
+    scored = store.similarity_search_with_relevance_scores(datagen.RARE_WORD, k=3)
+    assert scored[0][0].id == rare.id and 0.0 < scored[0][1] <= 1.0
+    mixed = store_for(
+        engine,
+        graph_name,
+        embedding,
+        search_type="hybrid",
+        fusion="max",
+        label="Max",
+        keyword=KeywordConfig(regconfig="simple"),
     )
-    # Create relationship index
-    docsearch.query(
-        """CREATE PROPERTY INDEX "relationship"
-           ON "REL" USING hnsw ((embedding::vector(1536)) vector_cosine_ops)
-        """
-    )
-    relationship_index = AgensgraphVector.from_existing_relationship_index(
-        embeddings, index_name="relationship", url=url
-    )
-
-    output = relationship_index.similarity_search("foo", k=1)
-    assert _no_id(output) == [Document(page_content="foo")]
-
-    drop_vector_indexes(docsearch)
-
-
-def test_agensgraph_vector_relationship_index_retrieval() -> None:
-    """Test end to end construction and search."""
-    embeddings = FakeEmbeddingsWithOsDimension()
-    docsearch = AgensgraphVector.from_texts(
-        texts=texts,
-        embedding=embeddings,
-        url=url,
-        pre_delete_collection=True,
-    )
-    # Ingest data
-    docsearch.query(
-        (
-            """CREATE ({node:'text'})-[:"REL" {text: 'foo', embedding: %(e1)s}]->()"""
-            """, ({node:'text'})-[:"REL" {text: 'far', embedding: %(e2)s}]->()"""
-        ),
-        params={
-            "e1": embeddings.embed_query("foo"),
-            "e2": embeddings.embed_query("bar"),
-        },
-    )
-    # Create relationship index
-    docsearch.query(
-        """CREATE PROPERTY INDEX "relationship"
-           ON "REL" USING hnsw ((embedding::vector(1536)) vector_cosine_ops)
-        """
-    )
-    retrieval_query = (
-        "RETURN relationship.text + '-' + startNode(relationship).node "
-        "AS text, score, {{foo:'bar'}} AS metadata"
-    )
-    relationship_index = AgensgraphVector.from_existing_relationship_index(
-        embeddings, index_name="relationship", retrieval_query=retrieval_query, url=url
-    )
-
-    output = relationship_index.similarity_search("foo", k=1)
-    assert _no_id(output) == [Document(page_content="foo-text", metadata={"foo": "bar"})]
-
-    drop_vector_indexes(docsearch)
-
-
-def test_agensgraph_max_marginal_relevance_search() -> None:
-    """
-    Test end to end construction and MMR search.
-    The embedding function used here ensures `texts` become
-    the following vectors on a circle (numbered v0 through v3):
-
-           ______ v2
-          /      \
-         /        |  v1
-    v3  |     .    | query
-         |        /  v0
-          |______/                 (N.B. very crude drawing)
-
-    With fetch_k==3 and k==2, when query is at (1, ),
-    one expects that v2 and v0 are returned (in some order).
-    """
-    texts = ["-0.124", "+0.127", "+0.25", "+1.0"]
-    metadatas = [{"page": i} for i in range(len(texts))]
-    docsearch = AgensgraphVector.from_texts(
-        texts,
-        metadatas=metadatas,
-        embedding=AngularTwoDimensionalEmbeddings(),
-        pre_delete_collection=True,
-        url=url,
-    )
-
-    expected_set = {
-        ("+0.25", 2),
-        ("-0.124", 0),
-    }
-
-    output = docsearch.max_marginal_relevance_search("0.0", k=2, fetch_k=3)
-    output_set = {(mmr_doc.page_content, mmr_doc.metadata["page"]) for mmr_doc in output}
-    assert output_set == expected_set
-
-    drop_vector_indexes(docsearch)
-
-
-def test_agensgraph_vector_passing_graph_object() -> None:
-    """Test end to end construction and search with passing graph object."""
-    graph = AgensGraph(conf=conf, graph_name="test", create=True)
-    # Rewrite env vars to make sure it fails if env is used
-    os.environ["AGENSGRAPH_URI"] = "foo"
-    docsearch = AgensgraphVector.from_texts(
-        texts=texts,
-        embedding=FakeEmbeddingsWithOsDimension(),
-        graph=graph,
-        pre_delete_collection=True,
-        url=url,
-    )
-    output = docsearch.similarity_search("foo", k=1)
-    assert _no_id(output) == [Document(page_content="foo")]
-
-    drop_vector_indexes(docsearch)
-
-
-class TestABitColumnIsUsable:
-    """``HAMMING`` and ``JACCARD`` measure a ``bit`` column, and both are reachable.
-
-    A bit column holds a string of ones and zeros, so an embedding bound for one is
-    binary quantised into that string. Written as a list it would be cast from its printed
-    form and read as a bit string of that whole length.
-    """
-
-    class BitEmbeddings:
-        """A deterministic 0/1 embedding, which is what a bit column holds."""
-
-        dims = 12
-
-        def _vec(self, text: str) -> List[float]:
-            digest = int(md5(text.encode()).hexdigest(), 16)
-            return [float((digest >> i) & 1) for i in range(self.dims)]
-
-        def embed_documents(self, texts: List[str]) -> List[List[float]]:
-            return [self._vec(t) for t in texts]
-
-        def embed_query(self, text: str) -> List[float]:
-            return self._vec(text)
-
-    @pytest.mark.parametrize("strategy", [DistanceStrategy.HAMMING, DistanceStrategy.JACCARD])
-    def test_a_bit_distance_indexes_ingests_and_searches(self, strategy) -> None:
-        store = AgensgraphVector.from_texts(
-            texts=["alpha", "beta", "gamma"],
-            embedding=self.BitEmbeddings(),
-            url=url,
-            graph_name="vector_it",
-            node_label="BitChunk",
-            index_name=f"bit_{strategy.value.lower()}",
-            distance_strategy=strategy,
-            vector_type="bit",
-            pre_delete_collection=True,
-        )
-        try:
-            stored = store.query('MATCH (n:"BitChunk") RETURN n.embedding AS e LIMIT 1')[0]["e"]
-            assert set(stored) <= {"0", "1"} and len(stored) == 12
-            assert store.similarity_search("beta", k=1)[0].page_content == "beta"
-        finally:
-            drop_vector_indexes(store)
-
-
-class TestMetadataDoesNotOverwriteWhatTheStoreWrites:
-    """The text, the embedding and the id are written after a caller's metadata.
-
-    A metadata key of the same name would otherwise land on top of them -- and an
-    embedding replaced by a string is refused by the vector index, so the write fails
-    outright rather than quietly storing the wrong thing.
-    """
-
-    def test_reserved_keys_in_metadata(self) -> None:
-        store = AgensgraphVector.from_texts(
-            texts=["the quick brown fox"],
-            embedding=FakeEmbeddings(),
-            metadatas=[{"embedding": "clobbered", "text": "clobbered", "__id__": "clobbered"}],
-            url=url,
-            graph_name="vector_it",
-            node_label="ReservedChunk",
-            index_name="reserved",
-            pre_delete_collection=True,
-        )
-        try:
-            row = store.query(
-                'MATCH (n:"ReservedChunk") RETURN n.text AS text, '
-                "n.__id__ AS id, array_size(n.embedding) AS dims"
-            )[0]
-            assert row["text"] == "the quick brown fox"
-            assert row["id"] != "clobbered"
-            assert row["dims"] == len(FakeEmbeddings().embed_query("x"))
-        finally:
-            drop_vector_indexes(store)
-
-
-class TestAMissingPropertyAnswersTheSame:
-    """``$ne`` and ``$nin`` are the same question about an element that lacks the key.
-
-    An absent property is unequal to anything, so it satisfies both.
-    """
-
-    @pytest.mark.parametrize(
-        "flt",
-        [{"kind": {"$ne": "a"}}, {"kind": {"$nin": ["a"]}}],
-    )
-    def test_an_element_without_the_property(self, flt) -> None:
-        store = AgensgraphVector.from_texts(
-            texts=["has it", "missing it"],
-            embedding=FakeEmbeddings(),
-            metadatas=[{"kind": "a"}, {}],
-            url=url,
-            graph_name="vector_it",
-            node_label="MissingChunk",
-            index_name="missing",
-            pre_delete_collection=True,
-        )
-        try:
-            found = store.similarity_search("has it", k=10, filter=flt)
-            assert [d.page_content for d in found] == ["missing it"]
-        finally:
-            drop_vector_indexes(store)
-
-
-class TestAGraphThatWasAlreadyThere:
-    """What ``from_existing_graph`` has to get right for a graph it did not create."""
-
-    @staticmethod
-    def _seed() -> AgensgraphVector:
-        graph = AgensGraph("vector_existing_it", conf, create=True)
-        graph.query("MATCH (n) DETACH DELETE n")
-        for title, content in [
-            ("quantum computing", "qubits and gates"),
-            ("cooking pasta", "boil water add salt"),
-            ("quantum mechanics", "wave functions"),
-        ]:
-            graph.query(
-                'CREATE (:"Doc" {"title": %(t)s, "content": %(c)s})',
-                {"t": title, "c": content},
-            )
-        graph.close()
-        return AgensgraphVector.from_existing_graph(
-            embedding=FakeEmbeddings(),
-            node_label="Doc",
-            embedding_node_property="embedding",
-            text_node_properties=["title", "content"],
-            url=url,
-            graph_name="vector_existing_it",
-            index_name="existing_vector",
-        )
-
-    def test_a_document_has_an_id_and_can_be_read_back_by_it(self) -> None:
-        store = self._seed()
-        try:
-            hits = store.similarity_search("quantum", k=3)
-            assert all(doc.id for doc in hits)
-            fetched = store.get_by_ids([hits[0].id])
-            assert fetched and fetched[0].id == hits[0].id
-        finally:
-            drop_vector_indexes(store)
-
-    def test_maximal_marginal_relevance_reads_the_embeddings_it_needs(self) -> None:
-        """The retrieval query shapes the document and carries no embedding."""
-        store = self._seed()
-        try:
-            picked = store.max_marginal_relevance_search("quantum", k=2, fetch_k=3)
-            assert len(picked) == 2
-            assert all("_embedding_" not in doc.metadata for doc in picked)
-        finally:
-            drop_vector_indexes(store)
-
-    @pytest.mark.asyncio
-    async def test_the_async_path_agrees(self) -> None:
-        store = self._seed()
-        try:
-            picked = await store.amax_marginal_relevance_search("quantum", k=2, fetch_k=3)
-            assert len(picked) == 2
-        finally:
-            drop_vector_indexes(store)
-
-
-class TestHybridScoresBothHalves:
-    """A hybrid search fuses two rankings, and an element has to be found in both.
-
-    The halves are joined on the element's own identity. ``__id__`` is a property only
-    ``add_embeddings`` writes, so over a graph that was already there it was null on both
-    sides, nothing joined, and every hit was scored by one half of the fusion.
-    """
-
-    def test_an_element_matched_by_both_scores_more_than_one_matched_by_one(self) -> None:
-        graph = AgensGraph("vector_hybrid_it", conf, create=True)
-        graph.query("MATCH (n) DETACH DELETE n")
-        for title, content in [
-            ("quantum computing", "qubits and gates"),
-            ("cooking pasta", "boil water add salt"),
-        ]:
-            graph.query(
-                'CREATE (:"Doc" {"title": %(t)s, "content": %(c)s})',
-                {"t": title, "c": content},
-            )
-        graph.close()
-        store = AgensgraphVector.from_existing_graph(
-            embedding=FakeEmbeddings(),
-            node_label="Doc",
-            embedding_node_property="embedding",
-            text_node_properties=["title", "content"],
-            search_type=SearchType.HYBRID,
-            url=url,
-            graph_name="vector_hybrid_it",
-            index_name="hybrid_vector",
-            keyword_index_name="hybrid_keyword",
-        )
-        try:
-            hits = store.similarity_search_with_score("quantum computing", k=5)
-            scores = sorted((score for _, score in hits), reverse=True)
-            # Two terms of the fusion against one: the best hit is matched by the
-            # keyword half as well, so it scores about twice the one that is not.
-            assert scores[0] > scores[-1] * 1.8
-        finally:
-            drop_vector_indexes(store)
-            drop_fulltext_indexes(store)
-
-    def test_the_keyword_half_reads_every_property_it_indexed(self) -> None:
-        """A term only in the second text property still matches."""
-        graph = AgensGraph("vector_hybrid_it", conf, create=True)
-        graph.query("MATCH (n) DETACH DELETE n")
-        graph.query(
-            'CREATE (:"Doc" {"title": %(t)s, "content": %(c)s})',
-            {"t": "an unremarkable heading", "c": "supercalifragilistic contents"},
-        )
-        graph.close()
-        store = AgensgraphVector.from_existing_graph(
-            embedding=FakeEmbeddings(),
-            node_label="Doc",
-            embedding_node_property="embedding",
-            text_node_properties=["title", "content"],
-            search_type=SearchType.HYBRID,
-            url=url,
-            graph_name="vector_hybrid_it",
-            index_name="hybrid_vector2",
-            keyword_index_name="hybrid_keyword2",
-        )
-        try:
-            match, _ = store._keyword_expressions()
-            rendered = match.as_string(store.connection)
-            assert '"title"' in rendered and '"content"' in rendered
-            hits = store.similarity_search_with_score("supercalifragilistic", k=1)
-            # One document, matched by both halves, so both terms of the fusion.
-            assert hits and hits[0][1] > 1.0 / 61
-        finally:
-            drop_vector_indexes(store)
-            drop_fulltext_indexes(store)
-
-
-class TestTheStoreInstallsNothing:
-    """Building a store adds no function of ours to somebody else's database.
-
-    What an index covers is read from the definition the server prints for it. Asking the
-    question with a function of our own meant creating one on every construction, into
-    whatever ``search_path`` happened to resolve to.
-    """
-
-    @staticmethod
-    def _function_count(store: AgensgraphVector) -> int:
-        return int(store.query("SELECT count(*) AS c FROM pg_catalog.pg_proc")[0]["c"])
-
-    def test_pg_proc_is_the_same_size_afterwards(self) -> None:
-        graph = AgensGraph("vector_install_it", conf, create=True)
-        graph.query("MATCH (n) DETACH DELETE n")
-        # A database may already hold such functions from elsewhere. They are dropped
-        # first, so that what is asserted is whether building a store creates any.
-        for leftover in graph.query(
-            "SELECT p.oid::regprocedure AS signature FROM pg_catalog.pg_proc p "
-            "WHERE p.proname LIKE 'ag\\_list%'"
-        ):
-            graph.query(f"DROP FUNCTION IF EXISTS {leftover['signature']}")
-        before = int(graph.query("SELECT count(*) AS c FROM pg_catalog.pg_proc")[0]["c"])
-        store = AgensgraphVector.from_texts(
-            texts=["alpha", "beta"],
-            embedding=FakeEmbeddings(),
-            graph=graph,
-            node_label="InstallChunk",
-            index_name="install_vec",
-            keyword_index_name="install_kw",
-            search_type=SearchType.HYBRID,
-            pre_delete_collection=True,
-        )
-        try:
-            assert store.similarity_search("alpha", k=1)
-            assert self._function_count(store) == before
-            named = store.query(
-                "SELECT count(*) AS c FROM pg_catalog.pg_proc WHERE proname LIKE 'ag\\_list%'"
-            )
-            assert int(named[0]["c"]) == 0
-        finally:
-            drop_vector_indexes(store)
-            drop_fulltext_indexes(store)
-            graph.close()
-
-    def test_the_driver_still_knows_which_graph_is_selected(self) -> None:
-        """A raw ``SET graph_path`` would leave it unable to read the catalogs."""
-        graph = AgensGraph("vector_install_it", conf, create=True)
-        store = AgensgraphVector.from_texts(
-            texts=["alpha"],
-            embedding=FakeEmbeddings(),
-            graph=graph,
-            node_label="SelectedChunk",
-            index_name="selected_vec",
-            pre_delete_collection=True,
-        )
-        try:
-            assert graph.connection.label_table.graph == "vector_install_it"
-            assert graph.connection.indexes()  # would raise if none were selected
-        finally:
-            drop_vector_indexes(store)
-            graph.close()
-
-
-class TestNamingElementsByIdReachesTheIndex:
-    """The perf contract is only real if a test enforces it.
-
-    A bound list is compared by containment -- the list is asked whether it holds the
-    property -- and containment is not a comparison the unique index on the id can
-    answer, so the label is read whole. The rows come back either way, so only the plan
-    shows it.
-
-    Enforced over enough elements for the choice to matter. Below a few thousand, reading
-    the label once and joining is genuinely the cheaper plan and the server picks it,
-    which says nothing about whether the index can be used at a size where it counts.
-    """
-
-    ROWS = 20000
-
-    @pytest.fixture
-    def loaded(self):
-        graph = AgensGraph("vector_plan_it", conf, create=True)
-        held = graph.query('MATCH (n:"PlanChunk") RETURN count(*) AS c')[0]["c"]
-        store = AgensgraphVector(
-            FakeEmbeddings(),
-            graph=graph,
-            node_label="PlanChunk",
-            index_name="plan_vec",
-        )
-        if held < self.ROWS:
-            graph.query("MATCH (n) DETACH DELETE n")
-            store.add_texts(
-                [f"chunk {i}" for i in range(self.ROWS)],
-                ids=[f"id{i}" for i in range(self.ROWS)],
-                batch_size=2500,
-            )
-            graph.query(f'ANALYZE "{graph.graph_name}"."PlanChunk"')
-        yield store
-        graph.close()
-
-    def _plan(self, store, statement, params) -> str:
-        rows = store.query("EXPLAIN (COSTS OFF) " + statement.as_string(store.connection), params)
-        return "\n".join(str(next(iter(r.values()))) for r in rows)
-
-    def test_reading_by_id_is_an_index_scan(self, loaded) -> None:
-        params: dict = {}
-        statement = sql.SQL("{by} RETURN n.__id__ AS id").format(
-            by=loaded._named_by_id([f"id{i}" for i in range(20)], params)
-        )
-        plan = self._plan(loaded, statement, params)
-        assert "Index Scan" in plan
-        assert "Seq Scan" not in plan
-
-    def test_reading_many_by_id_does_not_grow_the_statement(self, loaded) -> None:
-        """One probe repeated, not one term per id.
-
-        Written out as a term each, the statement grows with the list and the planner pays
-        for every term -- and with no index to answer them, each is a pass over the label.
-        """
-        params: dict = {}
-        few = loaded._named_by_id(["id1"], params).as_string(loaded.connection)
-        many = loaded._named_by_id([f"id{i}" for i in range(200)], {}).as_string(loaded.connection)
-        assert few == many, "the statement says the same thing however many ids"
-
-    def test_get_by_ids_returns_what_was_asked_for(self, loaded) -> None:
-        wanted = [f"id{i}" for i in range(0, self.ROWS, self.ROWS // 20)][:20]
-        found = loaded.get_by_ids(wanted)
-        assert sorted(d.id for d in found) == sorted(wanted)
-
-    def test_delete_removes_only_those(self, loaded) -> None:
-        before = loaded.query('MATCH (n:"PlanChunk") RETURN count(*) AS c')[0]["c"]
-        loaded.delete(["id1", "id2", "id3"])
-        after = loaded.query('MATCH (n:"PlanChunk") RETURN count(*) AS c')[0]["c"]
-        assert int(before) - int(after) == 3
-        loaded.add_texts(["chunk 1", "chunk 2", "chunk 3"], ids=["id1", "id2", "id3"])
-
-    @pytest.mark.asyncio
-    async def test_the_async_twins_agree(self, loaded) -> None:
-        wanted = ["id10", "id11"]
-        found = await loaded.aget_by_ids(wanted)
-        assert sorted(d.id for d in found) == sorted(wanted)
-
-
-class TestSearchTuningEndsWithTheSearch:
-    """``hnsw.ef_search`` decides how many candidates the index looks at.
-
-    Set for the session it stays on a pooled connection and tunes every later borrower's
-    search -- a recall setting one caller asked for, silently applied to everyone who gets
-    that connection next, and a cost they did not ask to pay.
-    """
-
-    def test_the_connection_is_left_as_it_was_found(self) -> None:
-        from langchain_agensgraph.engine import AgensEngine
-
-        # One connection, so the next borrower certainly gets the same one.
-        engine = AgensEngine.from_url(url, min_size=1, max_size=1)
-        graph = AgensGraph(
-            "vector_tuning_it", conf, create=True, engine=engine, refresh_schema=False
-        )
-        store = AgensgraphVector.from_texts(
-            texts=["alpha", "beta"],
-            embedding=FakeEmbeddings(),
-            graph=graph,
-            node_label="TunedChunk",
-            index_name="tuned_vec",
-            pre_delete_collection=True,
-            search_options={"hnsw.ef_search": 200},
-        )
-        try:
-            with engine.connection() as conn:
-                default = conn.execute("SHOW hnsw.ef_search").fetchone()[0]
-
-            assert store.similarity_search("alpha", k=1)
-
-            with engine.connection() as conn:
-                after = conn.execute("SHOW hnsw.ef_search").fetchone()[0]
-            assert after == default, "the tuning outlived the search that asked for it"
-        finally:
-            drop_vector_indexes(store)
-            graph.close()
-            engine.close()
-
-
-class TestBuildingAStoreCostsNoEmbedding:
-    """How wide an embedding is comes from the index, not from asking the model.
-
-    Asking is a request to whatever is behind the embedding function -- for a hosted
-    model, a wait and a charge -- and it was made on every construction, including one
-    that only ever reads.
-    """
-
-    class Counting:
-        calls = 0
-
-        def embed_documents(self, texts):
-            type(self).calls += len(texts)
-            return [[0.1] * 10 for _ in texts]
-
-        def embed_query(self, text):
-            type(self).calls += 1
-            return [0.1] * 10
-
-    @pytest.fixture
-    def seeded(self):
-        graph = AgensGraph("vector_width_it", conf, create=True)
-        graph.query("MATCH (n) DETACH DELETE n")
-        store = AgensgraphVector.from_texts(
-            texts=["a", "b"],
-            embedding=self.Counting(),
-            graph=graph,
-            node_label="WidthChunk",
-            index_name="width_vec",
-            pre_delete_collection=True,
-        )
-        yield store
-        drop_vector_indexes(store)
-        graph.close()
-
-    def test_building_over_an_existing_index_asks_nothing(self, seeded) -> None:
-        self.Counting.calls = 0
+    load(mixed, chunks)
+    assert mixed.similarity_search(datagen.RARE_WORD, k=1)[0].id == rare.id
+
+
+def test_relevance_score_fn_says_what_a_distance_means(
+    engine: AgensEngine, graph_name: str, chunks: list[datagen.Chunk], embedding: FixedEmbeddings
+) -> None:
+    def near(distance: float) -> float:
+        return 1.0 / (1.0 + distance)
+
+    taxicab = {"distance_strategy": "TAXICAB", "index": None}
+    plain = store_for(engine, graph_name, embedding, relevance_score_fn=near, **taxicab)
+    load(plain, chunks[:20])
+    (doc, relevance), *_ = plain.similarity_search_with_relevance_scores(chunks[3].text, k=3)
+    assert doc.id == chunks[3].id and relevance == 1.0
+    # A max-fused search needs a relevance for its vector half, which TAXICAB has only when given.
+    fused = {"search_type": "hybrid", "fusion": "max", **taxicab}
+    said = store_for(engine, graph_name, embedding, label="Said", relevance_score_fn=near, **fused)
+    load(said, chunks[:20])
+    assert said.similarity_search(chunks[3].text, k=1)[0].id == chunks[3].id
+    unsaid = store_for(engine, graph_name, embedding, label="Unsaid", **fused)
+    load(unsaid, chunks[:20])
+    with pytest.raises(ValueError, match="relevance_score_fn"):
+        unsaid.similarity_search(chunks[3].text, k=1)
+
+
+def test_the_index_waits_for_a_callers_transaction_to_end(
+    engine: AgensEngine, graph_name: str, chunks: list[datagen.Chunk], embedding: FixedEmbeddings
+) -> None:
+    store = store_for(engine, graph_name, embedding)
+    with engine.transaction():
+        load(store, chunks[:20])
+        assert store.index_status() == {
+            "indexed": False,
+            "pending": True,
+            "refused": False,
+            "state": "absent",
+        }
+    assert store.build_index()
+    assert store.index_status()["indexed"]
+
+
+def test_an_index_a_rolled_back_transaction_built_is_built_again(
+    engine: AgensEngine, graph_name: str, chunks: list[datagen.Chunk], embedding: FixedEmbeddings
+) -> None:
+    store = store_for(engine, graph_name, embedding)
+    store.setup()
+    with pytest.raises(RuntimeError), engine.transaction():
+        load(store, chunks[:20])
+        assert store.build_index()
+        raise RuntimeError
+    # The rollback took the rows and the index; the next write builds the index again.
+    load(store, chunks[:20])
+    assert store.index_status()["indexed"]
+
+
+@pytest.mark.parametrize("concurrently", [False, True])
+def test_an_index_too_big_for_shared_memory_is_built_serially(
+    dsn: str,
+    engine: AgensEngine,
+    graph_name: str,
+    chunks: list[datagen.Chunk],
+    embedding: FixedEmbeddings,
+    monkeypatch: pytest.MonkeyPatch,
+    concurrently: bool,
+) -> None:
+    store = store_for(engine, graph_name, embedding, index_build="manual")
+    load(store, chunks)
+    table = store.layout.vector_table_regclass
+    # Parallel workers share a segment of all of maintenance_work_mem from /dev/shm, which is
+    # 256 MB on the test image. A table this small gets no workers unless it asks for them.
+    monkeypatch.setattr(store, "_build_memory", lambda rows: 1024)
+    build_with = store._build_with
+    serial_builds: list[bool] = []
+
+    def recorded(memory: str, *, concurrently: bool, serial: bool) -> Program[None]:
+        serial_builds.append(serial)
+        return build_with(memory, concurrently=concurrently, serial=serial)
+
+    monkeypatch.setattr(store, "_build_with", recorded)
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(f"ALTER TABLE {table} SET (parallel_workers = 2)")
+    assert store.build_index(concurrently=concurrently)
+    # The parallel build was refused its shared memory, and the serial one built the index.
+    assert serial_builds == [False, True]
+    assert store.index_status()["indexed"]
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        invalid = conn.execute(
+            "SELECT count(*) FROM pg_index WHERE indrelid = %s::regclass AND NOT indisvalid",
+            (table,),
+        ).fetchone()
+    assert invalid == (0,)
+
+
+def test_a_failed_transaction_takes_the_chunks_with_it(
+    engine: AgensEngine, graph_name: str, chunks: list[datagen.Chunk], embedding: FixedEmbeddings
+) -> None:
+    store = store_for(engine, graph_name, embedding)
+    store.setup()
+    with pytest.raises(RuntimeError):
+        with engine.transaction():
+            load(store, chunks[:5])
+            raise RuntimeError
+    assert store.get_by_ids([c.id for c in chunks[:5]]) == []
+
+
+def test_an_existing_store_is_found_again_with_its_dimension(
+    engine: AgensEngine, graph_name: str, chunks: list[datagen.Chunk], embedding: FixedEmbeddings
+) -> None:
+    load(store_for(engine, graph_name, embedding), chunks[:5])
+    again = AgensgraphVector.from_existing_index(embedding, engine=engine, graph_name=graph_name)
+    assert again.dims == DIMS
+    assert again.get_by_ids([chunks[0].id])[0].page_content == chunks[0].text
+    with pytest.raises(SchemaMismatchError):
         AgensgraphVector.from_existing_index(
-            embedding=self.Counting(),
-            url=url,
-            graph_name="vector_width_it",
-            index_name="width_vec",
-            node_label="WidthChunk",
+            embedding, engine=engine, graph_name=graph_name, label="Absent"
         )
-        assert self.Counting.calls == 0
 
-    def test_the_width_still_comes_out_right(self, seeded) -> None:
-        store = AgensgraphVector.from_existing_index(
-            embedding=self.Counting(),
-            url=url,
-            graph_name="vector_width_it",
-            index_name="width_vec",
-            node_label="WidthChunk",
+
+def test_a_missing_graph_is_not_made_unless_asked(engine: AgensEngine, graph_name: str) -> None:
+    store = AgensgraphVector(
+        DeterministicFakeEmbedding(size=DIMS), engine=engine, graph_name=graph_name
+    )
+    with pytest.raises(UnknownLabel, match="create_graph=True"):
+        store.add_texts(["x"])
+
+
+def test_vectors_left_by_a_dropped_graph_are_refused(
+    dsn: str,
+    engine: AgensEngine,
+    graph_name: str,
+    embedding: FixedEmbeddings,
+    chunks: list[datagen.Chunk],
+) -> None:
+    load(store_for(engine, graph_name, embedding), chunks[:5])
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(sql.SQL("DROP GRAPH {} CASCADE").format(sql.Identifier(graph_name)))
+    fresh = store_for(engine, graph_name, embedding)
+    with pytest.raises(StaleVectorStorage):
+        fresh.add_texts(["after"], ids=["after"])
+
+
+def test_a_retrieval_query_reads_each_hit_through_cypher(
+    engine: AgensEngine, graph_name: str, chunks: list[datagen.Chunk], embedding: FixedEmbeddings
+) -> None:
+    store = store_for(engine, graph_name, embedding)
+    load(store, chunks[:30])
+    retriever = AgensVectorRetriever(
+        vectorstore=store,
+        k=2,
+        retrieval_query=(
+            "RETURN node.text AS text, score, {lang: node.lang, shout: 'yes'} AS metadata, "
+            "node.__id__ AS doc_id"
+        ),
+    )
+    docs = retriever.invoke(chunks[6].text)
+    assert docs[0].id == chunks[6].id
+    assert docs[0].metadata == {"lang": chunks[6].metadata["lang"], "shout": "yes", "score": 0.0}
+
+
+def test_a_retrieval_query_sees_the_hits_best_first_whatever_the_join(
+    engine: AgensEngine, graph_name: str, chunks: list[datagen.Chunk], embedding: FixedEmbeddings
+) -> None:
+    store = store_for(engine, graph_name, embedding)
+    load(store, chunks[:30])
+    ranked = [d.id for d in store.similarity_search(chunks[20].text, k=5)]
+    retriever = AgensVectorRetriever(
+        vectorstore=store,
+        k=5,
+        retrieval_query="RETURN node.text AS text, score, {} AS metadata, node.__id__ AS doc_id",
+    )
+
+    aggregating = AgensVectorRetriever(
+        vectorstore=store,
+        k=5,
+        retrieval_query=(
+            "OPTIONAL MATCH (node)-[]->(x) WITH node, score, count(x) AS near "
+            "RETURN node.text AS text, score, {near: near} AS metadata, node.__id__ AS doc_id"
+        ),
+    )
+
+    def hashing() -> Program[object]:
+        # A hash join or a hash aggregate hands rows on in an order of its own, not the hits'.
+        return (
+            yield Statement(
+                "SELECT set_config('enable_nestloop', 'off', true), "
+                "set_config('enable_mergejoin', 'off', true), "
+                "set_config('enable_sort', 'off', true)"
+            )
         )
-        assert store.embedding_dimension == 10
 
-    def test_a_model_of_the_wrong_width_is_refused_on_the_first_write(self, seeded) -> None:
-        class Wider(self.Counting):
-            def embed_documents(self, texts):
-                return [[0.1] * 99 for _ in texts]
+    with engine.transaction():
+        engine.run(hashing, graph=graph_name)
+        assert [d.id for d in retriever.invoke(chunks[20].text)] == ranked
+        assert [d.id for d in aggregating.invoke(chunks[20].text)] == ranked
 
-            def embed_query(self, text):
-                return [0.1] * 99
 
-        store = AgensgraphVector.from_existing_index(
-            embedding=Wider(),
-            url=url,
-            graph_name="vector_width_it",
-            index_name="width_vec",
-            node_label="WidthChunk",
+def test_the_retriever_takes_k_from_the_call_then_the_search_kwargs(
+    engine: AgensEngine, graph_name: str, chunks: list[datagen.Chunk], embedding: FixedEmbeddings
+) -> None:
+    store = store_for(engine, graph_name, embedding)
+    load(store, chunks[:30])
+    retriever = AgensVectorRetriever(vectorstore=store, k=1, search_kwargs={"k": 3})
+    assert len(retriever.invoke(chunks[0].text)) == 3
+    assert len(retriever.invoke(chunks[0].text, k=5)) == 5
+    assert all("score" in d.metadata for d in retriever.invoke(chunks[0].text))
+
+
+def test_graph_context_brings_the_neighbourhood(
+    dsn: str,
+    engine: AgensEngine,
+    graph_name: str,
+    chunks: list[datagen.Chunk],
+    embedding: FixedEmbeddings,
+) -> None:
+    store = store_for(engine, graph_name, embedding)
+    load(store, chunks[:10])
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(sql.SQL("SET graph_path = {}").format(sql.Identifier(graph_name)))
+        conn.execute("CREATE VLABEL Entity")
+        conn.execute("CREATE ELABEL MENTIONS")
+        conn.execute("CREATE ELABEL KNOWS")
+        conn.execute(
+            "MATCH (c:\"Chunk\" {__id__: %s}) CREATE (c)-[:MENTIONS]->(:Entity {name: 'Ada'})"
+            "-[:KNOWS]->(:Entity {name: 'Bob'})",
+            (Jsonb(chunks[0].id),),
         )
-        with pytest.raises(ValueError, match="dimensions do not match"):
-            store.add_texts(["one of the wrong width"])
+    retriever = AgensGraphContextRetriever(
+        vectorstore=store, k=1, hops=2, document_formatter=render_graph_context
+    )
+    (doc,) = retriever.invoke(chunks[0].text)
+    names = sorted(n["properties"]["name"] for n in doc.metadata["_context_nodes_"])
+    assert names == ["Ada", "Bob"]
+    assert sorted(r["type"] for r in doc.metadata["_context_rels_"]) == ["knows", "mentions"]
+    assert "entity:Ada -[knows]-> entity:Bob" in doc.page_content
+    one_hop = AgensGraphContextRetriever(vectorstore=store, k=1, hops=1)
+    assert len(one_hop.invoke(chunks[0].text)[0].metadata["_context_nodes_"]) == 1
+    typed = AgensGraphContextRetriever(vectorstore=store, k=1, hops=2, relationship_type="mentions")
+    assert len(typed.invoke(chunks[0].text)[0].metadata["_context_nodes_"]) == 1
+    # A retrieval query the store holds is for AgensVectorRetriever; the seeds here go past it.
+    queried = store_for(
+        engine, graph_name, embedding, retrieval_query="RETURN node.text AS text, score, {} AS m"
+    )
+    (seed,) = AgensGraphContextRetriever(vectorstore=queried, k=1, hops=2).invoke(chunks[0].text)
+    assert seed.metadata["_seed_id_"] != "None"
+    assert sorted(n["properties"]["name"] for n in seed.metadata["_context_nodes_"]) == [
+        "Ada",
+        "Bob",
+    ]
 
 
-class TestPerCallRetrievalQuery:
-    """One store, many shapes: a search names its own retrieval query.
-
-    The override exists so several retrievers can share one store -- and its one
-    connection pool -- while each reads a different context. These tests hold the two
-    properties that make that safe: the override shapes only the call that carries it,
-    and the store's own query is untouched afterwards.
-    """
-
-    OVERRIDE = """
-        RETURN 'overridden' AS text, score, node.__id__ AS doc_id,
-        {{shape: 'override'}} AS metadata
-    """
-
-    def test_override_shapes_one_call_only(self) -> None:
-        docsearch = AgensgraphVector.from_texts(
-            texts=texts,
-            embedding=FakeEmbeddings(),
-            pre_delete_collection=True,
-            url=url,
+def test_graph_context_is_capped_and_a_seed_alone_has_none(
+    dsn: str,
+    engine: AgensEngine,
+    graph_name: str,
+    chunks: list[datagen.Chunk],
+    embedding: FixedEmbeddings,
+) -> None:
+    store = store_for(engine, graph_name, embedding)
+    load(store, chunks[:3])
+    numbers = ", ".join(str(i) for i in range(30))
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(sql.SQL("SET graph_path = {}").format(sql.Identifier(graph_name)))
+        conn.execute("CREATE VLABEL Entity")
+        conn.execute("CREATE ELABEL MENTIONS")
+        conn.execute(
+            f'MATCH (c:"Chunk" {{__id__: %s}}) UNWIND [{numbers}] AS i '
+            "CREATE (c)-[:MENTIONS]->(:Entity {i: i})",
+            (Jsonb(chunks[0].id),),
         )
-        shaped = docsearch.similarity_search("foo", k=1, retrieval_query=self.OVERRIDE)
-        assert _no_id(shaped) == [
-            Document(page_content="overridden", metadata={"shape": "override"})
+    few_nodes = AgensGraphContextRetriever(vectorstore=store, k=1, max_context_nodes=5)
+    (hub,) = few_nodes.invoke(chunks[0].text)
+    assert len(hub.metadata["_context_nodes_"]) == 5
+    assert len(hub.metadata["_context_rels_"]) <= 20
+    few_edges = AgensGraphContextRetriever(vectorstore=store, k=1, max_context_rels=4)
+    (hub,) = few_edges.invoke(chunks[0].text)
+    assert len(hub.metadata["_context_rels_"]) == len(hub.metadata["_context_nodes_"]) == 4
+    (alone,) = few_nodes.invoke(chunks[1].text)
+    assert alone.metadata["_context_nodes_"] == [] and alone.metadata["_context_rels_"] == []
+
+
+def test_graph_context_reads_only_what_its_caps_keep_and_keeps_what_the_whole_walk_would(
+    dsn: str,
+    engine: AgensEngine,
+    graph_name: str,
+    chunks: list[datagen.Chunk],
+    embedding: FixedEmbeddings,
+) -> None:
+    store = store_for(engine, graph_name, embedding)
+    load(store, chunks[:3])
+    numbers = ", ".join(str(i) for i in range(12))
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(sql.SQL("SET graph_path = {}").format(sql.Identifier(graph_name)))
+        conn.execute("CREATE VLABEL Entity")
+        conn.execute("CREATE ELABEL MENTIONS")
+        conn.execute("CREATE ELABEL KNOWS")
+        conn.execute(
+            f'MATCH (c:"Chunk" {{__id__: %s}}) UNWIND [{numbers}] AS i '
+            "CREATE (c)-[:MENTIONS]->(:Entity {i: i})",
+            (Jsonb(chunks[0].id),),
+        )
+        conn.execute("MATCH (e:Entity) UNWIND [0, 1, 2] AS j CREATE (e)-[:KNOWS]->(:Entity {j: j})")
+    retriever = AgensGraphContextRetriever(
+        vectorstore=store, k=1, hops=2, max_context_nodes=7, max_context_rels=9
+    )
+    (doc,) = retriever.invoke(chunks[0].text)
+    hits = store._search_hits(chunks[0].text, 1, None, retrieval_query=None)
+    seeds = [gid for _, _, gid in hits]
+    capped = engine.run(lambda: retriever._walk(hits), graph=graph_name)
+    whole = engine.run(
+        lambda: walk(
+            graph_name, seeds, hops=2, cap=9, nodes=10**6, rels=10**6, relationship_type=None
+        ),
+        graph=graph_name,
+    )
+    assert len(capped) < len(whole)
+    ((expected, _),) = retriever._with_context(hits, whole)
+    assert doc.metadata["_context_nodes_"] == expected.metadata["_context_nodes_"]
+    assert doc.metadata["_context_rels_"] == expected.metadata["_context_rels_"]
+    assert len(doc.metadata["_context_nodes_"]) == 7
+    assert len(doc.metadata["_context_rels_"]) == 9
+
+
+@pytest.mark.parametrize(
+    ("index", "built_with"),
+    [
+        (IndexConfig(method="ivfflat", lists=4), "lists='4'"),
+        (IndexConfig(m=8, ef_construction=32), "m='8', ef_construction='32'"),
+    ],
+)
+def test_each_index_is_built_with_its_settings_and_searched(
+    dsn: str,
+    engine: AgensEngine,
+    graph_name: str,
+    chunks: list[datagen.Chunk],
+    embedding: FixedEmbeddings,
+    index: IndexConfig,
+    built_with: str,
+) -> None:
+    store = store_for(engine, graph_name, embedding, index=index)
+    load(store, chunks)
+    assert store.index_status()["indexed"]
+    with psycopg.connect(dsn) as conn:
+        definitions = [
+            row[0]
+            for row in conn.execute(
+                "SELECT indexdef FROM pg_indexes WHERE schemaname = %s",
+                (f"{graph_name}_store",),
+            )
         ]
-        # The next plain search still reads the store's default shape.
-        plain = docsearch.similarity_search("foo", k=1)
-        assert _no_id(plain) == [Document(page_content="foo")]
-        drop_vector_indexes(docsearch)
-
-    def test_override_wins_over_the_stores_own(self) -> None:
-        docsearch = AgensgraphVector.from_texts(
-            texts=texts,
-            embedding=FakeEmbeddings(),
-            pre_delete_collection=True,
-            retrieval_query="RETURN 'constructor' AS text, score, {{}} AS metadata",
-            url=url,
-        )
-        shaped = docsearch.similarity_search("foo", k=1, retrieval_query=self.OVERRIDE)
-        assert shaped[0].page_content == "overridden"
-        # And without the override the constructor's query still answers.
-        assert docsearch.similarity_search("foo", k=1)[0].page_content == "constructor"
-        drop_vector_indexes(docsearch)
-
-    async def test_the_async_path_carries_the_override(self) -> None:
-        docsearch = AgensgraphVector.from_texts(
-            texts=texts,
-            embedding=FakeEmbeddings(),
-            pre_delete_collection=True,
-            url=url,
-        )
-        shaped = await docsearch.asimilarity_search("foo", k=1, retrieval_query=self.OVERRIDE)
-        assert _no_id(shaped) == [
-            Document(page_content="overridden", metadata={"shape": "override"})
-        ]
-        await docsearch.aclose()
-        drop_vector_indexes(docsearch)
+    assert any(f"USING {index.method}" in d and built_with in d for d in definitions)
+    found = store.similarity_search_by_vector(list(chunks[7].embedding), k=3)
+    assert found[0].id == chunks[7].id
 
 
-class TestAsyncHybridConfig:
-    """The async twin takes the fusion knobs the blocking one does.
+def test_a_least_privileged_role_writes_and_searches_but_leaves_the_index_to_the_owner(
+    dsn: str,
+    engine: AgensEngine,
+    graph_name: str,
+    chunks: list[datagen.Chunk],
+    embedding: FixedEmbeddings,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    owner_store = store_for(engine, graph_name, embedding, index_build="manual")
+    owner_store.setup()
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(render_grants(graph_name))
+    with AgensEngine(make_conninfo(dsn, user="app_rw", password="agens")) as app:
+        store = AgensgraphVector(embedding, engine=app, graph_name=graph_name)
+        load(store, chunks[:20])
+        assert store.similarity_search(chunks[1].text, k=1)[0].id == chunks[1].id
+        with pytest.raises(psycopg.errors.InsufficientPrivilege):
+            store.build_index()
+        store.delete([chunks[1].id])
+    assert owner_store.build_index()
 
-    Before, ``hybrid_config`` reached `_build_search` only by falling through
-    ``**kwargs``; naming it is what this test pins, by asserting the two paths fuse
-    identically under a knob that is not the default.
-    """
 
-    async def test_the_twins_fuse_alike(self) -> None:
-        from langchain_agensgraph.vectorstores.agensgraph_vector import (
-            HybridSearchConfig,
-        )
+async def test_the_awaiting_interface_does_the_same(
+    engine: AgensEngine, graph_name: str, chunks: list[datagen.Chunk], embedding: FixedEmbeddings
+) -> None:
+    store = store_for(engine, graph_name, embedding, search_type="hybrid")
+    ids = await store.aadd_texts(
+        [c.text for c in chunks[:30]],
+        [dict(c.metadata) for c in chunks[:30]],
+        ids=[c.id for c in chunks[:30]],
+    )
+    assert ids == [c.id for c in chunks[:30]]
+    assert (await store.asimilarity_search(chunks[3].text, k=1))[0].id == chunks[3].id
+    assert [d.id for d in await store.aget_by_ids([chunks[2].id])] == [chunks[2].id]
+    await store.adelete([chunks[3].id])
+    assert await store.aget_by_ids([chunks[3].id]) == []
+    retriever = AgensGraphContextRetriever(vectorstore=store, k=2)
+    assert len(await retriever.ainvoke(chunks[4].text)) == 2
+    await engine.aclose()
 
-        docsearch = AgensgraphVector.from_texts(
-            texts=texts,
-            embedding=FakeEmbeddings(),
-            pre_delete_collection=True,
-            search_type=SearchType.HYBRID,
-            url=url,
-        )
-        sharp = HybridSearchConfig(rank_constant=1, keyword_weight=2.0)
-        wanted = docsearch.similarity_search_with_score("foo", k=3, hybrid_config=sharp)
-        got = await docsearch.asimilarity_search_with_score("foo", k=3, hybrid_config=sharp)
-        assert [(d.page_content, s) for d, s in _no_id(wanted)] == [
-            (d.page_content, s) for d, s in _no_id(got)
-        ]
-        await docsearch.aclose()
-        drop_fulltext_indexes(docsearch)
-        drop_vector_indexes(docsearch)
+
+async def test_an_awaiting_store_infers_its_dimension(engine: AgensEngine, graph_name: str) -> None:
+    store = store_for(engine, graph_name, DeterministicFakeEmbedding(size=5))
+    await store.aadd_texts(["one", "two"])
+    assert store.dims == 5
+    await engine.aclose()

@@ -1,92 +1,62 @@
-"""Retrieve documents by vector or hybrid similarity over an AgensgraphVector."""
+"""Retrieve chunks by vector or hybrid similarity over an :class:`AgensgraphVector`."""
 
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from langchain_core.callbacks import (
     AsyncCallbackManagerForRetrieverRun,
     CallbackManagerForRetrieverRun,
 )
 from langchain_core.documents import Document
+from pydantic import Field
 
 from langchain_agensgraph.retrievers._base import _AgensRetrieverBase
-from langchain_agensgraph.vectorstores.agensgraph_vector import (
-    AgensgraphVector,
-    HybridSearchConfig,
-)
+from langchain_agensgraph.vectorstores.agensgraph_vector import AgensgraphVector
 
 
 class AgensVectorRetriever(_AgensRetrieverBase):
-    """Seed-only retrieval: one similarity search, scored documents out.
+    """One similarity search, scored documents out.
 
-    The store decides whether that search is a plain vector scan or the
-    server-side reciprocal-rank fusion of vector and keyword halves -- both run
-    as one statement, so a retrieval is one server round trip either way. Every
-    knob here is a default a call may override: ``retriever.invoke(query, k=8,
-    filter=...)`` reaches the same search the constructor's values do.
+    ``search_kwargs`` go to the store's search on every call (``filter``, ``fetch_k``, ...), and
+    a call's own arguments win over them. ``k`` is taken from the call, then from
+    ``search_kwargs``, then from the field. ``retrieval_query`` reads each hit again through
+    Cypher, with ``node`` and ``score`` in scope, returning ``text``, ``score`` and ``metadata``;
+    rows returning the hit's own ``score`` come back best first, even from a query that aggregates::
 
-    ``retrieval_query`` shapes what each hit returns without touching the store,
-    so several retrievers can share one store -- and its one connection pool --
-    while each reads a different context. The query sees ``node`` (or
-    ``relationship``) and ``score``, returns ``text``, ``score``, ``doc_id`` and
-    ``metadata``, and doubles literal braces.
-
-    Example:
-        .. code-block:: python
-
-            from langchain_agensgraph import AgensgraphVector
-            from langchain_agensgraph.retrievers import AgensVectorRetriever
-
-            store = AgensgraphVector.from_existing_index(embedding, url=url)
-            retriever = AgensVectorRetriever(store=store, k=6)
-            docs = retriever.invoke("what failed over the weekend?")
+        retriever = AgensVectorRetriever(
+            vectorstore=store,
+            retrieval_query=(
+                "OPTIONAL MATCH (node)-[:MENTIONS]->(e) "
+                "WITH node, score, collect(e.name) AS entities "
+                "RETURN node.text AS text, score, {entities: entities} AS metadata"
+            ),
+        )
     """
 
-    store: AgensgraphVector
-    filter: Optional[Dict[str, Any]] = None
-    params: Optional[Dict[str, Any]] = None
-    effective_search_ratio: float = 1.0
-    search_options: Optional[Dict[str, Any]] = None
-    hybrid_config: Optional[HybridSearchConfig] = None
-    retrieval_query: Optional[str] = None
+    vectorstore: AgensgraphVector
+    search_kwargs: dict[str, Any] = Field(default_factory=dict)
+    retrieval_query: str | None = None
 
-    def _effective_retrieval_query(self) -> Optional[str]:
-        """The retrieval query this retriever runs; subclasses own theirs."""
-        return self.retrieval_query
-
-    def _search_kwargs(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        """This call's search arguments: the retriever's, with overrides laid over."""
-        return {
-            "k": kwargs.get("k", self.k),
-            "filter": kwargs.get("filter", self.filter),
-            "params": kwargs.get("params", self.params),
-            "effective_search_ratio": kwargs.get(
-                "effective_search_ratio", self.effective_search_ratio
-            ),
-            "search_options": kwargs.get("search_options", self.search_options),
-            "hybrid_config": kwargs.get("hybrid_config", self.hybrid_config),
-            "retrieval_query": self._effective_retrieval_query(),
-        }
+    def _arguments(self, kwargs: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        search = {**self.search_kwargs, **kwargs}
+        k = int(search.pop("k", self.k))
+        if self.retrieval_query is not None:
+            search.setdefault("retrieval_query", self.retrieval_query)
+        return k, search
 
     def _get_relevant_documents(
         self, query: str, *, run_manager: CallbackManagerForRetrieverRun, **kwargs: Any
-    ) -> List[Document]:
-        hits = self.store.similarity_search_with_score(query, **self._search_kwargs(kwargs))
+    ) -> list[Document]:
+        k, search = self._arguments(kwargs)
+        where = search.pop("filter", None)
+        hits = self.vectorstore.similarity_search_with_score(query, k, where, **search)
         return self._finalize(hits)
 
     async def _aget_relevant_documents(
-        self,
-        query: str,
-        *,
-        run_manager: AsyncCallbackManagerForRetrieverRun,
-        **kwargs: Any,
-    ) -> List[Document]:
-        # The embedding is awaited too: a provider's embed call is a network
-        # round trip, and running it blocking inside the loop would serialize
-        # every concurrent retrieval behind it.
-        embedding = await self.store.embedding.aembed_query(query)
-        hits = await self.store.asimilarity_search_with_score_by_vector(
-            embedding=embedding, query=query, **self._search_kwargs(kwargs)
-        )
+        self, query: str, *, run_manager: AsyncCallbackManagerForRetrieverRun, **kwargs: Any
+    ) -> list[Document]:
+        k, search = self._arguments(kwargs)
+        where = search.pop("filter", None)
+        hits = await self.vectorstore.asimilarity_search_with_score(query, k, where, **search)
         return self._finalize(hits)

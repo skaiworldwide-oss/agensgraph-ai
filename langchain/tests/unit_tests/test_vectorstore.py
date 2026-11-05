@@ -1,150 +1,155 @@
-"""Test AgensGraph functionality."""
+"""The vector store's filters, configuration and statements, without a server."""
+
+from __future__ import annotations
+
+import math
 
 import pytest
+from agensgraph import Distance, InTable, Jsonb, VectorStorage
 
-from langchain_agensgraph.vectorstores.agensgraph_vector import (
-    AgensgraphVector,
-    dict_to_yaml_str,
-    remove_lucene_chars,
+from langchain_agensgraph.vectorstores import DistanceStrategy, IndexConfig, KeywordConfig
+from langchain_agensgraph.vectorstores._sql import Layout, keyword_text
+from langchain_agensgraph.vectorstores.config import distance_of, relevance_function
+from langchain_agensgraph.vectorstores.filters import translate
+from tests.filter_oracle import matches
+
+
+def test_no_filter_is_true() -> None:
+    assert translate(None) == ("TRUE", [])
+    assert translate({}) == ("TRUE", [])
+
+
+def test_equality_and_membership_are_containment() -> None:
+    text, params = translate({"lang": "en"})
+    assert text == "l.properties @> %s::jsonb"
+    assert isinstance(params[0], Jsonb) and params[0].obj == {"lang": "en"}
+    text, params = translate({"lang": {"$nin": ["en", "ko"]}})
+    assert text == "NOT (l.properties @> ANY(%s::jsonb[]))"
+    assert [p.obj for p in params[0]] == [{"lang": "en"}, {"lang": "ko"}]
+
+
+def test_a_comparison_is_bracketed_by_the_values_type() -> None:
+    text, params = translate({"year": {"$gte": 2020}})
+    assert "jsonb_typeof((l.properties->'year')) = 'number'" in text
+    assert "(l.properties->'year') >= %s::jsonb" in text
+    text, _ = translate({"name": {"$lt": "m"}})
+    assert "= 'string'" in text
+
+
+def test_combinators_nest() -> None:
+    text, params = translate({"$or": [{"a": 1}, {"$and": [{"b": 2}, {"$not": {"c": 3}}]}]})
+    assert text.count("@>") == 3 and "NOT (" in text and " OR " in text
+    assert len(params) == 3
+
+
+def test_a_key_is_quoted_and_a_percent_doubled() -> None:
+    text, _ = translate({"it's 50%": {"$exists": True}})
+    assert "'it''s 50%%'" in text
+
+
+def test_empty_membership_needs_no_parameter() -> None:
+    assert translate({"a": {"$in": []}}) == ("FALSE", [])
+    assert translate({"a": {"$nin": []}}) == ("TRUE", [])
+
+
+@pytest.mark.parametrize(
+    "where",
+    [
+        {"$bogus": 1},
+        {"a": {"$bogus": 1}},
+        {"a": None},
+        {"a": {"$gt": True}},
+        {"a": {"$gt": [1]}},
+        {"a": {"$between": [1, "z"]}},
+        {"a": {"$between": [1]}},
+        {"a": {"$like": 3}},
+        {"a": {"$exists": "yes"}},
+        {"$and": []},
+        {"a": {"$in": "abc"}},
+        {"a": float("nan")},
+        {"": 1},
+        {"a\x00b": 1},
+    ],
 )
-from langchain_agensgraph.vectorstores.utils import DistanceStrategy
+def test_a_filter_that_cannot_mean_one_thing_is_refused(where: dict) -> None:
+    with pytest.raises(ValueError):
+        translate(where)
 
 
-def test_escaping_lucene() -> None:
-    """Test escaping lucene characters"""
-    assert remove_lucene_chars("Hello+World") == "Hello World"
-    assert remove_lucene_chars("Hello World\\") == "Hello World"
-    assert (
-        remove_lucene_chars("It is the end of the world. Take shelter!")
-        == "It is the end of the world. Take shelter"
+@pytest.mark.parametrize(
+    "where, metadata, expected",
+    [
+        ({"a": 1}, {"a": 1.0}, True),
+        ({"a": 1}, {"a": True}, False),
+        ({"a": True}, {"a": 1}, False),
+        ({"a": {"$ne": 1}}, {}, True),
+        ({"a": {"$gt": 5}}, {"a": "9"}, False),
+        ({"a": {"$gt": "5"}}, {"a": "9"}, True),
+        ({"a": {"$like": "n1%"}}, {"a": "n12"}, True),
+        ({"a": {"$like": "n1_"}}, {"a": "n123"}, False),
+        ({"a": {"$ilike": "N%"}}, {"a": "nb"}, True),
+        ({"a": {"$exists": False}}, {"b": 1}, True),
+        ({"a": {"$in": [1, 2]}}, {"a": [1, 2]}, False),
+        ({"$not": {"a": 1}}, {"a": 2}, True),
+    ],
+)
+def test_the_reference_evaluator(where: dict, metadata: dict, expected: bool) -> None:
+    assert matches(where, metadata) is expected
+
+
+def test_each_strategy_names_a_driver_distance() -> None:
+    assert distance_of("COSINE") is Distance.COSINE
+    assert distance_of(DistanceStrategy.TAXICAB) is Distance.L1
+    with pytest.raises(ValueError, match="bit strings"):
+        distance_of(DistanceStrategy.HAMMING)
+
+
+def test_relevance_runs_from_one_at_no_distance() -> None:
+    assert relevance_function(DistanceStrategy.COSINE)(0.0) == 1.0
+    assert relevance_function(DistanceStrategy.EUCLIDEAN_DISTANCE)(math.sqrt(2)) == 0.0
+    inner = relevance_function(DistanceStrategy.MAX_INNER_PRODUCT)
+    assert (inner(-1.0), inner(0.0), inner(1.0)) == (1.0, 0.5, 0.0)
+    # Nearer is never less relevant: an inner product of 0.5 outranks one of -0.1.
+    assert inner(-0.5) > inner(0.1)
+    with pytest.raises(ValueError, match="relevance_score_fn"):
+        relevance_function(DistanceStrategy.TAXICAB)
+
+
+def test_an_index_configuration_becomes_the_drivers() -> None:
+    assert IndexConfig().driver().m == 16
+    assert IndexConfig(method="ivfflat", lists=7).driver().lists == 7
+
+
+def layout(**kwargs: object) -> Layout:
+    storage = VectorStorage(
+        "g",
+        "Doc",
+        dimensions=4,
+        storage=InTable(schema="g_store", name="Doc__embedding__vec"),
     )
-    assert (
-        remove_lucene_chars("It is the end of the world. Take shelter&&")
-        == "It is the end of the world. Take shelter"
-    )
-    assert remove_lucene_chars("Bill&&Melinda Gates Foundation") == "Bill  Melinda Gates Foundation"
-    assert (
-        remove_lucene_chars("It is the end of the world. Take shelter(&&)")
-        == "It is the end of the world. Take shelter"
-    )
-    assert (
-        remove_lucene_chars("It is the end of the world. Take shelter??")
-        == "It is the end of the world. Take shelter"
-    )
-    assert (
-        remove_lucene_chars("It is the end of the world. Take shelter^")
-        == "It is the end of the world. Take shelter"
-    )
-    assert (
-        remove_lucene_chars("It is the end of the world. Take shelter+")
-        == "It is the end of the world. Take shelter"
-    )
-    assert (
-        remove_lucene_chars("It is the end of the world. Take shelter-")
-        == "It is the end of the world. Take shelter"
-    )
-    assert (
-        remove_lucene_chars("It is the end of the world. Take shelter~")
-        == "It is the end of the world. Take shelter"
+    return Layout(
+        graph="g",
+        label="Doc",
+        text_property="text",
+        storage=storage,
+        keyword=KeywordConfig(),
+        filter_keys=("year",),
+        **kwargs,  # type: ignore[arg-type]
     )
 
 
-def test_converting_to_yaml() -> None:
-    example_dict = {
-        "name": "John Doe",
-        "age": 30,
-        "skills": ["Python", "Data Analysis", "Machine Learning"],
-        "location": {"city": "Ljubljana", "country": "Slovenia"},
-    }
+def test_the_layout_names_everything_in_the_companion_schema() -> None:
+    made = layout()
+    assert made.vector_table == '"g_store"."Doc__embedding__vec"'
+    assert made.text_table == '"g_store"."Doc__embedding__fts"'
+    assert made.required()[:2] == [("g", "Doc"), ("g", "Doc__id__")]
+    assert ("g", "Doc__meta__year") in made.required()
+    assert ("g_store", "Doc__embedding__vec") in made.required()
+    assert "ORDER BY distance LIMIT" in made.nearest("TRUE", embeddings=False, exact=False)
+    assert "ORDER BY distance, l.id LIMIT" in made.nearest("TRUE", embeddings=False, exact=True)
 
-    yaml_str = dict_to_yaml_str(example_dict)
 
-    expected_output = (
-        "name: John Doe\nage: 30\nskills:\n- Python\n- "
-        "Data Analysis\n- Machine Learning\nlocation:\n  city: Ljubljana\n"
-        "  country: Slovenia\n"
+def test_the_keyword_text_reads_the_named_properties_in_order() -> None:
+    assert keyword_text({"text": "a", "title": "b", "n": 3}, ["title", "text", "n", "x"]) == (
+        "b\na\n3"
     )
-
-    assert yaml_str == expected_output
-
-
-class _FakeConnection:
-    """Answers the two capability questions and records what was sent."""
-
-    def __init__(self, version=(0, 8, 5)):
-        self._version = version
-        self.statements: list = []
-
-    def has_vectors(self) -> bool:
-        return self._version is not None
-
-    def vector_version(self):
-        return self._version
-
-    def execute(self, statement, *args, **kwargs):
-        self.statements.append(str(statement))
-        return self
-
-
-def _store(version, **attrs):
-    """A store with only what the capability checks read, and no database."""
-    store = AgensgraphVector.__new__(AgensgraphVector)
-    store.connection = _FakeConnection(version)
-    store._vector_type = attrs.get("vector_type", "vector")
-    store._distance_strategy = attrs.get("distance_strategy", DistanceStrategy.COSINE)
-    store._search_options = attrs.get("search_options", {})
-    return store
-
-
-class TestVectorSupportIsRead:
-    """Whether vectors can be read is a catalog question, not a privilege."""
-
-    def test_a_database_with_pgvector_is_accepted_without_sending_anything(self):
-        store = _store((0, 8, 5))
-        store.verify_vector_support()
-        assert store.connection.statements == []
-
-    def test_a_database_without_it_is_told_what_to_run(self):
-        store = _store(None)
-        with pytest.raises(ValueError, match="CREATE EXTENSION vector"):
-            store.verify_vector_support()
-        # Creating an extension is a privilege an application role usually lacks, and
-        # trying it reports the refusal as pgvector not being on the server.
-        assert store.connection.statements == []
-
-
-class TestAFeatureNamesTheVersionItNeeds:
-    """pgvector gates its own features, and a server without one says so obscurely."""
-
-    @pytest.mark.parametrize(
-        "version,attrs,needs",
-        [
-            ((0, 6, 0), {"vector_type": "halfvec"}, "0.7.0"),
-            ((0, 6, 0), {"vector_type": "sparsevec"}, "0.7.0"),
-            ((0, 6, 0), {"distance_strategy": DistanceStrategy.TAXICAB}, "0.7.0"),
-            (
-                (0, 7, 4),
-                {"search_options": {"hnsw.iterative_scan": "relaxed_order"}},
-                "0.8.0",
-            ),
-        ],
-    )
-    def test_too_old_is_refused_by_number(self, version, attrs, needs):
-        store = _store(version, **attrs)
-        with pytest.raises(ValueError, match=needs):
-            store._verify_vector_version()
-
-    @pytest.mark.parametrize(
-        "attrs",
-        [
-            {"vector_type": "halfvec"},
-            {"vector_type": "sparsevec"},
-            {"distance_strategy": DistanceStrategy.TAXICAB},
-            {"search_options": {"hnsw.iterative_scan": "relaxed_order"}},
-        ],
-    )
-    def test_new_enough_is_accepted(self, attrs):
-        _store((0, 8, 0), **attrs)._verify_vector_version()
-
-    def test_the_ordinary_configuration_needs_nothing_recent(self):
-        _store((0, 5, 0))._verify_vector_version()

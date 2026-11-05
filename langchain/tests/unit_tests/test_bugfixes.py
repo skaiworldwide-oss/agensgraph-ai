@@ -16,18 +16,6 @@ from langchain_agensgraph.graphs.agensgraph import (
     AgensQueryException,
     _sanitize_value,
 )
-from langchain_agensgraph.vectorstores.agensgraph_vector import (
-    DEFAULT_VECTOR_INDEX_AM,
-    VectorIndexAM,
-)
-
-
-def test_ivfflat_enum_value_is_pgvector_name() -> None:
-    # Old enum value was "IVFLLAT" (extra L) which pgvector rejects in DDL.
-    assert VectorIndexAM.IVFFLAT.value == "ivfflat"
-    assert VectorIndexAM.HNSW.value == "HNSW"
-    # Default remains HNSW; the bugfix is just that the IVFFLAT option now works.
-    assert DEFAULT_VECTOR_INDEX_AM is VectorIndexAM.HNSW
 
 
 def test_query_exception_keeps_the_servers_own_account() -> None:
@@ -45,28 +33,11 @@ def test_query_exception_still_reads_the_other_spelling() -> None:
     assert exc.get_details() == "the real cause"
 
 
-def test_one_query_exception_class_for_the_package() -> None:
-    # Two byte-identical copies would mean `except` on one does not catch the other, so
-    # both modules must name the same object.
-    from langchain_agensgraph.vectorstores import agensgraph_vector as vec
-
-    assert vec.AgensQueryException is AgensQueryException
-
-
 def test_refresh_schema_accepts_force_and_ttl() -> None:
     sig = inspect.signature(AgensGraph.refresh_schema)
     assert "force" in sig.parameters
     init_sig = inspect.signature(AgensGraph.__init__)
     assert "schema_cache_ttl" in init_sig.parameters
-
-
-def test_no_debug_prints_in_vectorstore_module() -> None:
-    # Bug: `print("DEBUG: ...")` at two callsites — replaced by self.logger.debug.
-    import langchain_agensgraph.vectorstores.agensgraph_vector as mod
-
-    src = inspect.getsource(mod)
-    assert 'print("DEBUG:' not in src
-    assert "print('DEBUG:" not in src
 
 
 def test_nothing_installs_a_plpgsql_typeof() -> None:

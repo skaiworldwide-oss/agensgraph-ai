@@ -30,6 +30,16 @@ test-images: ## Build the agensgraph-test image for every leg (local only)
 			-t agensgraph-test:$$leg-pgvector$(PGVECTOR) tests/images || exit 1; \
 	done
 
+MATRIX_TESTS ?= tests/unit_tests tests/integration_tests
+comma := ,
+
+test-matrix: ## Run the unit and integration suites against each compose leg in turn
+	@for pair in $(subst $(comma), ,$(COMPAT_DSNS)); do \
+		label=$${pair%%=*}; dsn=$${pair#*=}; echo "== $$label"; \
+		AGENSGRAPH_TEST_DSN="$$dsn" REQUIRE_SERVER=1 SKIP_LEDGER=tests/skip_ledger.toml \
+			python -X dev -m pytest -q $(MATRIX_TESTS) || exit 1; \
+	done
+
 test-compat: ## Run the phase-0 shape matrix against the compose legs
 	AGENSGRAPH_COMPAT_DSNS="$(COMPAT_DSNS)" AGENSGRAPH_COMPAT_DOCKER="$(COMPAT_DOCKER)" \
 		REQUIRE_SERVER=1 pytest tests/compat

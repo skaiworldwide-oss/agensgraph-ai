@@ -33,6 +33,8 @@ import pytest
 from psycopg import sql
 from psycopg.conninfo import conninfo_to_dict, make_conninfo
 
+from langchain_agensgraph._core.engine import AgensEngine
+
 ADMIN_DSN = os.environ.get("AGENSGRAPH_TEST_DSN", "")
 REQUIRE_SERVER = os.environ.get("REQUIRE_SERVER") == "1"
 OWNER_FUNCTIONS = ("agensgraph_build_index", "agensgraph_analyze")
@@ -183,6 +185,13 @@ def dsn() -> str:
     if not _worker_dsn:
         pytest.skip("set AGENSGRAPH_TEST_DSN to run the server tests")
     return _worker_dsn
+
+
+@pytest.fixture
+def engine(dsn: str) -> Iterator[AgensEngine]:
+    """An engine on this worker's database, closed with the test."""
+    with AgensEngine(dsn) as made:
+        yield made
 
 
 @pytest.fixture(scope="session")

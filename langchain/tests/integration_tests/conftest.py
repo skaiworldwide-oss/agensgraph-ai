@@ -11,7 +11,6 @@ collect_ignore = [
     "test_checkpoint.py",
     "test_composition.py",
     "test_cypher_qa.py",
-    "test_engine.py",
     "test_enhanced_schema.py",
     "test_graph_transformer_ingest.py",
     "test_graphstore.py",

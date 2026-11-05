@@ -16,32 +16,35 @@ cd langchain
 .venv/bin/python examples/demos/05_graph_retrievers/arxiv.py
 ```
 
+`retrieve.py` and `arxiv.py` need `AGENSGRAPH_UNTRUSTED_URL` (see the demos
+README, "Roles"); `DEMOS_FAKE=1` runs them on the fake models.
+
 ## Explore it interactively
 
-[`graph_retrievers.ipynb`](graph_retrievers.ipynb) is a runnable, pre-executed tour
-of everything the retriever family does, with real outputs: all three retrievers,
-the graph context rendered as a prompt reads it, the driver's own proof that a
-four-seed two-hop retrieval is **one** statement, the server refusing a generated
-write, self-correction recovering a direction-flipped relationship on the arXiv
-graph, the dialect example pack, an index created live and the plan changing with
-it, and the eval's plan claims re-proven cell by cell. Open it after `ingest.py`.
+[`graph_retrievers.ipynb`](graph_retrievers.ipynb) is a runnable tour of
+everything the retriever family does: all three retrievers, the graph context
+rendered as a prompt reads it, the driver's own proof that a four-seed two-hop
+retrieval is **two** statements, a generated write refused before it is sent,
+self-correction recovering a direction-flipped relationship on the arXiv graph,
+the dialect example pack, an index created live and the plan changing with it,
+and the eval's plan claims re-proven cell by cell. Open it after `ingest.py`.
 
 ## What it demonstrates
 
-- **`ingest.py`** — the movies are the vector store's own nodes (label `Movie`,
+- **`ingest.py`** — the movies are the vector store's own vertices (label `Movie`,
   plot text embedded, the title as `__id__`), with directors, actors and genres
   as ordinary graph structure around them.
 - **`retrieve.py`** — the same questions through three retrievers:
-  1. **`AgensVectorRetriever`** finds the right film by its plot — and cannot
-     name its director, because the plot never says.
-  2. **`AgensGraphContextRetriever`** runs the identical search with the film's
-     2-hop neighbourhood fetched **in the same statement**; the rendered
-     context names the director, and a director question routed through a
-     shared director ("which other film was made by...") resolves across two
-     hops.
+  1. **`AgensVectorRetriever(vectorstore=store)`** finds the right film by its
+     plot — and cannot name its director, because the plot never says.
+  2. **`AgensGraphContextRetriever(vectorstore=store, hops=2)`** runs the
+     identical search, then walks out from every hit at once, in one more
+     statement; the rendered context (`render_graph_context`) names the director,
+     and a director question routed through a shared director ("which other film
+     was made by...") resolves across two hops.
   3. **`AgensText2CypherRetriever`** answers the aggregate ("how many films did
      X direct?") by writing the Cypher itself — a similarity search has no
-     notion of *count*.
+     notion of *count*. The statement runs as `llm_ro`, after `render_grants`.
 
 Each answer prints with its retrieval wall-clock, and the text2cypher answer
 prints the Cypher it generated.
@@ -54,7 +57,7 @@ prints the Cypher it generated.
   question also shows `retry_on_empty` recovering from a relationship written
   against its schema direction — a query that runs clean and matches nothing.
 - **`bench/retriever_bench_arxiv.py`** — the module's numbers on that graph,
-  with no embedding API in the loop (query vectors are sampled from the store):
-  one-statement context vs one-query-per-seed, plan-shape proof, concurrency,
+  with no embedding API in the loop (query vectors are read from the store):
+  one walk from every seed vs one query per seed, plan-shape proof, concurrency,
   and the cautionary unfiltered two-hop walk through the Category/Year hubs
   that a `relationship_type` filter exists to avoid.

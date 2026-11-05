@@ -1,9 +1,9 @@
 """arXiv GraphRAG — query.
 
-Three ways to interrogate the graph + vector store built by ``prepare.py``:
+Three ways to interrogate the graph and vector store built by ``prepare.py``:
 
   (a) graph analytics in Cypher        (prolific authors, categories, co-authors)
-  (b) vector semantic search           (HNSW over Paper abstracts)
+  (b) vector semantic search           (HNSW over the Paper chunks)
   (c) hybrid GraphRAG                  (vector retrieve → graph expand → LLM answer)
 
     cd langchain
@@ -15,46 +15,50 @@ from __future__ import annotations
 
 import pathlib
 import sys
+from typing import Any, Dict, List, Tuple
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-from psycopg.types.json import Jsonb
-
-from langchain_agensgraph import AgensgraphVector
+from agensgraph import Jsonb
+from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
 
 from _common import agens, config, console
 from _common.models import get_embeddings, get_llm
+from langchain_agensgraph import AgensGraph, AgensgraphVector
 
 GRAPH = "arxiv"
+LABEL = "Paper"
 DEFAULT_QUESTION = "What methods are used for studying black hole thermodynamics?"
 
 
 # ── (a) graph analytics ──────────────────────────────────────────────────────
 
-def graph_analytics(graph) -> None:
+def graph_analytics(graph: AgensGraph) -> Dict[str, List[Dict[str, Any]]]:
     console.section("(a) graph analytics — Cypher over the knowledge graph")
+    out: Dict[str, List[Dict[str, Any]]] = {}
 
     console.sub("most prolific authors")
-    rows = graph.query(
+    out["authors"] = rows = graph.query(
         'MATCH (a:"Author")<-[:"AUTHORED_BY"]-(p:"Paper") '
-        "RETURN a.name AS author, count(p) AS papers "
+        "RETURN a.name AS author, count(*) AS papers "
         "ORDER BY papers DESC LIMIT 10"
     )
     console.table([(r["author"], r["papers"]) for r in rows], headers=["author", "papers"])
 
     console.sub("largest categories")
-    rows = graph.query(
+    out["categories"] = rows = graph.query(
         'MATCH (c:"Category")<-[:"IN_CATEGORY"]-(p:"Paper") '
-        "RETURN c.name AS category, count(p) AS papers "
+        "RETURN c.name AS category, count(*) AS papers "
         "ORDER BY papers DESC LIMIT 10"
     )
     console.table([(r["category"], r["papers"]) for r in rows], headers=["category", "papers"])
 
     console.sub("top co-authorship pairs")
-    rows = graph.query(
+    out["pairs"] = rows = graph.query(
         'MATCH (a1:"Author")<-[:"AUTHORED_BY"]-(p:"Paper")-[:"AUTHORED_BY"]->(a2:"Author") '
         "WHERE a1.name < a2.name "
-        "RETURN a1.name AS author_1, a2.name AS author_2, count(p) AS together "
+        "RETURN a1.name AS author_1, a2.name AS author_2, count(*) AS together "
         "ORDER BY together DESC LIMIT 10"
     )
     console.table(
@@ -63,43 +67,44 @@ def graph_analytics(graph) -> None:
     )
 
     console.sub("papers per year")
-    rows = graph.query(
+    out["years"] = rows = graph.query(
         'MATCH (p:"Paper")-[:"UPDATED_IN"]->(y:"Year") '
-        "RETURN y.year AS year, count(p) AS papers ORDER BY year"
+        "RETURN y.year AS year, count(*) AS papers ORDER BY year"
     )
     console.table([(r["year"], r["papers"]) for r in rows], headers=["year", "papers"])
+    return out
 
 
-# ── store reconstruction (idempotent: no re-embedding) ───────────────────────
+# ── the store over the existing Paper chunks (nothing is embedded again) ─────
 
-def get_store() -> AgensgraphVector:
-    return AgensgraphVector.from_existing_graph(
-        embedding=get_embeddings(),
-        node_label="Paper",
-        embedding_node_property="embedding",
-        text_node_properties=["title", "abstract"],
-        index_name="paper_vec",
-        graph_name=GRAPH,
+def get_store(embedding: Embeddings | None = None, graph_name: str = GRAPH) -> AgensgraphVector:
+    """The vector store ``prepare.py`` made; refused if it is not there."""
+    return AgensgraphVector.from_existing_index(
+        embedding or get_embeddings(),
         engine=agens.get_engine(),
+        graph_name=graph_name,
+        label=LABEL,
     )
 
 
 # ── (b) vector semantic search ───────────────────────────────────────────────
 
-def vector_search(store, query: str, k: int = 5) -> None:
+def vector_search(store: AgensgraphVector, query: str, k: int = 5) -> List[Tuple[Document, float]]:
     console.section(f"(b) vector semantic search — {query!r}")
-    with console.timer("similarity_search_with_score") as t:
-        hits = store.similarity_search_with_score(query, k=k)
+    with console.timer("similarity_search_with_relevance_scores") as t:
+        hits = store.similarity_search_with_relevance_scores(query, k=k)
     print("  " + t.rate(k, "results"))
-    for doc, score in hits:
-        title = doc.page_content.split("abstract:")[0].replace("title:", "").strip()
-        print(f"\n  [{score:.3f}] {title[:100]}")
+    for doc, relevance in hits:
+        print(f"\n  [{relevance:.3f}] {doc.metadata.get('title', '')[:100]}")
         print(f"        arXiv:{doc.metadata.get('id')}  year:{doc.metadata.get('year')}")
+    return hits
 
 
 # ── (c) hybrid GraphRAG ──────────────────────────────────────────────────────
 
-def graphrag(store, graph, llm, question: str, k: int = 5) -> None:
+def graphrag(
+    store: AgensgraphVector, graph: AgensGraph, llm, question: str, k: int = 5
+) -> Dict[str, Any]:
     console.section(f"(c) hybrid GraphRAG — {question!r}")
 
     # 1) vector-retrieve seed papers
@@ -107,7 +112,7 @@ def graphrag(store, graph, llm, question: str, k: int = 5) -> None:
     seed_ids = [d.metadata["id"] for d in seeds]
     print(f"  seed papers (vector): {', '.join(seed_ids)}")
 
-    # 2) graph-expand: related papers that share an author or a category
+    # 2) graph-expand: related papers that share an author
     related = graph.query(
         "UNWIND %(ids)s AS pid "
         'MATCH (p:"Paper" {id: pid})-[:"AUTHORED_BY"]->(:"Author")<-[:"AUTHORED_BY"]-(rel:"Paper") '
@@ -129,17 +134,16 @@ def graphrag(store, graph, llm, question: str, k: int = 5) -> None:
         "If the abstracts don't cover it, say so.\n\n"
         f"Question: {question}\n\nAbstracts:\n{context}\n\nAnswer:"
     )
-    with console.timer("LLM answer") as t:
-        answer = llm.invoke(prompt).content
+    with console.timer("LLM answer"):
+        answer = llm.invoke(prompt).text
     print(f"\n{answer}\n")
+    return {"seeds": seed_ids, "related": related, "answer": answer}
 
 
 def main() -> None:
     config.require_openai_key()
     question = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_QUESTION
-    # This demo runs only explicit Cypher + vector search, so skip the schema
-    # introspection scan at construction (see FINDINGS F-005).
-    graph = agens.make_graph(GRAPH, create=False, refresh_schema=False)
+    graph = agens.make_graph(GRAPH)
     try:
         graph_analytics(graph)
         store = get_store()

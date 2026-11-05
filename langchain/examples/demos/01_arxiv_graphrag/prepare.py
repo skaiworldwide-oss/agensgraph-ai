@@ -1,59 +1,58 @@
 """arXiv GraphRAG — ingest.
 
-Builds, in ONE AgensGraph graph, a knowledge graph of papers + authors +
-categories + years AND a pgvector (HNSW) index over the same Paper nodes:
+Builds, in ONE AgensGraph graph, a knowledge graph of papers, authors, categories and years, and
+a vector store over the same Paper vertices:
 
-    (:Paper {id,title,abstract,year})-[:AUTHORED_BY]->(:Author {name})
+    (:Paper {id,title,year,text})-[:AUTHORED_BY]->(:Author {name})
     (:Paper)-[:IN_CATEGORY]->(:Category {name})
     (:Paper)-[:UPDATED_IN]->(:Year {year})
 
-Data: real arXiv metadata streamed from Hugging Face (no full download). Paper
-nodes are embedded with OpenAI **concurrently** (many requests in flight) and
-indexed with pgvector HNSW. Re-runs only embed papers that don't already have an
-embedding, so a larger ARXIV_LIMIT simply APPENDS to (and reuses) an existing
-load. Everything runs through one shared AgensEngine connection pool.
+The papers are the vector store's own chunks (label ``Paper``), so the graph links to them with
+ordinary edges; their embeddings live in the graph's companion schema ``"arxiv_store"``, indexed
+with HNSW. The authors, categories and years go in with ``AgensGraph.add_graph_documents``,
+merged by id. Data: real arXiv metadata streamed from Hugging Face, or with ``DEMOS_FAKE=1`` the
+50 invented papers of ``_common/fixtures/arxiv.jsonl``.
+
+Embedding requests run concurrently (many in flight). A re-run embeds only papers not already
+stored, so a larger ARXIV_LIMIT appends to an existing load.
 
     cd langchain
     .venv/bin/python examples/demos/01_arxiv_graphrag/prepare.py
     ARXIV_LIMIT=2000 .venv/bin/python examples/demos/01_arxiv_graphrag/prepare.py   # quick
     ARXIV_RESET=1    .venv/bin/python examples/demos/01_arxiv_graphrag/prepare.py   # rebuild
 
-Knobs: ARXIV_LIMIT (default 50000), ARXIV_BATCH, ARXIV_RESET, EMBED_CONCURRENCY
-(parallel embedding requests, default 10), EMBED_BATCH (texts per request),
-ARXIV_BUILD_MEM (e.g. "4GB" — raise maintenance_work_mem for the HNSW build when
-loading millions of papers), ARXIV_SKIP_INGEST (skip streaming/ingest and only
-embed + index already-loaded papers — useful to resume after an interruption).
+Knobs: ARXIV_LIMIT (default 50000), ARXIV_BATCH (papers per write, default 1000), ARXIV_RESET,
+EMBED_CONCURRENCY (parallel embedding requests, default 10), EMBED_BATCH (texts per request,
+default 100).
 """
 
 from __future__ import annotations
 
-import asyncio
-import contextlib
 import os
 import pathlib
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Dict, Iterable, List, Optional
 
 # Make the demos root importable (dir names like "01_..." aren't valid packages).
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-import psycopg
-from psycopg.types.json import Jsonb
-
-from langchain_agensgraph import AgensgraphVector
+from langchain_core.embeddings import Embeddings
 
 from _common import agens, config, console
-from _common.datautil import batched, env_int, stream_hf
+from _common.datautil import batched, env_int, fixture, stream_hf
 from _common.models import get_embeddings
+from langchain_agensgraph import AgensGraph, AgensgraphVector, GraphDocument, Node, Relationship
 
 GRAPH = "arxiv"
+LABEL = "Paper"
 DATASET = "UniverseTBD/arxiv-abstracts-large"
 MAX_AUTHORS = 20  # cap pathological author lists (some physics papers have 100s)
 
 
-def _norm(rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Normalize a raw HF record into {id,title,abstract,year,authors,categories}."""
+def normalize(rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Normalize a raw arXiv record into {id,title,abstract,year,authors,categories}."""
     pid = (rec.get("id") or "").strip()
     title = " ".join((rec.get("title") or "").split())
     abstract = " ".join((rec.get("abstract") or "").split())
@@ -86,259 +85,151 @@ def _norm(rec: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     }
 
 
-def _reset(conf: Dict[str, Any]) -> None:
-    """Drop the graph (outside the pool) so a rebuild starts clean."""
-    with psycopg.connect(**conf, autocommit=True) as conn:
-        conn.execute('DROP GRAPH IF EXISTS "%s" CASCADE' % GRAPH)
-    print(f"[reset] dropped graph {GRAPH!r}")
+def records(limit: int) -> Iterable[Dict[str, Any]]:
+    """Normalized papers: the fixture with DEMOS_FAKE=1, else the Hugging Face stream."""
+    raw = fixture("arxiv", limit) if config.fake() else stream_hf(DATASET, limit=limit)
+    return (paper for paper in map(normalize, raw) if paper)
 
 
-# ── batched ingest ──────────────────────────────────────────────────────────
+def paper_store(embedding: Embeddings, graph_name: str = GRAPH, **kwargs: Any) -> AgensgraphVector:
+    """The vector store whose chunks are the Paper vertices.
 
-AUTHORED_Q = """
-UNWIND %(rows)s AS row
-MATCH (p:"Paper" {id: row.pid})
-MATCH (a:"Author" {name: row.name})
-MERGE (p)-[:"AUTHORED_BY"]->(a)
-"""
-
-IN_CATEGORY_Q = """
-UNWIND %(rows)s AS row
-MATCH (p:"Paper" {id: row.pid})
-MATCH (c:"Category" {name: row.name})
-MERGE (p)-[:"IN_CATEGORY"]->(c)
-"""
-
-UPDATED_IN_Q = """
-UNWIND %(rows)s AS row
-MATCH (p:"Paper" {id: row.pid})
-MATCH (y:"Year" {year: row.year})
-MERGE (p)-[:"UPDATED_IN"]->(y)
-"""
-
-
-def _distinct_pairs(pairs: Iterable[tuple]) -> List[Dict[str, Any]]:
-    """The ``{pid, name}`` edge rows for a batch, each pair once, in the order first seen."""
-    seen = dict.fromkeys(pairs)
-    return [{"pid": pid, "name": name} for pid, name in seen]
-
-
-def _ensure_schema(graph) -> None:
-    """Labels + the unique property indexes the upsert addresses each label by.
-
-    Unique rather than plain for two reasons. ``upsert_vertices`` reads which keys are
-    already present and copies only the rest, which is only sound if a key names at most
-    one element -- so it refuses a key with no uniqueness behind it. And uniqueness is
-    what makes a re-run safe: with a plain index two concurrent loaders merging the same
-    paper id produce two papers rather than an error.
+    ``filter_keys`` gives the arXiv id and the year an index each, for filtered searches.
     """
-    for vlabel in ("Paper", "Author", "Category", "Year"):
-        graph.query(f'CREATE VLABEL IF NOT EXISTS "{vlabel}"')
-    for elabel in ("AUTHORED_BY", "IN_CATEGORY", "UPDATED_IN"):
-        graph.query(f'CREATE ELABEL IF NOT EXISTS "{elabel}"')
-    graph.query('CREATE UNIQUE PROPERTY INDEX IF NOT EXISTS paper_id_idx ON "Paper" (id)')
-    graph.query('CREATE UNIQUE PROPERTY INDEX IF NOT EXISTS author_name_idx ON "Author" (name)')
-    graph.query('CREATE UNIQUE PROPERTY INDEX IF NOT EXISTS category_name_idx ON "Category" (name)')
-    graph.query('CREATE UNIQUE PROPERTY INDEX IF NOT EXISTS year_year_idx ON "Year" (year)')
+    return agens.make_vector(
+        embedding,
+        graph_name=graph_name,
+        label=LABEL,
+        filter_keys=("id", "year"),
+        **kwargs,
+    )
 
 
-def _ingest(graph, records: Iterable[Dict[str, Any]], batch_size: int) -> Dict[str, int]:
-    """Write the vertices by key, then join them up.
+def paper_text(paper: Dict[str, Any]) -> str:
+    return f"title: {paper['title']}\nabstract: {paper['abstract']}"
 
-    Each label goes in through ``upsert_vertices``, which asks the graph which of these
-    keys it already holds and copies only the rows whose key it does not. It asks for the
-    keys by name, so the cost follows the batch rather than the size of the label.
 
-    The endpoints exist by the time the edges go in, so an edge statement matches both
-    and merges only the relationship.
+def paper_document(paper: Dict[str, Any]) -> GraphDocument:
+    """The paper's authors, categories and year, and its edges to them.
 
-    Throughput is reported for the database alone as well as for the wall clock, which
-    the Hugging Face stream dominates.
+    The Paper vertex itself is the vector store's; ``add_graph_documents`` finds it again by
+    ``id`` and only adds the edges.
     """
-    engine = agens.get_engine()
-    n_papers = n_authored = n_incat = 0
+    node = Node(id=paper["id"], type=LABEL)
+    authors = [Node(id=name, type="Author", properties={"name": name}) for name in paper["authors"]]
+    categories = [
+        Node(id=name, type="Category", properties={"name": name}) for name in paper["categories"]
+    ]
+    year = Node(id=paper["year"], type="Year", properties={"year": paper["year"]})
+    relationships = (
+        [Relationship(source=node, target=a, type="AUTHORED_BY") for a in authors]
+        + [Relationship(source=node, target=c, type="IN_CATEGORY") for c in categories]
+        + [Relationship(source=node, target=year, type="UPDATED_IN")]
+    )
+    return GraphDocument(nodes=[*authors, *categories, year], relationships=relationships)
+
+
+def embed_all(
+    embed: Embeddings, texts: List[str], concurrency: int, sub_batch: int
+) -> List[List[float]]:
+    """Embed texts with ``concurrency`` requests in flight, ``sub_batch`` texts each, in order."""
+    parts = [texts[i : i + sub_batch] for i in range(0, len(texts), sub_batch)]
+    with ThreadPoolExecutor(max_workers=concurrency) as pool:
+        return [vector for part in pool.map(embed.embed_documents, parts) for vector in part]
+
+
+def ingest(
+    graph: AgensGraph,
+    store: AgensgraphVector,
+    papers: Iterable[Dict[str, Any]],
+    *,
+    batch_size: int = 1000,
+    concurrency: int = 10,
+    sub_batch: int = 100,
+) -> Dict[str, int]:
+    """Store each batch's new papers as chunks, then write their graph around them.
+
+    A paper already stored is not embedded again. Database time is reported apart from the wall
+    clock, which embedding and the Hugging Face stream dominate.
+    """
+    n_papers = n_new = n_edges = 0
     db_seconds = 0.0
     wall_start = time.perf_counter()
-
-    with engine.connection(GRAPH) as conn:
-        for chunk in batched(records, batch_size):
-            # Deduplicated because a paper may list the same author or category twice,
-            # and each repeat is a MERGE the server performs and then discards.
-            authored = _distinct_pairs((r["id"], a) for r in chunk for a in r["authors"])
-            in_category = _distinct_pairs((r["id"], c) for r in chunk for c in r["categories"])
-            updated_in = [{"pid": r["id"], "year": r["year"]} for r in chunk]
-
-            # Deduplicated per batch: the same author, category or year recurs across a
-            # batch's papers, and a key repeated inside one copy is work the server does
-            # twice and then has to reconcile.
-            papers = [
-                {"id": r["id"], "title": r["title"], "abstract": r["abstract"], "year": r["year"]}
-                for r in chunk
-            ]
-            authors = [{"name": n} for n in {r["name"] for r in authored}]
-            categories = [{"name": n} for n in {r["name"] for r in in_category}]
-            years = [{"year": y} for y in {r["year"] for r in chunk}]
-
+    for chunk in batched(papers, batch_size):
+        t0 = time.perf_counter()
+        stored = {doc.id for doc in store.get_by_ids([p["id"] for p in chunk])}
+        db_seconds += time.perf_counter() - t0
+        new = [p for p in chunk if p["id"] not in stored]
+        if new:
+            texts = [paper_text(p) for p in new]
+            vectors = embed_all(store.embeddings, texts, concurrency, sub_batch)
             t0 = time.perf_counter()
-            # `skip`, not `update`. A re-run appends papers rather than revising the ones
-            # already there, and an update is charged the whole property map per row --
-            # once a paper is embedded that map holds 1,536 floats, all of which `+=`
-            # reads and writes back to change a title.
-            conn.upsert_vertices("Paper", "id", papers, on_existing="skip")
-            if authors:
-                conn.upsert_vertices("Author", "name", authors)
-            if categories:
-                conn.upsert_vertices("Category", "name", categories)
-            if years:
-                conn.upsert_vertices("Year", "year", years)
-
-            conn.execute(UPDATED_IN_Q, {"rows": Jsonb(updated_in)})
-            if authored:
-                conn.execute(AUTHORED_Q, {"rows": Jsonb(authored)})
-            if in_category:
-                conn.execute(IN_CATEGORY_Q, {"rows": Jsonb(in_category)})
-            conn.commit()
+            store.add_embeddings(
+                texts,
+                vectors,
+                metadatas=[{"id": p["id"], "title": p["title"], "year": p["year"]} for p in new],
+                ids=[p["id"] for p in new],
+            )
             db_seconds += time.perf_counter() - t0
+        documents = [paper_document(p) for p in chunk]
+        t0 = time.perf_counter()
+        graph.add_graph_documents(documents, batch_size=batch_size)
+        db_seconds += time.perf_counter() - t0
 
-            n_papers += len(chunk)
-            n_authored += len(authored)
-            n_incat += len(in_category)
-            if n_papers % (batch_size * 10) == 0:
-                print(f"    ... {n_papers:,} papers")
+        n_papers += len(chunk)
+        n_new += len(new)
+        n_edges += sum(len(d.relationships) for d in documents)
+        if n_papers % (batch_size * 10) == 0:
+            print(f"    ... {n_papers:,} papers")
 
     wall = time.perf_counter() - wall_start
-    edges = n_authored + n_incat + n_papers  # + UPDATED_IN (one per paper)
-    print(f"  DB ingest:   {n_papers:,} papers + {edges:,} edges in {db_seconds:.2f}s "
-          f"({n_papers / db_seconds:,.0f} papers/s, {edges / db_seconds:,.0f} edges/s)")
-    print(f"  wall (incl. HF streaming): {wall:.1f}s")
-    return {"papers": n_papers, "authored_by": n_authored, "in_category": n_incat}
-
-
-# ── parallel embedding + HNSW index ──────────────────────────────────────────
-
-def _exec_autocommit(statements: List[str], **settings: str) -> None:
-    """Run SQL on a dedicated autocommit connection (SET settings inlined first;
-    SET can't take a bind parameter — the values here are trusted constants)."""
-    with psycopg.connect(**config.conf(), autocommit=True) as conn:
-        for key, val in settings.items():
-            conn.execute(f"SET {key} = '{val}'")
-        for stmt in statements:
-            conn.execute(stmt)
-
-
-async def _embed_unembedded(graph, embed, concurrency: int, sub_batch: int) -> int:
-    """Embed every Paper whose embedding IS NULL, with concurrent OpenAI requests.
-
-    Sequential embedding is OpenAI-latency bound (~60 papers/s); issuing many
-    requests at once saturates the account's token-rate limit instead (several
-    times faster). Papers that already have an embedding are skipped, so this
-    only embeds what a re-run/append added.
-    """
-    ids = [r["id"] for r in graph.query('MATCH (p:"Paper") WHERE p.embedding IS NULL RETURN p.id AS id')]
-    n = len(ids)
-    print(f"  {n:,} papers to embed" + ("" if n else " (all already embedded — skipped)"))
-    if not n:
-        return 0
-    sem = asyncio.Semaphore(concurrency)
-
-    async def embed_sub(rows):
-        texts = [f"\ntitle: {r['title']}\nabstract: {r['abstract']}" for r in rows]
-        async with sem:
-            vecs = await embed.aembed_documents(texts)
-        return [{"id": r["id"], "embedding": v} for r, v in zip(rows, vecs)]
-
-    done = 0
-    t0 = time.perf_counter()
-    for page in batched(ids, concurrency * sub_batch):
-        rows = graph.query(
-            'UNWIND %(ids)s AS pid MATCH (p:"Paper" {id: pid}) '
-            "RETURN p.id AS id, p.title AS title, p.abstract AS abstract",
-            {"ids": Jsonb(page)},
+    if db_seconds:
+        print(
+            f"  DB ingest:   {n_papers:,} papers + {n_edges:,} edges in {db_seconds:.2f}s "
+            f"({n_papers / db_seconds:,.0f} papers/s, {n_edges / db_seconds:,.0f} edges/s)"
         )
-        for wb in await asyncio.gather(*(embed_sub(s) for s in batched(rows, sub_batch))):
-            graph.query(
-                'UNWIND %(rows)s AS row MATCH (p:"Paper" {id: row.id}) SET p.embedding = row.embedding',
-                {"rows": Jsonb(wb)},
-            )
-            done += len(wb)
-        print(f"    ... embedded {done:,}/{n:,}  ({done / (time.perf_counter() - t0):,.0f}/s)")
-    return done
-
-
-@contextlib.contextmanager
-def _build_resources(maintenance_work_mem: Optional[str]):
-    """Optionally raise maintenance_work_mem (+ parallel workers) for the HNSW
-    build (reloadable, server-wide) and reset afterwards. No-op when unset, so
-    the small-scale demo doesn't touch server config."""
-    if not maintenance_work_mem:
-        yield
-        return
-    _exec_autocommit([
-        f"ALTER SYSTEM SET maintenance_work_mem = '{maintenance_work_mem}'",
-        "ALTER SYSTEM SET max_parallel_maintenance_workers = 4",
-        "SELECT pg_reload_conf()",
-    ])
-    try:
-        yield
-    finally:
-        _exec_autocommit([
-            "ALTER SYSTEM RESET maintenance_work_mem",
-            "ALTER SYSTEM RESET max_parallel_maintenance_workers",
-            "SELECT pg_reload_conf()",
-        ])
+    print(f"  wall (incl. embedding and streaming): {wall:.1f}s")
+    return {"papers": n_papers, "embedded": n_new, "edges": n_edges}
 
 
 def main() -> None:
     limit = env_int("ARXIV_LIMIT", 50000)
     batch_size = env_int("ARXIV_BATCH", 1000)
     concurrency = env_int("EMBED_CONCURRENCY", 10)
-    sub_batch = env_int("EMBED_BATCH", 1000)
-    build_mem = os.getenv("ARXIV_BUILD_MEM")  # e.g. "4GB"; unset = server default
-    skip_ingest = bool(os.getenv("ARXIV_SKIP_INGEST"))  # only (re-)embed + index existing papers
+    sub_batch = env_int("EMBED_BATCH", 100)
     config.require_openai_key()
 
     console.section(f"arXiv GraphRAG — ingest  (ARXIV_LIMIT={limit:,})")
-
-    if os.getenv("ARXIV_RESET"):
-        _reset(config.conf())
-
-    # refresh_schema=False: this script only runs explicit Cypher + the vector
-    # store, so skip the (large-graph) schema introspection scan on construction.
-    graph = agens.make_graph(GRAPH, create=True, refresh_schema=False)
+    graph = agens.make_graph(GRAPH, create=True)
     try:
-        console.sub("schema (labels + property indexes)")
-        _ensure_schema(graph)
+        if os.getenv("ARXIV_RESET"):
+            graph.drop_graph()
+            print(f"[reset] dropped graph {GRAPH!r} and its companion schema")
 
-        if skip_ingest:
-            console.sub("skipping ingest (ARXIV_SKIP_INGEST) — embedding existing papers")
-        else:
-            console.sub("streaming + batched UNWIND ingest")
-            records = (n for n in (_norm(r) for r in stream_hf(DATASET, limit=limit)) if n)
-            counts = _ingest(graph, records, batch_size)
-            console.table(list(counts.items()), headers=["edge/node", "count"])
+        # index_build="manual": the HNSW index is built once, after the load, instead of being
+        # kept up to date while every batch arrives.
+        store = paper_store(
+            get_embeddings(max_retries=10, timeout=60), create_graph=True, index_build="manual"
+        )
 
-        # Embed the Paper nodes concurrently (index-free writes), then bulk-build
-        # the pgvector HNSW index over the same nodes.
-        console.sub(f"embedding Paper abstracts (parallel, concurrency={concurrency}) → pgvector HNSW")
-        embed = get_embeddings(max_retries=10, timeout=60)
-        with console.timer("embed") as te:
-            done = asyncio.run(_embed_unembedded(graph, embed, concurrency, sub_batch))
-        if done:
-            print("  " + te.rate(done, "papers embedded"))
-        with _build_resources(build_mem), console.timer("HNSW index build"):
-            AgensgraphVector.from_existing_graph(
-                embedding=embed,
-                node_label="Paper",
-                embedding_node_property="embedding",
-                text_node_properties=["title", "abstract"],
-                index_name="paper_vec",
-                graph_name=GRAPH,
-                engine=agens.get_engine(),
-            )
+        console.sub("embedding papers, writing chunks and graph documents")
+        counts = ingest(
+            graph,
+            store,
+            records(limit),
+            batch_size=batch_size,
+            concurrency=concurrency,
+            sub_batch=sub_batch,
+        )
+        console.table(list(counts.items()), headers=["what", "count"])
+
+        # build_index sizes maintenance_work_mem for the build itself.
+        with console.timer("HNSW index build"):
+            store.build_index()
 
         console.sub("done")
-        total_nodes = graph.query("MATCH (n) RETURN count(n) AS c")[0]["c"]
-        total_edges = graph.query("MATCH ()-[r]->() RETURN count(r) AS c")[0]["c"]
+        total_nodes = graph.query("MATCH (n) RETURN count(*) AS c")[0]["c"]
+        total_edges = graph.query("MATCH ()-[r]->() RETURN count(*) AS c")[0]["c"]
         console.table(
             [["nodes", f"{total_nodes:,}"], ["edges", f"{total_edges:,}"]],
             headers=["total", "count"],

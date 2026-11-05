@@ -6,7 +6,7 @@ Wikipedia text, and natural-language questions are answered by generating Cypher
 
 ```
 (:Person|Organization|Location|Event|Concept|Work|…)-[:LOCATED_IN|PART_OF|…]->(…)
-(:Document {title,url})-[:MENTIONS]->(entity)        # provenance
+(:Document {title,url,text})-[:MENTIONS]->(entity)        # provenance
 ```
 
 ## Run
@@ -25,6 +25,11 @@ Knobs: `WIKI_LIMIT` (articles), `WIKI_CHARS` (lead chars per article fed to the
 LLM, default 1800), `WIKI_CONCURRENCY` (parallel extractions, default 8),
 `WIKI_RESET=1` (rebuild the graph).
 
+`ask.py` needs `AGENSGRAPH_UNTRUSTED_URL` (see the demos README, "Roles"). With
+`DEMOS_FAKE=1` the articles are the 50 short leads of
+`_common/fixtures/wikipedia.jsonl`, written for the fixture, and the fake model
+extracts their capitalized phrases as entities.
+
 ## Where LangChain does the work
 
 - **A fixed relationship vocabulary.** `build_kg.py` constrains both ends of the
@@ -36,23 +41,32 @@ LLM, default 1800), `WIKI_CONCURRENCY` (parallel extractions, default 8),
   hold a few MB of facts, and it cannot be queried, because nobody can write Cypher
   against a vocabulary they cannot enumerate. `strict_mode` (on by default) drops
   anything outside either list.
-- **`build_kg.py`** — `LLMGraphTransformer` (LangChain): the LLM extracts typed
-  entities and relationships from each article as **structured output**, returning
+- **`build_kg.py`** — `LLMGraphTransformer`: the LLM extracts typed entities and
+  relationships from each article as **structured output**, returning
   `GraphDocument`s that drop straight into `AgensGraph.add_graph_documents(...,
   include_source=True)` (which also records the source article + `MENTIONS`
-  edges). Extraction is run with bounded concurrency via `aconvert_to_graph_documents`.
+  edges). Extraction runs `max_concurrency` articles at a time, and
+  `on_error="skip"` leaves out an article that fails rather than aborting the
+  batch.
 - **`ask.py`** — **`AgensCypherQAChain`**, the library's Text2Cypher chain:
 
   ```python
-  chain = AgensCypherQAChain.from_llm(llm, graph=graph, return_intermediate_steps=True)
+  chain = AgensCypherQAChain.from_llm(
+      llm, graph=graph, return_intermediate_steps=True, allow_dangerous_requests=True
+  )
   out = chain.invoke({"query": "Which people are mentioned most often?"})
-  out["intermediate_steps"]   # [{"query": "MATCH ..."}, {"context": [...]}]
+  out["intermediate_steps"]   # [..., {"query": "MATCH ..."}, {"context": [...]}]
   ```
 
   The chain carries the parts that are easy to get wrong: the AgensGraph dialect
-  rules in the prompt, a repair pass for identifiers the model leaves unquoted,
-  refusal of generated writes, an `EXPLAIN` check so a malformed query never runs,
-  and a statement timeout.
+  rules in the prompt, chosen by the server's capabilities, and a repair pass for
+  identifiers the model leaves unquoted and edges it writes against the schema's
+  direction. It runs the statement with `graph.query_untrusted`: the text is read
+  and refused unless it is plainly one Cypher read, then run as `llm_ro` in a
+  read-only transaction that is rolled back, under a timeout. A refusal or error
+  goes back to the model with its statement, up to `max_retries` times.
+  `allow_dangerous_requests=True` acknowledges that model-written Cypher runs, and
+  the demo applies `render_grants` to the graph first so `llm_ro` can read it.
 
   The graph's `get_schema` (with `enhanced_schema=True`, so it carries example
   property values) goes into the prompt, and the same schema decides what the repair
@@ -63,9 +77,9 @@ LLM, default 1800), `WIKI_CONCURRENCY` (parallel extractions, default 8),
 ## Notes
 
 - Uses OpenAI for both extraction and Text2Cypher; cost scales with `WIKI_LIMIT`
-  (the default 500-article build is well under a dollar with `gpt-4o-mini`).
-- `add_graph_documents` issues a statement per node/edge; fine for the small
-  per-article graphs here. For bulk *structured* loads, batched `UNWIND` is far
-  faster — see demo 01's `prepare.py`.
-- Generated Cypher is model output: it's validated read-only and time-bounded,
-  but a wrong query yields an empty/odd answer rather than an error.
+  (the default 500-article build is well under a dollar with `gpt-6-luna`).
+- `add_graph_documents` writes a batch of documents in one round trip, after
+  making the labels and their indexes once.
+- Generated Cypher is model output: it runs read-only, as a role that can read
+  the graph and nothing else, and time-bounded, but a wrong query yields an
+  empty/odd answer rather than an error.

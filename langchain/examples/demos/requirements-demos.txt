@@ -1,11 +1,13 @@
-# Extra dependencies for the demos, on top of the langchain-agensgraph package.
+# Extra dependencies for the demos, on top of the langchain-agensgraph package
+# with its langgraph extra (AgensSaver and AgensStore need it).
 #
 #   uv venv langchain/.venv --python 3.13
-#   uv pip install --python langchain/.venv/bin/python -e ./langchain \
+#   uv pip install --python langchain/.venv/bin/python -e "./langchain[langgraph]" \
 #       -r langchain/examples/demos/requirements-demos.txt
 #
 # Everything below is for streaming public datasets and calling OpenAI. No
-# local embedding/LLM runtimes (no fastembed / onnxruntime / torch).
+# local embedding/LLM runtimes (no fastembed / onnxruntime / torch). With
+# DEMOS_FAKE=1, and for smoke.py, only langchain and python-dotenv are needed.
 
 langchain-openai>=0.2
 langchain>=1.0          # demo 04: langchain.agents.create_agent

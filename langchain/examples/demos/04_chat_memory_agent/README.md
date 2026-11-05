@@ -1,11 +1,11 @@
 # 04 · Conversational memory agent
 
-A durable conversational agent: a LangGraph ReAct agent
+A durable conversational agent: a LangGraph agent
 (`langchain.agents.create_agent`) that answers from the news corpus (demo 03) via
 a retriever tool, with its full conversation state persisted in AgensGraph by
 **`AgensSaver`** (the LangGraph checkpointer). The same `thread_id` resumes the
 conversation — even in a brand-new process. The transcript is also mirrored to
-**`AgensChatMessageHistory`**.
+**`AgensChatMessageHistory`**, beside the news graph.
 
 ## Run
 
@@ -19,17 +19,22 @@ cd langchain
 .venv/bin/python examples/demos/04_chat_memory_agent/agent.py my-thread "What did you just tell me?"
 ```
 
-Prerequisite: demo 03's news store (`03_news_vector_rag/ingest.py`).
+Prerequisite: demo 03's news store (`03_news_vector_rag/ingest.py`). With
+`DEMOS_FAKE=1` the fake chat model calls the tool the message asks for and
+answers with what it returned.
 
 ## What it demonstrates
 
-- **`AgensSaver`** — a LangGraph checkpointer backed by AgensGraph. Passed as
-  `create_agent(model, tools, checkpointer=AgensSaver(...))`, it persists the
-  agent's full state per `thread_id`, so:
+- **`AgensSaver`** — a LangGraph checkpointer whose tables sit in a graph's
+  companion schema (`AgensSaver(engine, graph_name="agent_memory")`; the graph
+  itself need not exist). Passed as `create_agent(model, tools,
+  checkpointer=saver)`, it persists the agent's full state per `thread_id`, so:
   - later turns see earlier ones without re-sending them, and
   - a **fresh agent instance** (as a new process) resumes the exact conversation
     from the checkpoint — the demo asks "what was my first question?" and it
     answers from persisted state, without searching again.
+  - One saver serves both `invoke` and `ainvoke`; the demo ends with three
+    conversations answered at once on the awaiting path.
 - **`AgensStore`** — the other half of memory. The checkpointer scopes state to one
   conversation; the store holds what should outlive any of them, keyed by who it is
   about rather than by which thread mentioned it. Passed as
@@ -41,18 +46,19 @@ Prerequisite: demo 03's news store (`03_news_vector_rag/ingest.py`).
     The dimension is read from the embedding model rather than hard-coded.
   - `put` embeds the one memory it writes, which is what an agent learning a single fact
     wants. Seeding or importing should use `batch`, which embeds the whole set in one
-    request — measured at 2.1 memories a second against 21.
-  - Items are ordinary vertices, so a memory can be linked to other memories or to
-    domain data with ordinary edges. Embeddings are held outside the property map, in
-    a companion-schema table, so recall never reads a vector out of jsonb.
+    request.
+  - Items are rows of the companion schema, their embeddings in a table beside them.
 - **Grounded tool use** — a `search_news` tool runs `AgensgraphVector`
   similarity search over the news store, so graph store, vector store, and agent
   memory all live in one AgensGraph database.
 - **`AgensChatMessageHistory`** — a lighter per-session message log
-  (`add_messages` / `.messages` / `clear`), shown alongside the checkpointer.
+  (`add_messages` / `.messages` / `clear`), kept in the news graph's companion
+  schema. Its `cypher_subquery()` is SQL a Cypher statement can hold, so one
+  statement reads the session's messages next to the `Article` vertices — the
+  demo lists the news domains the conversation mentions.
 
-See [`chat_memory_agent.ipynb`](chat_memory_agent.ipynb) for a pre-executed,
-end-to-end walkthrough.
+See [`chat_memory_agent.ipynb`](chat_memory_agent.ipynb) for an end-to-end
+walkthrough.
 
 ## Notes
 

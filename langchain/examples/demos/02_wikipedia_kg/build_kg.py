@@ -1,14 +1,15 @@
 """Wikipedia knowledge graph — build.
 
-Uses LangChain's LLMGraphTransformer to extract a knowledge graph from Wikipedia
-article leads, then writes it to AgensGraph with add_graph_documents:
+Uses LLMGraphTransformer to extract a knowledge graph from Wikipedia article leads, then writes it
+to AgensGraph with add_graph_documents:
 
     (:Person|Organization|Location|...)-[:LOCATED_IN|PART_OF|...]->(...)
-    (:Document {title,url})-[:MENTIONS]->(entity)     # provenance (include_source)
+    (:Document {title,url,text})-[:MENTIONS]->(entity)     # provenance (include_source)
 
-This is the LangChain-native graph-construction path: the LLM does the entity /
-relationship extraction (structured output), and the same GraphDocument objects
-load straight into AgensGraph.
+The model does the entity and relationship extraction (structured output), and the same
+GraphDocument objects load straight into AgensGraph. With ``DEMOS_FAKE=1`` the articles are the
+50 short leads of ``_common/fixtures/wikipedia.jsonl``, written for the fixture, and the fake model
+takes their capitalized phrases as entities.
 
     cd langchain
     .venv/bin/python examples/demos/02_wikipedia_kg/build_kg.py
@@ -17,21 +18,19 @@ load straight into AgensGraph.
 
 from __future__ import annotations
 
-import asyncio
+import os
 import pathlib
 import sys
-import time
+from typing import Iterable, List, Sequence, Tuple
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
-import psycopg
 from langchain_core.documents import Document
 
-from langchain_agensgraph import LLMGraphTransformer
-
 from _common import agens, config, console
-from _common.datautil import batched, env_int, stream_hf
+from _common.datautil import batched, env_int, fixture, stream_hf
 from _common.models import get_llm
+from langchain_agensgraph import AgensGraph, GraphDocument, LLMGraphTransformer
 
 GRAPH = "wikipedia_kg"
 DATASET = ("wikimedia/wikipedia", "20231101.en")
@@ -58,9 +57,14 @@ ALLOWED_RELATIONSHIPS = [
 ]
 
 
-def _docs(limit: int, chars: int):
-    """Stream Wikipedia and yield LangChain Documents from each article's lead."""
-    for rec in stream_hf(DATASET[0], config=DATASET[1], limit=limit):
+def documents(limit: int, chars: int) -> Iterable[Document]:
+    """Each article's lead as a Document: the fixture with DEMOS_FAKE=1, else the stream."""
+    source = (
+        fixture("wikipedia", limit)
+        if config.fake()
+        else stream_hf(DATASET[0], config=DATASET[1], limit=limit)
+    )
+    for rec in source:
         text = (rec.get("text") or "")[:chars].strip()
         if len(text) < 200:
             continue
@@ -70,25 +74,38 @@ def _docs(limit: int, chars: int):
         )
 
 
-async def _extract(transformer, docs, concurrency):
-    """Bounded-concurrency extraction.
+def transformer(llm, concurrency: int = 8) -> LLMGraphTransformer:
+    """The extractor: a fixed vocabulary, and a failed article left out rather than raised."""
+    return LLMGraphTransformer(
+        llm,
+        allowed_nodes=ALLOWED_NODES,
+        allowed_relationships=ALLOWED_RELATIONSHIPS,
+        node_properties=False,  # strict_mode drops anything outside either list
+        max_concurrency=concurrency,
+        on_error="skip",
+    )
 
-    aconvert_to_graph_documents isolates per-document errors (logs + skips them),
-    so a single article that errors (e.g. an entity-dense one that exceeds the
-    LLM output-token limit) won't abort the batch.
+
+def extract(
+    extractor: LLMGraphTransformer, docs: Sequence[Document], chunk: int = 50
+) -> Tuple[List[GraphDocument], int]:
+    """Graph documents for the articles, and how many were skipped.
+
+    ``on_error="skip"`` logs and leaves out an article that fails (an entity-dense one that
+    exceeds the model's output limit, say) instead of aborting the batch.
     """
-    out, done = [], 0
-    for chunk in batched(docs, concurrency):
-        out.extend(await transformer.aconvert_to_graph_documents(chunk))
-        done += len(chunk)
+    out: List[GraphDocument] = []
+    done = 0
+    for part in batched(docs, chunk):
+        out.extend(extractor.convert_to_graph_documents(part))
+        done += len(part)
         print(f"    ... processed {done} articles ({done - len(out)} skipped)")
     return out, done - len(out)
 
 
-def _reset(conf) -> None:
-    with psycopg.connect(**conf, autocommit=True) as conn:
-        conn.execute('DROP GRAPH IF EXISTS "%s" CASCADE' % GRAPH)
-    print(f"[reset] dropped graph {GRAPH!r}")
+def load(graph: AgensGraph, graph_docs: Sequence[GraphDocument]) -> None:
+    """Write the graph documents, each source article as a Document with MENTIONS edges."""
+    graph.add_graph_documents(graph_docs, include_source=True)
 
 
 def main() -> None:
@@ -98,35 +115,28 @@ def main() -> None:
     config.require_openai_key()
 
     console.section(f"Wikipedia KG — build  (WIKI_LIMIT={limit:,}, lead={chars} chars)")
-
-    if __import__("os").getenv("WIKI_RESET"):
-        _reset(config.conf())
-
-    transformer = LLMGraphTransformer(
-        get_llm(),
-        allowed_nodes=ALLOWED_NODES,
-        allowed_relationships=ALLOWED_RELATIONSHIPS,
-        node_properties=False,   # strict_mode drops anything outside either list
-    )
-
-    console.sub("LLM extraction (LLMGraphTransformer, structured output)")
-    docs = list(_docs(limit, chars))
-    with console.timer("extraction") as t:
-        graph_docs, failed = asyncio.run(_extract(transformer, docs, concurrency))
-    n_nodes = sum(len(g.nodes) for g in graph_docs)
-    n_rels = sum(len(g.relationships) for g in graph_docs)
-    print(f"  {len(graph_docs)} articles -> {n_nodes:,} nodes, {n_rels:,} relationships "
-          f"({len(docs) / t.seconds:.1f} articles/s)"
-          + (f"; {failed} skipped (extraction error)" if failed else ""))
-
-    console.sub("load into AgensGraph (add_graph_documents, include_source=True)")
-    graph = agens.make_graph(GRAPH, create=True, refresh_schema=False)
+    graph = agens.make_graph(GRAPH, create=True)
     try:
-        with console.timer("add_graph_documents") as t:
-            graph.add_graph_documents(graph_docs, include_source=True)
+        if os.getenv("WIKI_RESET"):
+            graph.drop_graph()
+            print(f"[reset] dropped graph {GRAPH!r}")
 
-        total_nodes = graph.query("MATCH (n) RETURN count(n) AS c")[0]["c"]
-        total_edges = graph.query("MATCH ()-[r]->() RETURN count(r) AS c")[0]["c"]
+        console.sub("LLM extraction (LLMGraphTransformer, structured output)")
+        docs = list(documents(limit, chars))
+        with console.timer("extraction") as t:
+            graph_docs, failed = extract(transformer(get_llm(), concurrency), docs)
+        n_nodes = sum(len(g.nodes) for g in graph_docs)
+        n_rels = sum(len(g.relationships) for g in graph_docs)
+        print(f"  {len(graph_docs)} articles -> {n_nodes:,} nodes, {n_rels:,} relationships "
+              f"({len(docs) / max(t.seconds, 1e-9):.1f} articles/s)"
+              + (f"; {failed} skipped (extraction error)" if failed else ""))
+
+        console.sub("load into AgensGraph (add_graph_documents, include_source=True)")
+        with console.timer("add_graph_documents"):
+            load(graph, graph_docs)
+
+        total_nodes = graph.query("MATCH (n) RETURN count(*) AS c")[0]["c"]
+        total_edges = graph.query("MATCH ()-[r]->() RETURN count(*) AS c")[0]["c"]
         labels = graph.query(
             "MATCH (n) RETURN label(n) AS label, count(*) AS n ORDER BY n DESC LIMIT 12"
         )

@@ -4,7 +4,7 @@ Every film, person and plot here is invented, which is the point of the demo:
 an LLM cannot answer questions about this catalog from what it already knows,
 so whatever the answers contain came out of the retrievers.
 
-Movies are the vector store's own nodes (label ``Movie``, plot text embedded);
+Movies are the vector store's own vertices (label ``Movie``, plot text embedded);
 directors, actors and genres hang off them as ordinary graph structure. The
 film's title is its ``__id__``, so the edge wiring reads as what it says.
 
@@ -16,11 +16,14 @@ from __future__ import annotations
 
 import pathlib
 import sys
+from typing import Dict
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent))
 
+from langchain_core.embeddings import Embeddings
+
 from _common import agens, console, models
-from langchain_agensgraph import AgensgraphVector
+from langchain_agensgraph import AgensGraph, AgensgraphVector
 
 GRAPH = "movie_retrievers"
 
@@ -109,67 +112,71 @@ GENRES = {
 }
 
 
+def movie_store(embedding: Embeddings, graph_name: str = GRAPH, **kwargs) -> AgensgraphVector:
+    """The store whose chunks are the Movie vertices, the plot as their text."""
+    return agens.make_vector(
+        embedding, graph_name=graph_name, label="Movie", text_property="plot", **kwargs
+    )
+
+
+def build_catalog(graph: AgensGraph, store: AgensgraphVector) -> Dict[str, int]:
+    """Store the eight plots, then wire people and genres to the Movie vertices."""
+    store.add_texts(
+        [plot for _, _, plot in MOVIES],
+        metadatas=[{"title": t, "year": y} for t, y, _ in MOVIES],
+        ids=[title for title, _, _ in MOVIES],
+    )
+    for ddl in (
+        "CREATE VLABEL IF NOT EXISTS person",
+        "CREATE VLABEL IF NOT EXISTS genre",
+        "CREATE ELABEL IF NOT EXISTS directed",
+        "CREATE ELABEL IF NOT EXISTS acted_in",
+        "CREATE ELABEL IF NOT EXISTS in_genre",
+    ):
+        graph.query(ddl)
+    people = sorted(set(DIRECTED.values()) | {a for c in ACTED.values() for a in c})
+    for name in people:
+        graph.query("MERGE (:person {name: %(name)s})", {"name": name})
+    for name in sorted({g for gs in GENRES.values() for g in gs}):
+        graph.query("MERGE (:genre {name: %(name)s})", {"name": name})
+    for title, director in DIRECTED.items():
+        graph.query(
+            'MATCH (p:person {name: %(p)s}), (m:"Movie") '
+            "WHERE m.__id__ = %(m)s MERGE (p)-[:directed]->(m)",
+            {"p": director, "m": title},
+        )
+    for title, cast in ACTED.items():
+        for actor in cast:
+            graph.query(
+                'MATCH (p:person {name: %(p)s}), (m:"Movie") '
+                "WHERE m.__id__ = %(m)s MERGE (p)-[:acted_in]->(m)",
+                {"p": actor, "m": title},
+            )
+    for title, genres in GENRES.items():
+        for genre in genres:
+            graph.query(
+                'MATCH (m:"Movie"), (g:genre {name: %(g)s}) '
+                "WHERE m.__id__ = %(m)s MERGE (m)-[:in_genre]->(g)",
+                {"g": genre, "m": title},
+            )
+    vertices = graph.query("MATCH (n) RETURN count(*) AS n")[0]["n"]
+    edges = graph.query("MATCH ()-[e]->() RETURN count(*) AS n")[0]["n"]
+    return {"vertices": vertices, "edges": edges}
+
+
 def main() -> None:
     console.section("Meridian Pictures — catalog ingest")
-    embeddings = models.get_embeddings()
-
-    with console.timer("embed + store 8 plots"):
-        store = AgensgraphVector.from_texts(
-            texts=[plot for _, _, plot in MOVIES],
-            metadatas=[{"title": t, "year": y} for t, y, _ in MOVIES],
-            ids=[title for title, _, _ in MOVIES],
-            embedding=embeddings,
-            graph_name=GRAPH,
-            node_label="Movie",
-            text_node_property="plot",
-            pre_delete_collection=True,
-            engine=agens.get_engine(),
-        )
-
-    with console.timer("people, genres and their edges"):
-        for ddl in (
-            "CREATE VLABEL IF NOT EXISTS person",
-            "CREATE VLABEL IF NOT EXISTS genre",
-            "CREATE ELABEL IF NOT EXISTS directed",
-            "CREATE ELABEL IF NOT EXISTS acted_in",
-            "CREATE ELABEL IF NOT EXISTS in_genre",
-        ):
-            store.query(ddl)
-        people = sorted(set(DIRECTED.values()) | {a for c in ACTED.values() for a in c})
-        for name in people:
-            store.query("MERGE (:person {name: %(name)s})", params={"name": name})
-        for name in sorted({g for gs in GENRES.values() for g in gs}):
-            store.query("MERGE (:genre {name: %(name)s})", params={"name": name})
-        for title, director in DIRECTED.items():
-            store.query(
-                'MATCH (p:person {name: %(p)s}), (m:"Movie") '
-                "WHERE m.__id__ = %(m)s CREATE (p)-[:directed]->(m)",
-                params={"p": director, "m": title},
-            )
-        for title, cast in ACTED.items():
-            for actor in cast:
-                store.query(
-                    'MATCH (p:person {name: %(p)s}), (m:"Movie") '
-                    "WHERE m.__id__ = %(m)s CREATE (p)-[:acted_in]->(m)",
-                    params={"p": actor, "m": title},
-                )
-        for title, genres in GENRES.items():
-            for genre in genres:
-                store.query(
-                    'MATCH (m:"Movie"), (g:genre {name: %(g)s}) '
-                    "WHERE m.__id__ = %(m)s CREATE (m)-[:in_genre]->(g)",
-                    params={"g": genre, "m": title},
-                )
-
-    counts = store.query(
-        "MATCH (n) WITH count(n) AS vertices MATCH ()-[e]->() "
-        "RETURN vertices, count(e) AS edges"
-    )[0]
-    console.kv("graph", GRAPH)
-    console.kv("vertices", counts["vertices"])
-    console.kv("edges", counts["edges"])
-    store.close()
-    agens.close()
+    graph = agens.make_graph(GRAPH, create=True)
+    try:
+        graph.drop_graph()  # start clean: the catalog is rebuilt whole on every run
+        store = movie_store(models.get_embeddings(), create_graph=True)
+        with console.timer("embed + store 8 plots, then people, genres and their edges"):
+            counts = build_catalog(graph, store)
+        console.kv("graph", GRAPH)
+        console.kv("vertices", counts["vertices"])
+        console.kv("edges", counts["edges"])
+    finally:
+        agens.close()
 
 
 if __name__ == "__main__":

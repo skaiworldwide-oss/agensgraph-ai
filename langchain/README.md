@@ -1,99 +1,125 @@
 # 🦜️🔗 LangChain AgensGraph
 
-LangChain integration for [AgensGraph](https://github.com/skaiworldwide-oss/agensgraph), Skai's PostgreSQL-based multi-model graph database. Ships a `GraphStore`, a pgvector-backed `VectorStore`, chat-message history, a LangGraph checkpointer, a LangGraph long-term memory store, an LLM graph transformer, and a connection-pooling engine — with async variants throughout.
+LangChain integration for [AgensGraph](https://github.com/skaiworldwide-oss/agensgraph), Skai's
+PostgreSQL-based graph database: a graph store, a vector store and its retrievers, a Cypher QA
+chain, an LLM graph transformer, chat message history, and a LangGraph checkpointer and store.
+Every class works blocking and awaiting.
 
 ## Requirements
 
 - Python 3.11 to 3.14.
-- `agensgraph-python` 2.0, installed with the package.
-- AgensGraph 2.17 or later; an older server is refused at connect. The vector store needs the `pgvector` extension, and schema introspection is faster with the `meta` extension.
+- AgensGraph 2.14.1 or later (2.14, 2.15, 2.16, 2.17 and 2.18 are tested).
+- The `vector` extension (pgvector 0.8.0 or later) for the vector store and the store's semantic
+  search. AgensGraph does not bundle it; build it against your server's `pg_config`:
 
-### AgensGraph requirements
-
-AgensGraph does **not** bundle the pgvector or `meta` extensions; build and install them against your AgensGraph install's `pg_config`:
-
-```bash
-# pgvector
-git clone https://github.com/pgvector/pgvector.git
-cd pgvector && PG_CONFIG=/path/to/agens/bin/pg_config make && make install
-
-# meta extension (ships in AgensGraph's contrib/)
-cd /path/to/agensgraph/contrib/meta
-PG_CONFIG=/path/to/agens/bin/pg_config make USE_PGXS=1 install
-
-# in your AgensGraph database:
-CREATE EXTENSION vector;
-CREATE EXTENSION meta;
-```
-
-The integration works without `meta` (falls back to `ag_label` catalog scans) but `refresh_schema` is much faster with it.
+  ```bash
+  git clone https://github.com/pgvector/pgvector.git
+  cd pgvector && PG_CONFIG=/path/to/agens/bin/pg_config make && make install
+  # then, in the database: CREATE EXTENSION vector;
+  ```
 
 ## Installation
 
 ```bash
 pip install -U langchain-agensgraph
+pip install -U "langchain-agensgraph[langgraph]"   # the checkpointer and the store
 ```
 
-## Usage
+## Connecting
 
-### AgensGraph (graph store)
+One `AgensEngine` per process holds the connection pools; every component takes it, or a conninfo
+string, and a graph name. Components handed the same conninfo string share one engine. Nothing
+connects until the first call, and each component makes what it needs on that call.
 
 ```python
-from langchain_agensgraph import AgensGraph
+from langchain_agensgraph import AgensEngine, AgensGraph
 
-conf = {
-    "dbname": "...",
-    "user": "...",
-    "password": "...",
-    "host": "...",
-    "port": 5432,
-}
-
-graph = AgensGraph(graph_name="my_graph", conf=conf, create=True)
-graph.query("MATCH (n) RETURN n LIMIT 1")
-
-# Optional: cache the schema between refreshes (seconds)
-graph = AgensGraph(graph_name="my_graph", conf=conf, schema_cache_ttl=60)
-
-# Async
-results = await graph.aquery("MATCH (n) RETURN count(n) AS c")
-await graph.aclose()
+engine = AgensEngine("postgresql://app_rw:secret@localhost:5432/db")
+graph = AgensGraph(engine, graph_name="kg", create_graph=True)
+graph.query("MATCH (n) RETURN count(*) AS n")
 ```
 
-### AgensgraphVector (vector store)
+A component's tables live in the graph's companion schema, `"<graph>_store"`.
+
+## Roles
+
+`langchain_agensgraph.roles` prints the SQL for the roles the package expects:
+
+```python
+from langchain_agensgraph.roles import render_grants, render_roles
+
+print(render_roles(password="..."))   # app_rw, llm_ro and llm_rw, once per server
+print(render_grants("kg"))            # what each role may do on one graph, as its owner
+```
+
+- `app_rw` runs the application.
+- `llm_ro` runs Cypher a model wrote. It reads the graph and nothing else.
+- `llm_rw` runs model-written writes (`allow_writes=True`), on 2.16 and later only.
+
+Give the engine those roles' conninfo strings:
+
+```python
+engine = AgensEngine(
+    "postgresql://app_rw:secret@localhost/db",
+    untrusted_conninfo="postgresql://llm_ro:secret@localhost/db",
+)
+```
+
+## The graph store
+
+```python
+graph.query("MATCH (p:\"Person\") WHERE p.age > %s RETURN p.name AS name", (30,))
+graph.query_many(["CREATE (:\"Tag\" {name: 'a'})", "CREATE (:\"Tag\" {name: 'b'})"])  # all or none
+graph.add_graph_documents(documents, include_source=True, baseEntityLabel=True)
+print(graph.get_schema)
+```
+
+- Rows hold the driver's `Vertex`, `Edge` and `Path` values; `sanitize=True` gives plain maps and
+  leaves out lists longer than 128 items.
+- A server refusal raises `AgensQueryError` carrying its `sqlstate`.
+- The schema is read on first use and kept for `schema_cache_ttl` seconds. Its counts are the
+  planner's estimates.
+- `add_graph_documents` merges each node by `id`, and each edge once per pair of ends
+  (`dedupe_edges=True`).
+- `query_untrusted(text)` runs Cypher a model wrote, as `llm_ro`. The text is checked before it is
+  sent and refused unless it is plainly one Cypher read. It then runs in a read-only transaction
+  that is always rolled back, reading at most `max_rows` rows.
+
+## The vector store
+
+Each chunk is a vertex. Its embedding is a row of a table in `"<graph>_store"`, deleted with the
+vertex.
 
 ```python
 from langchain_agensgraph import AgensgraphVector
-from langchain_openai import OpenAIEmbeddings
+from langchain_agensgraph.vectorstores import KeywordConfig
 
-embeddings = OpenAIEmbeddings(model="text-embedding-3-large")
-db = AgensgraphVector.from_documents(
-    docs,
+store = AgensgraphVector(
     embeddings,
-    url="postgresql://user:pwd@host:5432/db",
+    engine=engine,
+    graph_name="kg",
+    label="Chunk",
+    filter_keys=("source", "year"),         # indexed for filtered search
+    keyword=KeywordConfig(regconfig="english"),
+    search_type="hybrid",                    # vector and keyword, fused
+    create_graph=True,
 )
-
-# Search
-docs_with_score = db.similarity_search_with_score("What is LangChain?", k=4)
-
-# Higher recall — fetch 3× candidates from the ANN index, then trim to k
-hits = db.similarity_search("...", k=10, effective_search_ratio=3.0)
-
-# Mutation
-db.add_texts(["...", "..."], ids=["a", "b"], batch_size=500)
-db.delete(["a"])
-got = db.get_by_ids(["b"])
-
-# Async
-hits = await db.asimilarity_search("...", k=10)
-await db.aadd_texts(["..."], batch_size=500)
-await db.aclose()
+store.add_documents(docs, ids=ids)
+store.similarity_search("what failed?", k=5, filter={"year": {"$gte": 2024}})
+store.similarity_search_with_relevance_scores("what failed?", k=5)
+store.max_marginal_relevance_search("what failed?", k=5, fetch_k=20)
+store.delete(ids=["a"])
 ```
 
-### Retrievers
+- The approximate index (HNSW by default, or IVFFlat) is built after the first write. Before
+  then, and for a role that does not own the table, search is exact.
+- Filters take `$eq`, `$ne`, `$lt`, `$lte`, `$gt`, `$gte`, `$in`, `$nin`, `$between`, `$like`,
+  `$ilike`, `$exists`, `$and`, `$or` and `$not`.
+- `*_with_score` returns the distance; `*_with_relevance_scores` turns it into a relevance score.
+  In hybrid mode both return the fused score; `hybrid_search_with_details` returns each half.
+- Embeddings of up to 2,000 dimensions are stored as `vector`, wider ones as `halfvec`.
 
-Three `BaseRetriever`s over the same store and pool, each one server round trip
-per retrieval, sync and async alike:
+## Retrievers
 
 ```python
 from langchain_agensgraph import (
@@ -103,212 +129,126 @@ from langchain_agensgraph import (
 )
 from langchain_agensgraph.retrievers import render_graph_context
 
-# Seed-only: the store's vector (or server-side hybrid RRF) search, scored.
-retriever = AgensVectorRetriever(store=db, k=6)
-docs = retriever.invoke("what failed over the weekend?")
-docs[0].metadata["score"]
-
-# Seeds plus their neighbourhood within N hops, fetched in the SAME statement
-# as the seed search — measured 3–4.5x over querying each seed's context
-# separately. metadata carries _context_nodes_ / _context_rels_; the ready-made
-# formatter renders them under the text for a prompt.
-retriever = AgensGraphContextRetriever(
-    store=db, k=4, expand_by_hops=2, document_formatter=render_graph_context
+AgensVectorRetriever(vectorstore=store, k=6)
+AgensGraphContextRetriever(
+    vectorstore=store, k=4, hops=2, document_formatter=render_graph_context
 )
+AgensText2CypherRetriever(graph=graph, llm=llm, allow_dangerous_requests=True)
+```
 
-# A model writes the Cypher; the server contains it (write refusal, EXPLAIN
-# check, read-only transaction, one deadline across the attempt). max_retries
-# feeds an execution error back for a corrected attempt, on the same budget;
-# retry_on_empty extends that to a query that runs clean and matches nothing
-# (what a relationship written against its schema direction looks like).
-retriever = AgensText2CypherRetriever(
-    graph=graph, llm=llm, max_retries=1, retry_on_empty=True
+- `AgensVectorRetriever` takes a `retrieval_query`, Cypher that shapes each hit; it sees `node`
+  and `score`.
+- `AgensGraphContextRetriever` adds each hit's neighbourhood, within `hops` edges, to its metadata.
+- A call may pass `k=` and other search arguments; they win over the retriever's own.
+
+## Questions in plain language
+
+```python
+from langchain_agensgraph import AgensCypherQAChain, create_cypher_tool
+
+chain = AgensCypherQAChain.from_llm(llm, graph=graph, allow_dangerous_requests=True)
+chain.invoke({"query": "Who works at Acme?"})   # {"query": ..., "result": "Ada and Bob."}
+
+tool = create_cypher_tool(graph, llm, allow_dangerous_requests=True)
+```
+
+The model's Cypher runs only through `query_untrusted`, as `llm_ro`. Before it is sent:
+
+- the names the graph stores with capitals are quoted;
+- an edge written against the only direction the schema has is turned round;
+- the forms a release reads wrongly are rewritten.
+
+A refusal, or a server error about the statement, goes back to the model, up to `max_retries`
+times. The prompt carries the rules of the server it runs on. `examples=DIALECT_EXAMPLES` adds
+few-shot pairs. `allow_writes=True` runs model writes as `llm_rw` on 2.16 and later.
+
+## Extracting a graph from text
+
+```python
+from langchain_agensgraph import LLMGraphTransformer
+
+transformer = LLMGraphTransformer(
+    llm,
+    allowed_nodes=["Person", "Company"],
+    allowed_relationships=[("Person", "WORKS_AT", "Company")],
+    node_properties=["role"],
 )
-rows = retriever.invoke("How many people joined after 2024?")
-rows[0].metadata["cypher"]
-
-# Every knob is a per-call override too:
-retriever.invoke("...", k=10)
-await retriever.ainvoke("...")
+graph.add_graph_documents(transformer.convert_to_graph_documents(docs), include_source=True)
 ```
 
-`AgensVectorRetriever` also takes a `retrieval_query` that shapes what each hit
-returns — several retrievers can share one store while each reads a different
-context (the query sees `node` and `score`; braces are doubled, as in the
-store's own contract).
+A model without structured output answers in JSON instead (`ignore_tool_usage=True` forces it).
 
-### AgensStore (LangGraph long-term memory)
-
-`AgensSaver` persists a single thread's state; `AgensStore` is the other half — cross-thread
-long-term memory, implementing LangGraph's `BaseStore` (`get` / `put` / `search` / `delete` /
-`list_namespaces`, sync and async). Because items are ordinary vertices, a memory can be linked
-to other memories and to your domain data with ordinary edges — which is the thing LangGraph's
-stock `PostgresStore` cannot do.
+## Chat history, checkpoints and memory
 
 ```python
-from langchain_agensgraph import AgensGraph, AgensStore
+from langchain_agensgraph import AgensChatMessageHistory, AgensSaver, AgensStore
 
-graph = AgensGraph("memories", conf=conf, create=True)
-store = AgensStore(graph=graph)
-
-store.put(("users", "alice", "memories"), "m1", {"text": "prefers tea", "topic": "prefs"})
-item = store.get(("users", "alice", "memories"), "m1")
-
-# a namespace search also returns its descendants
-hits = store.search(("users", "alice"), filter={"topic": "prefs"}, limit=10)
-namespaces = store.list_namespaces(prefix=("users", "*", "memories"))
-
-# async throughout
-item = await store.aget(("users", "alice", "memories"), "m1")
+history = AgensChatMessageHistory("session-1", engine, graph_name="kg")
+saver = AgensSaver(engine, graph_name="kg")           # sync and async graphs alike
+store = AgensStore(engine, graph_name="kg", index={"dims": 1536, "embed": embeddings})
+app = builder.compile(checkpointer=saver, store=store)
 ```
 
-Semantic search is opt-in and needs `pgvector`:
+`AsyncAgensStore` is the store for an event loop. All three keep their state in plain tables in
+`"<graph>_store"`.
+
+## Agent state next to the graph
+
+Each of them gives a SQL subquery a Cypher statement can hold, so one statement reads the agent's
+state and the knowledge graph together:
 
 ```python
-from langchain_openai import OpenAIEmbeddings
-
-store = AgensStore(
-    graph=graph,
-    index={"dims": 1536, "embed": OpenAIEmbeddings(), "fields": ["text"]},
+graph.query(
+    f"UNWIND [1] AS a WITH {history.cypher_subquery()} AS messages "
+    "UNWIND messages AS m MATCH (p:\"Person\") WHERE m.text CONTAINS p.name "
+    "RETURN p.name AS who, m.seq AS seq",
+    (history.session_id,),
 )
-hits = store.search(("users", "alice"), query="what do they drink?", limit=5)
 ```
 
-Embeddings are deliberately **not** stored as a property. A vector serialised into the jsonb
-property bag pushes the bag out of line, after which every property read on that row pays a
-detoast. They live instead in a narrow table in a companion schema (`<graph>_store`), keyed by
-graphid with an HNSW index, and a foreign key that cascades — so deleting a memory removes its
-embedding with it and searching never touches jsonb until the surviving rows are read back.
+`store.cypher_subquery()` gives the items in a namespace. For the checkpointer, declare the
+channels to read: `AgensSaver(..., queryable_channels={"messages": "messages"})`, then use
+`saver.cypher_subquery("messages")`.
 
-Two notes on the storage layout:
+## Transactions
 
-- **Namespaces** are flattened to a `.`-joined path. LangGraph already forbids `.` inside a
-  namespace label, so nothing is lost and no escaping is needed.
-- **`promoted=[...]`** is an opt-in tier that mirrors chosen properties into typed columns, so
-  filters and sorts compare in the column's native type rather than as jsonb. It is faster, but
-  it stores those values twice for now, and native comparison is not jsonb comparison — so
-  filter and sort results can legitimately differ from the default layout. Leave it unset unless
-  you have measured a reason to set it.
-
-### Asking questions in plain language (text2cypher)
-
-`AgensCypherQAChain` turns a question into Cypher, runs it read-only, and answers from the
-rows. No Neo4j package required.
+Calls through an engine join a transaction the caller opens:
 
 ```python
-from langchain_agensgraph import AgensCypherQAChain, AgensGraph
-
-graph = AgensGraph("my_graph", conf=conf)
-chain = AgensCypherQAChain.from_llm(llm, graph=graph)
-
-chain.invoke({"query": "Which people work at Acme?"})
-# {"query": "...", "result": "Alice and Bob."}
-
-# see what it ran
-chain = AgensCypherQAChain.from_llm(llm, graph=graph, return_intermediate_steps=True)
-out = chain.invoke({"query": "..."})
-out["intermediate_steps"]   # [{"query": "MATCH ..."}, {"context": [...]}]
+with engine.transaction() as conn:
+    store.add_documents(docs)
+    graph.add_graph_documents(graph_docs)
+    conn.execute("...")   # statements of your own, in the same transaction
 ```
 
-The same pipeline as a tool for an agent:
+## What differs between releases
 
-```python
-from langchain.agents import create_agent
-from langchain_agensgraph import create_cypher_tool
+| | 2.14 | 2.15 | 2.16 | 2.17 | 2.18 |
+|---|---|---|---|---|---|
+| model-written writes (`allow_writes`) | no | no | yes | yes | yes |
+| deleting a vertex scans every edge label | yes | yes | yes | no | no |
+| GQL clauses in the QA prompt | no | no | no | no | yes |
 
-agent = create_agent(llm, [create_cypher_tool(graph, llm)])
+## Writing Cypher for AgensGraph
 
-# or hand the agent rows instead of prose, to combine with other sources
-tool = create_cypher_tool(graph, llm, answer=False)
-```
+- Quote labels and types with capitals: `(n:"Person")`. An unquoted name folds to lower case.
+- Write edges with brackets, `(a)-[]->(b)`. AgensGraph reads `--` as the start of a comment.
+- Name a variable-length edge, `[r:"KNOWS"*1..3]`; an unnamed one is wrong on 2.14 and 2.15.
+- Before 2.17, `ORDER BY` names a returned alias, and `x IN %s` with a list parameter fails; use
+  `UNWIND`.
+- On 2.14, `collect()` keeps nulls and gives null for no rows.
+- `id(n) = '3.1'` is the fastest lookup. Inside a SQL subquery, read a vertex's properties with
+  `properties(n)`.
+- Cast to convert, `n.x::float8`; `toFloat()` and `toInteger()` are unreliable.
 
-Generated Cypher is not trusted. Writes are refused unless you pass
-`allow_dangerous_requests=True`, the query is checked with `EXPLAIN` before it runs so a
-malformed one fails without executing, and execution carries a `timeout`.
+## Upgrading from 0.3
 
-**Why a dedicated prompt.** AgensGraph is not Neo4j, and a model writing Cypher from habit
-gets two things wrong. It uses constructs that do not exist here — pattern expressions like
-`size((n)--())`, `COUNT { }`, `EXISTS { }`, `CALL { }` subqueries, `apoc.*` — which fail
-loudly. And it leaves identifiers unquoted, which fails silently: AgensGraph folds an
-unquoted identifier to lower case, so `(n:Person)` matches nothing at all. The prompt rules
-the first out by name and requires quoting for the second.
+See [CHANGELOG.md](CHANGELOG.md).
 
-Because folding runs both ways, the repair pass is driven by your schema rather than by a
-rule of thumb. A property written as `{"firstName": ...}` is stored case-preserved and must
-be read as `n."firstName"`; the same property written as `{firstName: ...}` is stored as
-`firstname` and must be read bare. The chain quotes an identifier only when your graph
-actually holds that spelling, so it cannot turn a working query into a silent miss.
+## Demos and evals
 
-### Shared connection pool
-
-```python
-from langchain_agensgraph import AgensEngine, AgensGraph, AgensgraphVector
-
-engine = AgensEngine.from_url("postgresql://user:pwd@host:5432/db", min_size=2, max_size=20)
-graph = AgensGraph("my_graph", conf={...}, engine=engine, create=True)
-store = AgensgraphVector(embeddings, graph_name="my_graph", engine=engine)
-# ... concurrent requests each borrow their own pooled connection ...
-engine.close()
-```
-
-## Production tips
-
-- **Connection pooling**: use `AgensEngine` (the driver's connection pool) and share it across your graph and vector stores so concurrent requests don't serialize on a single connection.
-- **PgBouncer transaction mode**: AgensGraph speaks the standard PG wire protocol, so PgBouncer works unchanged. In transaction-pool mode, disable psycopg's server-side prepared-statement cache (`prepare_threshold=None`).
-- **HNSW + AgensGraph 2.17**: two June-2026 commits (`e7e1be9`, `47b38ed`) finally make `CREATE PROPERTY INDEX ... USING HNSW (((embedding)::vector(N)) vector_cosine_ops)` use an `Index Scan` plan instead of falling back to seq-scan. If you see seq-scan on v2.17 with a small table, that's expected — the planner picks seq-scan when it's cheaper.
-- **`auto_gather_graphmeta`**: enable on the database (`ALTER DATABASE x SET auto_gather_graphmeta = on`) for ~30× faster `DETACH DELETE` on large graphs.
-
-## Demos
-
-Runnable demos on real datasets, each with a README and a pre-executed notebook, under [`examples/demos/`](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/langchain/examples/demos):
-
-| Demo | What it shows |
-|---|---|
-| [01 · arXiv GraphRAG](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/langchain/examples/demos/01_arxiv_graphrag) | `AgensGraph` and `AgensgraphVector` on one shared `AgensEngine`; batched ingest; graph and vectors in one database; hybrid GraphRAG |
-| [02 · Wikipedia knowledge graph](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/langchain/examples/demos/02_wikipedia_kg) | `LLMGraphTransformer` into `add_graph_documents`; `enhanced_schema`; text2cypher question answering |
-| [03 · News vector RAG](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/langchain/examples/demos/03_news_vector_rag) | `AgensgraphVector` at scale: HNSW, hybrid search, metadata filters, `effective_search_ratio` |
-| [04 · Chat memory agent](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/langchain/examples/demos/04_chat_memory_agent) | `AgensSaver` and `AgensChatMessageHistory`; a conversation resumes across processes |
-| [05 · Graph retrievers](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/langchain/examples/demos/05_graph_retrievers) | the three retrievers side by side, and against the arXiv graph |
-
-`evals/text2cypher/` scores generated Cypher by executing it against a dataset of 100 entries; its [README](https://github.com/skaiworldwide-oss/agensgraph-ai/tree/main/langchain/evals/text2cypher/README.md) has the measurements.
-
-## What's new in 0.3.0
-
-Every statement goes through the [`agensgraph-python`](https://github.com/skaiworldwide-oss/agensgraph-python) 2.0 driver, and the package gains retrievers, a text2cypher chain and a LangGraph store.
-
-**On the driver**
-- `AgensEngine` is a driver connection pool, sync and async, shared by every component built on it.
-- `query()` returns the driver's `Vertex`, `Edge` and `Path` values, with the label, the id and the properties kept apart. `query_many()` runs a burst of reads without waiting for each in turn.
-- A `str` parameter is sent as text. `json.dumps(...)` around a string parameter is no longer needed, and has to go: a JSON-encoded string now matches nothing.
-- `AgensgraphVector` is on the driver's vector types and indexes. `filter_properties` names the metadata properties a search filters on, and they get indexes, so a filtered search reads from an index rather than the label.
-- `log_queries()` reports every statement a block of code ran, and how long each took.
-
-**Retrievers** — three `BaseRetriever`s over the same store and pool, each one server round trip: `AgensVectorRetriever`; `AgensGraphContextRetriever`, which fetches each seed's neighbourhood within `expand_by_hops` in the seed search's own statement, with `render_graph_context` to format it for a prompt; and `AgensText2CypherRetriever`, where a model writes the Cypher and the server contains it, with `max_retries` and `retry_on_empty` feeding a failure back for a corrected attempt. See [Retrievers](#retrievers).
-
-**Text2Cypher** — `AgensCypherQAChain` answers a question with generated Cypher run in a read-only transaction, and `create_cypher_tool` gives an agent the same. The schema the model reads names the graph's property indexes (`include_indexes`), `examples=` adds few-shot pairs and `DIALECT_EXAMPLES` is a curated set of them; `evals/text2cypher/` scores generated Cypher by executing it. See [Asking questions in plain language](#asking-questions-in-plain-language-text2cypher).
-
-**LangGraph** — `AgensStore`, a `BaseStore` whose filters and namespace search run in the database. `AgensSaver` / `AsyncAgensSaver` complete the thread lifecycle with `prune`, `copy_thread` and `delete_for_runs`, and page the history reads. See [AgensStore](#agensstore-langgraph-long-term-memory).
-
-**Fixed**
-- A store search filter ignored its comparison operators.
-- `prune` deleted the checkpoints a delta channel rebuilds from, so the channel came back short of its history with no error.
-- `LLMGraphTransformer` wrote duplicate nodes when an entity type differed only in case.
-- `AgensChatMessageHistory` appends and windowed reads grew with the length of the history.
-- `AgensQueryException` read `details` while every raise wrote `detail`, so the server's account of a failure was lost.
-
-## Compatibility
-
-| | `0.2.0` | `0.3.0` |
-|---|---|---|
-| Database access | psycopg 3 directly | [`agensgraph-python`](https://github.com/skaiworldwide-oss/agensgraph-python) 2.0 |
-| `query()` rows | property maps, decoded by regex | `Vertex`, `Edge` and `Path` values |
-| A `str` parameter | JSON text, so `json.dumps(...)` was needed | text, as given |
-| AgensGraph | 2.17 recommended | 2.17 or later, refused at connect below it |
-| Python | 3.10–3.14 | 3.11–3.14 |
-| `langchain-core` / `langgraph` | `>=1.0.0,<2.0.0` | unchanged |
-| Retrievers | — | `AgensVectorRetriever`, `AgensGraphContextRetriever`, `AgensText2CypherRetriever` |
-| Text2Cypher | — | `AgensCypherQAChain`, `create_cypher_tool`, `evals/text2cypher/` |
-| LangGraph | checkpointer | checkpointer with the full thread lifecycle, and `AgensStore` |
+Runnable demos are under [`examples/demos/`](examples/demos/). `evals/text2cypher/` scores
+generated Cypher by running it.
 
 ## License
 

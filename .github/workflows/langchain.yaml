@@ -39,12 +39,15 @@ jobs:
           cache-dependency-glob: langchain/uv.lock
 
       - name: Install
-        run: uv sync --locked --group test --group lint --python ${{ matrix.python-version }}
+        run: uv sync --locked --group test --group lint --group typing --python ${{ matrix.python-version }}
 
       - name: Format and lint
         run: |
           uv run ruff format --check langchain_agensgraph tests evals
           uv run ruff check langchain_agensgraph tests evals
+
+      - name: Types
+        run: uv run mypy --strict langchain_agensgraph
 
       # -X dev makes ResourceWarning visible, which is how an unclosed connection is found; the
       # pytest configuration turns every warning into an error.
@@ -77,8 +80,10 @@ jobs:
             uv venv --clear /tmp/installed
             VIRTUAL_ENV=/tmp/installed uv pip install "$dist"
             (cd /tmp && /tmp/installed/bin/python -c '
+          import importlib.resources
           import langchain_agensgraph as package
           assert "site-packages" in package.__file__, package.__file__
+          assert importlib.resources.files(package).joinpath("py.typed").is_file()
           print(package.__version__, package.__file__)
           ')
           done

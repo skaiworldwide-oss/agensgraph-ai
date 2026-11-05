@@ -11,12 +11,16 @@ resolution-markers = [
 
 [[package]]
 name = "agensgraph-python"
-version = "2.0.1.dev18+gdb88b6daf"
-source = { git = "https://github.com/skaiworldwide-oss/agensgraph-python?rev=db88b6daf8be22096ec2834466b955099ed30f95#db88b6daf8be22096ec2834466b955099ed30f95" }
+version = "2.1.0"
+source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "msgspec" },
     { name = "psycopg", extra = ["binary"] },
     { name = "psycopg-pool" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/7f/75/74eaa9cc4faeec9212a1d77e26065c7f68fea081c31da36763b1e2406f19/agensgraph_python-2.1.0.tar.gz", hash = "sha256:dfabb5b05e9d538198b7f70a892f9e771870454c2e80d9c48bdcb2794d9196dc", size = 498155, upload-time = "2026-11-05T23:18:06.038Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/53/40/55f43764f5932daba110d7836ce12a1a1404debaa98ad73010987b3156a3/agensgraph_python-2.1.0-py3-none-any.whl", hash = "sha256:0f03ee30cc19880975d61a292e0a675a85d95f7c236667e366c2dfc8af93871f", size = 298107, upload-time = "2026-11-05T23:18:04.393Z" },
 ]
 
 [[package]]
@@ -1118,16 +1122,22 @@ wheels = [
 
 [[package]]
 name = "langchain-agensgraph"
-version = "0.3.1"
+version = "0.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "agensgraph-python" },
     { name = "langchain-core" },
-    { name = "langgraph" },
     { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "numpy", version = "2.5.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "psycopg", extra = ["binary"] },
     { name = "psycopg-pool" },
+    { name = "pydantic" },
+]
+
+[package.optional-dependencies]
+langgraph = [
+    { name = "langgraph" },
+    { name = "langgraph-checkpoint" },
 ]
 
 [package.dev-dependencies]
@@ -1141,6 +1151,7 @@ lint = [
 ]
 test = [
     { name = "langchain-tests" },
+    { name = "langgraph" },
     { name = "langgraph-checkpoint-conformance" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -1157,13 +1168,16 @@ typing = [
 
 [package.metadata]
 requires-dist = [
-    { name = "agensgraph-python", git = "https://github.com/skaiworldwide-oss/agensgraph-python?rev=db88b6daf8be22096ec2834466b955099ed30f95" },
-    { name = "langchain-core", specifier = ">=1.0.0,<2.0.0" },
-    { name = "langgraph", specifier = ">=1.0.0,<2.0.0" },
+    { name = "agensgraph-python", specifier = ">=2.1,<3" },
+    { name = "langchain-core", specifier = ">=1.7,<2" },
+    { name = "langgraph", marker = "extra == 'langgraph'", specifier = ">=1.2.18,<2" },
+    { name = "langgraph-checkpoint", marker = "extra == 'langgraph'", specifier = ">=4.3.1,<5" },
     { name = "numpy", specifier = ">=1.21,<3" },
-    { name = "psycopg", extras = ["binary"], specifier = ">=3.3.6,<4.0.0" },
-    { name = "psycopg-pool", specifier = ">=3.3.1,<4.0.0" },
+    { name = "psycopg", extras = ["binary"], specifier = ">=3.3.6,<4" },
+    { name = "psycopg-pool", specifier = ">=3.3.1,<4" },
+    { name = "pydantic", specifier = ">=2.7,<3" },
 ]
+provides-extras = ["langgraph"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -1174,6 +1188,7 @@ dev = [
 lint = [{ name = "ruff", specifier = "==0.16.1" }]
 test = [
     { name = "langchain-tests", specifier = ">=1.1.9" },
+    { name = "langgraph", specifier = ">=1.2.18,<2" },
     { name = "langgraph-checkpoint-conformance", specifier = "==0.0.2" },
     { name = "pytest", specifier = ">=8.3" },
     { name = "pytest-asyncio", specifier = ">=0.25" },

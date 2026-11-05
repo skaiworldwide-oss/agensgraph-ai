@@ -72,8 +72,10 @@ def render_grants(
 ) -> str:
     """The grants each role needs on one graph and its companion schema, as SQL.
 
-    ``owner`` is the role that makes the graph's labels and tables, for the default privileges
-    that extend these grants to what it makes later; the role running the statements otherwise.
+    The companion schema is made if it does not exist, so the grants can be given as soon as the
+    graph is. ``owner`` is the role that makes the graph's labels and tables, for the default
+    privileges that extend these grants to what it makes later; the role running the statements
+    otherwise.
     """
     graph = ident(checked(graph_name, "graph name"))
     store = ident(companion_schema(graph_name))
@@ -83,6 +85,7 @@ def render_grants(
     dml = "SELECT, INSERT, UPDATE, DELETE"
     lines = [
         f"-- {graph} and its companion schema {store}.",
+        f"CREATE SCHEMA IF NOT EXISTS {store};",
         f"GRANT USAGE ON SCHEMA {graph}, {store} TO {app};",
         f"GRANT {dml} ON ALL TABLES IN SCHEMA {graph} TO {app};",
         f"GRANT {dml}, TRUNCATE ON ALL TABLES IN SCHEMA {store} TO {app};",

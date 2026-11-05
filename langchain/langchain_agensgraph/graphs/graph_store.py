@@ -1,46 +1,44 @@
-"""Graph store base class.
+"""What a Cypher QA chain asks of a graph, as a protocol.
 
-Vendored locally so this package does not depend on the archived
-``langchain-community``. It is a lightweight ABC mirroring the interface
-that Cypher graph-QA chains expect.
+The same shape as ``langchain_neo4j.graphs.graph_store.GraphStore``, so code written against one
+reads the other. Blocking only; :class:`~langchain_agensgraph.AgensGraph` adds the awaiting forms.
 """
 
 from __future__ import annotations
 
-from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from collections.abc import Sequence
+from typing import Any, Protocol, runtime_checkable
 
 from langchain_agensgraph.graphs.graph_document import GraphDocument
 
 
-class GraphStore(ABC):
-    """Abstract interface for a graph database backing a LangChain graph store."""
+@runtime_checkable
+class GraphStore(Protocol):
+    """A graph a chain can describe to a model, query, and write graph documents into."""
 
     @property
-    @abstractmethod
     def get_schema(self) -> str:
-        """Schema of the graph database as a human-readable string."""
+        """The schema as text for a prompt."""
+        ...
 
     @property
-    @abstractmethod
-    def get_structured_schema(self) -> Dict[str, Any]:
-        """Schema as a structured dict (node_props, rel_props, relationships)."""
+    def get_structured_schema(self) -> dict[str, Any]:
+        """The schema as a mapping: ``node_props``, ``rel_props``, ``relationships``."""
+        ...
 
-    @abstractmethod
-    def query(self, query: str, params: dict = {}) -> List[Dict[str, Any]]:
-        """Run a Cypher query and return result rows."""
+    def query(self, query: str, params: Any = None) -> list[dict[str, Any]]:
+        """Run a statement; its rows as mappings."""
+        ...
 
-    @abstractmethod
     def refresh_schema(self) -> None:
-        """Re-read the schema from the live database."""
+        """Read the schema again."""
+        ...
 
-    @abstractmethod
     def add_graph_documents(
-        self,
-        graph_documents: List[GraphDocument],
-        include_source: bool = False,
+        self, graph_documents: Sequence[GraphDocument], include_source: bool = False
     ) -> None:
-        """Persist a list of ``GraphDocument`` instances into the graph."""
+        """Write graph documents into the graph."""
+        ...
 
 
 __all__ = ["GraphStore"]

@@ -1,61 +1,68 @@
-"""Integration test: LLMGraphTransformer output ingests into AgensGraph."""
+"""What the graph transformer extracts goes into a graph as it came out: typed values, the
+caller's spelling, and each source document."""
 
 from __future__ import annotations
 
-import os
+from collections.abc import Iterator
 from typing import Any
 
+import pytest
 from langchain_core.documents import Document
 from langchain_core.runnables import RunnableLambda
 
-from langchain_agensgraph import AgensGraph, LLMGraphTransformer
+from langchain_agensgraph._core.engine import AgensEngine
+from langchain_agensgraph.graph_transformers import LLMGraphTransformer
+from langchain_agensgraph.graphs import AgensGraph
+
+pytestmark = pytest.mark.server
+
+PAYLOAD = {
+    "nodes": [
+        {"id": "Alice", "type": "person", "properties": [{"key": "age", "value": 36}]},
+        {"id": "Acme", "type": "Company", "properties": [{"key": "public", "value": True}]},
+    ],
+    "relationships": [
+        {
+            "source_id": "Alice",
+            "source_type": "PERSON",
+            "target_id": "Acme",
+            "target_type": "company",
+            "type": "works_at",
+            "properties": [{"key": "since", "value": 2019}],
+        }
+    ],
+}
 
 
-class FakeStructuredLLM:
-    def __init__(self, payload: dict):
-        self._payload = payload
-
-    def with_structured_output(self, schema: Any, **kwargs: Any):
-        return RunnableLambda(lambda _messages: dict(self._payload))
+class StructuredLLM:
+    def with_structured_output(self, schema: Any, **kwargs: Any) -> RunnableLambda[Any, dict]:
+        return RunnableLambda(lambda _messages: dict(PAYLOAD))
 
 
-def _conf():
-    return {
-        "dbname": os.getenv("AGENSGRAPH_DB"),
-        "user": os.getenv("AGENSGRAPH_USER"),
-        "password": os.getenv("AGENSGRAPH_PASSWORD"),
-        "host": os.getenv("AGENSGRAPH_HOST", "localhost"),
-        "port": int(os.getenv("AGENSGRAPH_PORT", 5432)),
-    }
+@pytest.fixture
+def graph(dsn: str, graph_name: str) -> Iterator[AgensGraph]:
+    with AgensEngine(dsn) as engine:
+        yield AgensGraph(engine, graph_name=graph_name, create_graph=True)
 
 
-def test_transformer_output_ingests():
-    payload = {
-        "nodes": [
-            {"id": "Alice", "type": "Person", "properties": []},
-            {"id": "Acme", "type": "Company", "properties": []},
-        ],
-        "relationships": [
-            {
-                "source_id": "Alice",
-                "source_type": "Person",
-                "target_id": "Acme",
-                "target_type": "Company",
-                "type": "WORKS_AT",
-                "properties": [],
-            }
-        ],
-    }
-    t = LLMGraphTransformer(FakeStructuredLLM(payload))
-    gdocs = t.convert_to_graph_documents([Document(page_content="Alice works at Acme.")])
-
-    g = AgensGraph("transformer_test", _conf(), create=True)
-    g.query("MATCH (n) DETACH DELETE n")
-    g.add_graph_documents(gdocs)
-
-    counts = g.query("MATCH (n) RETURN count(n) AS c")
-    assert counts[0]["c"] == 2
-    rels = g.query("MATCH ()-[r]->() RETURN type(r) AS t")
-    assert any(r["t"].upper() == "WORKS_AT" for r in rels)
-    g.query("MATCH (n) DETACH DELETE n")
-    g.close()
+def test_what_the_transformer_extracts_is_ingested_as_extracted(graph: AgensGraph) -> None:
+    transformer = LLMGraphTransformer(
+        StructuredLLM(),
+        allowed_nodes=["Person", "Company"],
+        allowed_relationships=[("Person", "WORKS_AT", "Company")],
+        node_properties=True,
+        relationship_properties=True,
+    )
+    documents = transformer.convert_to_graph_documents(
+        [Document(page_content="Alice, 36, works at Acme.", metadata={"id": "d1"})]
+    )
+    graph.add_graph_documents(documents, include_source=True)
+    rows = graph.query(
+        'MATCH (p:"Person")-[w:"WORKS_AT"]->(c:"Company") '
+        "RETURN p.id AS who, p.age AS age, c.public AS public, w.since AS since"
+    )
+    assert rows == [{"who": "Alice", "age": 36, "public": True, "since": 2019}]
+    mentions = graph.query(
+        'MATCH (d:"Document")-[:"MENTIONS"]->(n) RETURN d.id AS doc, count(*) AS n'
+    )
+    assert mentions == [{"doc": "d1", "n": 2}]

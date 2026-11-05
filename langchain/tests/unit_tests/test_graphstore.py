@@ -1,91 +1,60 @@
-"""Unit tests for the graph store's pure helpers.
-
-What can be tested without a server is label cleaning, the sanitizer, and the shape the
-schema is rendered in. Decoding the wire format is the driver's, and is tested there.
-"""
+"""The graph store's pure parts: grouping graph documents, and the schema a prompt reads."""
 
 from __future__ import annotations
 
-import unittest
-from typing import Any, Dict, List
+from types import SimpleNamespace
 
-from langchain_agensgraph.graphs.agensgraph import AgensGraph
+from langchain_core.documents import Document
+
+from langchain_agensgraph.graphs import GraphDocument, Node, Relationship
+from langchain_agensgraph.graphs.agensgraph import _collect, _entities, _index_facts, _rendered
 
 
-class TestAgensGraphHelpers(unittest.TestCase):
-    def test_clean_graph_labels(self) -> None:
-        inputs = ["label", "label 1", "label#$"]
+def test_a_node_is_written_once_with_everything_said_about_it() -> None:
+    ada = Node(id="a", type="Person", properties={"name": "Ada"})
+    bare = Node(id="a", type="Person")
+    org = Node(id=7, type="Org")
+    doc = GraphDocument(
+        nodes=[ada, org],
+        relationships=[Relationship(source=bare, target=org, type="WORKS_AT", properties={"y": 1})],
+        source=Document("Ada works at seven", metadata={"origin": "x"}),
+    )
+    vertices, edges, sources = _collect([doc], include_source=True)
+    assert vertices["Person"] == {"a": {"name": "Ada"}}
+    assert vertices["Org"] == {7: {}}
+    assert edges[("Person", "WORKS_AT", "Org")] == [("a", 7, {"y": 1})]
+    (key,) = vertices["Document"]
+    assert vertices["Document"][key] == {"origin": "x", "text": "Ada works at seven"}
+    assert sorted(edges[("Document", "MENTIONS", "Person")]) == [(key, "a", {})]
+    assert sources == {"Document"} and doc.source.metadata == {"origin": "x"}
+    assert _entities(vertices, sources) == ("Org", "Person")
 
-        expected = ["label", "label_1", "label_"]
 
-        for idx, value in enumerate(inputs):
-            self.assertEqual(AgensGraph.clean_graph_labels(value), expected[idx])
-
-    def test_structured_schema_splits_vertex_and_edge_properties(self) -> None:
-        """A label's kind decides which half of the schema it lands in.
-
-        An edge's property map has to survive decoding for the relationship half to hold
-        anything at all.
-        """
-        from agensgraph import GraphDescription, PropertyShape, Triple
-        from agensgraph.introspect import Label
-
-        description = GraphDescription(
-            graph="g",
-            labels=(
-                Label(3, "Person", "v", "ag_vertex"),
-                Label(4, "KNOWS", "e", "ag_edge"),
-            ),
-            properties={
-                "Person": (PropertyShape("name", "string", False),),
-                "KNOWS": (PropertyShape("since", "integer", False),),
-            },
-            triples=(Triple("Person", "KNOWS", "Person", 7),),
-            counts={"Person": 2, "KNOWS": 7},
-            meta_gathered=True,
-        )
-
-        structured = AgensGraph._structured(_FakeGraph(), description)
-
-        self.assertEqual(
-            structured["node_props"], {"Person": [{"property": "name", "type": "string"}]}
-        )
-        self.assertEqual(
-            structured["rel_props"], {"KNOWS": [{"property": "since", "type": "integer"}]}
-        )
-        self.assertEqual(
-            structured["relationships"],
-            [{"start": "Person", "type": "KNOWS", "end": "Person"}],
-        )
-        self.assertEqual(structured["counts"], {"Person": 2, "KNOWS": 7})
-        self.assertTrue(structured["metadata"]["meta_gathered"])
-
-    def test_rendered_schema_names_each_section(self) -> None:
-        """The prompt's framing is contractual -- a chain's few-shot examples read it."""
-        structured: Dict[str, Any] = {
-            "node_props": {"Person": [{"property": "name", "type": "string"}]},
-            "rel_props": {"KNOWS": [{"property": "since", "type": "integer"}]},
+def test_the_schema_text_names_each_section() -> None:
+    text = _rendered(
+        {
+            "node_props": {"Person": [{"property": "name", "type": "STRING"}]},
+            "rel_props": {"KNOWS": []},
             "relationships": [{"start": "Person", "type": "KNOWS", "end": "Person"}],
-            "counts": {"Person": 2},
-            "metadata": {},
+            "counts": {"Person": 3, "KNOWS": 2},
+            "indexes": [{"label": "Person", "on": "(id)", "unique": True}],
         }
-        rendered = AgensGraph._rendered(None, structured)
-
-        self.assertIn("Node properties are the following:", rendered)
-        self.assertIn("Relationship properties are the following:", rendered)
-        self.assertIn("The relationships are the following:", rendered)
-        # Counts are new, and free: they come from the catalogs with everything else, and a
-        # model picking between two ways of matching writes a better query knowing them.
-        self.assertIn("Element counts are the following:", rendered)
-        self.assertIn('(:"Person")-[:"KNOWS"]->(:"Person")', rendered)
+    )
+    assert text.splitlines()[0] == "Node properties are the following:"
+    assert '\'(:"Person")-[:"KNOWS"]->(:"Person")\'' in text
+    assert "Element counts (estimates) are the following:" in text
+    assert '(:"Person") ON (id) UNIQUE' in text
 
 
-class _FakeGraph:
-    """Enough of an AgensGraph for `_structured`, which only reads `capabilities`."""
+def test_only_btree_property_indexes_are_facts_for_a_prompt() -> None:
+    def index(definition: str, unique: bool = False) -> SimpleNamespace:
+        return SimpleNamespace(label="Person", definition=definition, unique=unique)
 
-    class capabilities:  # noqa: N801 - stands in for a property
-        version = (2, 18)
-
-
-def _entries(props: List[Dict[str, str]]) -> List[str]:
-    return [p["property"] for p in props]
+    facts = _index_facts(
+        [
+            index("CREATE UNIQUE INDEX p ON g.person USING btree (properties.'id')", True),
+            index("CREATE INDEX q ON g.person USING gin (properties jsonb_path_ops)"),
+            index("CREATE INDEX r ON g.person USING btree (properties.'__id__')"),
+        ]
+    )
+    assert facts == [{"label": "Person", "on": "(properties.'id')", "unique": True}]

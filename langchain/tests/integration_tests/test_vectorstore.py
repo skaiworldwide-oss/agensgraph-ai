@@ -15,6 +15,7 @@ from psycopg.conninfo import make_conninfo
 from langchain_agensgraph._core.engine import AgensEngine
 from langchain_agensgraph._core.program import Program, Statement
 from langchain_agensgraph.errors import SchemaMismatchError, UnknownLabel
+from langchain_agensgraph.graphs import AgensGraph
 from langchain_agensgraph.retrievers import (
     AgensGraphContextRetriever,
     AgensVectorRetriever,
@@ -342,6 +343,27 @@ def test_an_index_a_rolled_back_transaction_built_is_built_again(
     # The rollback took the rows and the index; the next write builds the index again.
     load(store, chunks[:20])
     assert store.index_status()["indexed"]
+
+
+@pytest.mark.timeout(60)
+def test_setup_inside_a_callers_transaction_runs_in_it(
+    engine: AgensEngine, graph_name: str, chunks: list[datagen.Chunk], embedding: FixedEmbeddings
+) -> None:
+    graph = AgensGraph(engine, graph_name=graph_name, create_graph=True)
+    graph.ensure_labels(["Chunk"])
+    store = store_for(engine, graph_name, embedding)
+    with pytest.raises(RuntimeError):
+        with engine.transaction():
+            # Setup puts indexes and a foreign key on Chunk, which this transaction has written
+            # to: on a connection of its own it would wait for the transaction to end.
+            graph.query('CREATE (:"Chunk" {note: %s})', ("written first",))
+            load(store, chunks[:5])
+            with pytest.raises(ValueError, match="cannot run inside a transaction"):
+                store.build_index(concurrently=True)
+            raise RuntimeError
+    # The rollback took the store's tables with it, so the next call makes them again.
+    load(store, chunks[:5])
+    assert [d.id for d in store.similarity_search(chunks[0].text, k=1)] == [chunks[0].id]
 
 
 @pytest.mark.parametrize("concurrently", [False, True])

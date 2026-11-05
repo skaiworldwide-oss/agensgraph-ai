@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import threading
+import time
 from typing import Any
 
 import pytest
@@ -204,6 +207,160 @@ class TestCancellationIsNotAFailedDocument:
 
                 return RunnableLambda(func=lambda m: dict(self._payload), afunc=answer)
 
-        transformer = LLMGraphTransformer(FailingLLM(CANNED))
+        transformer = LLMGraphTransformer(FailingLLM(CANNED), on_error="skip")
         out = await transformer.aconvert_to_graph_documents([Document(page_content="doc")])
         assert out == []
+        with pytest.raises(RuntimeError, match="output-token limit"):
+            await LLMGraphTransformer(FailingLLM(CANNED)).aconvert_to_graph_documents(
+                [Document(page_content="doc")]
+            )
+
+
+def test_an_answer_that_is_no_graph_is_skipped_like_a_failed_call():
+    class NoToolCallLLM(FakeStructuredLLM):
+        """Structured output gives None when the model's reply makes no tool call."""
+
+        def with_structured_output(self, schema: Any, **kwargs: Any):
+            return RunnableLambda(lambda m: None if "second" in str(m) else dict(self._payload))
+
+    docs = [Document(page_content=f"{n} doc") for n in ("first", "second", "third")]
+    kept = LLMGraphTransformer(NoToolCallLLM(CANNED), on_error="skip")
+    assert len(kept.convert_to_graph_documents(docs)) == 2
+    with pytest.raises(TypeError, match="not a graph"):
+        LLMGraphTransformer(NoToolCallLLM(CANNED)).convert_to_graph_documents(docs)
+
+
+class RecordingLLM(FakeStructuredLLM):
+    """Answers with a payload and keeps the messages it was sent, and how many ran at once."""
+
+    def __init__(self, payload: dict, pause: float = 0.0):
+        super().__init__(payload)
+        self.seen: list[Any] = []
+        self.running = 0
+        self.peak = 0
+        self.pause = pause
+        self.lock = threading.Lock()
+
+    def with_structured_output(self, schema: Any, **kwargs: Any):
+        def answer(messages: Any) -> dict:
+            with self.lock:
+                self.seen.append(messages)
+                self.running += 1
+                self.peak = max(self.peak, self.running)
+            time.sleep(self.pause)
+            with self.lock:
+                self.running -= 1
+            return dict(self._payload)
+
+        return RunnableLambda(answer)
+
+
+TRIPLED = {
+    "nodes": [
+        {"id": "Ada", "type": "person", "properties": [{"key": "Age", "value": 36}]},
+        {"id": "Acme", "type": "Company", "properties": [{"key": "public", "value": True}]},
+    ],
+    "relationships": [
+        {
+            "source_id": "Ada",
+            "source_type": "Person",
+            "target_id": "Acme",
+            "target_type": "Company",
+            "type": "works_at",
+            "properties": [{"key": "since", "value": 2019}],
+        },
+        {
+            "source_id": "Acme",
+            "source_type": "Company",
+            "target_id": "Ada",
+            "target_type": "Person",
+            "type": "WORKS_AT",
+            "properties": [],
+        },
+    ],
+}
+
+
+def test_a_triple_keeps_only_its_own_direction_in_the_callers_spelling():
+    transformer = LLMGraphTransformer(
+        RecordingLLM(TRIPLED),
+        allowed_nodes=["Person", "Company"],
+        allowed_relationships=[("Person", "WORKS_AT", "Company")],
+    )
+    (document,) = transformer.convert_to_graph_documents([Document(page_content="x")])
+    assert [(r.source.type, r.type, r.target.type) for r in document.relationships] == [
+        ("Person", "WORKS_AT", "Company")
+    ]
+    assert "(Person, WORKS_AT, Company)" in transformer._system
+
+
+@pytest.mark.parametrize(
+    ("relationships", "message"),
+    [
+        ([("Person", "WORKS_AT", "City")], "not among the allowed nodes"),
+        (["KNOWS", ("Person", "WORKS_AT", "Company")], "not both"),
+    ],
+)
+def test_allowed_relationships_are_checked(relationships, message):
+    with pytest.raises(ValueError, match=message):
+        LLMGraphTransformer(
+            RecordingLLM(TRIPLED),
+            allowed_nodes=["Person", "Company"],
+            allowed_relationships=relationships,
+        )
+
+
+def test_properties_are_kept_by_name_with_their_types():
+    transformer = LLMGraphTransformer(
+        RecordingLLM(TRIPLED), node_properties=["age"], relationship_properties=True
+    )
+    (document,) = transformer.convert_to_graph_documents([Document(page_content="x")])
+    assert [n.properties for n in document.nodes] == [{"age": 36}, {}]
+    assert document.relationships[0].properties == {"since": 2019}
+    assert "only these node properties, as key and value: age" in transformer._system
+    plain = LLMGraphTransformer(RecordingLLM(TRIPLED))
+    (document,) = plain.convert_to_graph_documents([Document(page_content="x")])
+    assert all(not n.properties for n in document.nodes)
+    assert all(not r.properties for r in document.relationships)
+
+
+def test_additional_instructions_reach_the_model_as_written():
+    llm = RecordingLLM(CANNED)
+    LLMGraphTransformer(llm, additional_instructions="Name {people} by surname.").process_response(
+        Document(page_content="x")
+    )
+    system, human = llm.seen[0]
+    assert system.content.endswith("Name {people} by surname.") and human.content == "x"
+
+
+@pytest.mark.parametrize("ignore_tool_usage", [True, False])
+def test_a_model_without_structured_output_answers_in_json(ignore_tool_usage):
+    from langchain_core.language_models import FakeListChatModel
+
+    reply = "```json\n" + json.dumps(CANNED) + "\n```"
+    transformer = LLMGraphTransformer(
+        FakeListChatModel(responses=[reply]), ignore_tool_usage=ignore_tool_usage
+    )
+    assert "JSON" in transformer._system
+    document = transformer.process_response(Document(page_content="Alice works at Acme."))
+    assert {n.id for n in document.nodes} == {"Alice", "Acme", "Berlin"}
+
+
+def test_documents_convert_at_most_max_concurrency_at_a_time_in_their_order():
+    llm = RecordingLLM(CANNED, pause=0.02)
+    transformer = LLMGraphTransformer(llm, max_concurrency=2)
+    documents = [Document(page_content=f"doc {i}") for i in range(6)]
+    out = transformer.convert_to_graph_documents(documents)
+    assert [d.source.page_content for d in out] == [d.page_content for d in documents]
+    assert llm.peak == 2
+
+
+def test_a_conversion_runs_under_the_callers_config():
+    from langchain_core.tracers.context import collect_runs
+
+    with collect_runs() as runs:
+        LLMGraphTransformer(RecordingLLM(CANNED)).convert_to_graph_documents(
+            [Document(page_content="x")], config={"tags": ["ingest"]}
+        )
+    (run,) = runs.traced_runs
+    assert run.name == "LLMGraphTransformer" and "ingest" in run.tags

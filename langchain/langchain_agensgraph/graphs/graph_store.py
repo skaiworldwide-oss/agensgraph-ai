@@ -7,7 +7,11 @@ reads the other. Blocking only; :class:`~langchain_agensgraph.AgensGraph` adds t
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any, Protocol, runtime_checkable
+from typing import Any
+
+# typing_extensions' Protocol checks an instance's members without reading them on every supported
+# Python; typing's reads them below 3.12, and reading get_schema reads the schema from the server.
+from typing_extensions import Protocol, runtime_checkable
 
 from langchain_agensgraph.graphs.graph_document import GraphDocument
 

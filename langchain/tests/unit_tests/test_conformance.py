@@ -6,6 +6,7 @@ from langchain_agensgraph.graphs import AgensGraph, GraphStore
 
 
 def test_the_graph_store_is_a_graph_store() -> None:
+    # The host does not resolve, so a check that read the schema would raise.
     graph = AgensGraph("host=nowhere dbname=none", graph_name="g")
     try:
         assert isinstance(graph, GraphStore)

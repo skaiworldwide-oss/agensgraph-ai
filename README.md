@@ -3,7 +3,8 @@
 Integrations, tools and starter material for building AI applications on
 [AgensGraph](https://github.com/skaiworldwide-oss/agensgraph), the PostgreSQL-based graph
 database. Every integration here runs on the
-[`agensgraph-python`](https://pypi.org/project/agensgraph-python/) 2.0 driver.
+[`agensgraph-python`](https://pypi.org/project/agensgraph-python/) driver: LangChain on 2.1,
+the others on 2.0 or later.
 
 | Integration | Package | What it gives you |
 | --- | --- | --- |
@@ -68,13 +69,12 @@ The `mcp` extra is for the other case: hosting a server yourself over HTTP or SS
 ## Requirements
 
 - Python 3.11 or later.
-- A running AgensGraph 2.17 or later; the driver refuses an older server at connect.
+- A running AgensGraph: 2.14.1 or later for LangChain, 2.17 or later for the others.
   `SHOW agversion` tells you which you have. From 2.18 a release reports four numbers, such
   as `2.18.4.0`, with `-rc1` on a release candidate; the first two are the line, so
   `2.18.6.0-rc1` is a 2.18 server.
-- The vector-backed features need the `pgvector` extension, and schema introspection is
-  faster with the `meta` extension. AgensGraph bundles neither; see
-  [how to build them](https://github.com/skaiworldwide-oss/agensgraph-ai/blob/main/langchain/README.md#agensgraph-requirements).
+- The vector-backed features need the `pgvector` extension. AgensGraph does not bundle it;
+  see [how to build it](https://github.com/skaiworldwide-oss/agensgraph-ai/blob/main/langchain/README.md#requirements).
 
 ## License
 

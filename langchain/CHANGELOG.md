@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.4.0
+## 0.4.0 (2026-11-06)
 
 Runs on AgensGraph 2.14.1 and later, on `agensgraph-python` 2.1.
 

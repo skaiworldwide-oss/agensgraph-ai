@@ -1,6 +1,6 @@
 [project]
 name = "agensgraph-ai"
-version = "0.3.1"
+version = "0.4.0"
 description = "Umbrella installer for the AgensGraph AI integrations (LangChain, LlamaIndex, LightRAG, cognee, MCP)."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -33,7 +33,7 @@ classifiers = [
 dependencies = []
 
 [project.optional-dependencies]
-langchain = ["langchain-agensgraph>=0.3"]
+langchain = ["langchain-agensgraph>=0.4"]
 llama-index = ["llama-index-agensgraph>=0.3"]
 lightrag = ["lightrag-agensgraph>=0.3"]
 cognee = ["cognee-agensgraph>=0.3"]
